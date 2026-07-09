@@ -11,7 +11,7 @@
 
 ## Local Setup
 
-Create a backend `.env` from `backend后段接口/.env.example` or export the variable before starting the backend:
+Create a backend `.env` from `backend/.env.example` or export the variable before starting the backend:
 
 ```bash
 export RUNNINGHUB_API_KEY=your_runninghub_key

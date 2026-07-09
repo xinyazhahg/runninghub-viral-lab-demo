@@ -5,7 +5,7 @@
 后端：
 
 ```bash
-cd backend后段接口
+cd backend
 npm install
 cp .env.example .env
 export RUNNINGHUB_API_KEY=your_runninghub_key
@@ -72,4 +72,3 @@ CORS_ORIGINS=http://localhost:5173,https://your-preview.example.com
 3. 生成 Prompt 后点击生成视频，确认请求到线上后端的 `/api/generate-video`。
 4. 如果返回 `videoUrl` 或 `/generated/...`，页面应能直接播放视频；前后端分开部署时，前端会把相对视频地址补成后端域名。
 5. 如果接口失败，页面应显示中文错误信息，后端日志应能看到对应接口调用。
-
