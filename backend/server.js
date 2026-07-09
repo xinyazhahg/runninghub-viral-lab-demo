@@ -10,18 +10,60 @@ const https = require("https");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason);
+});
+
 const DEFAULT_ALLOWED_ORIGINS = [
   "http://localhost:5173",
   "http://127.0.0.1:5173",
+  "https://viral-lab-frontend.onrender.com",
 ];
 const configuredOrigins = [
   process.env.FRONTEND_ORIGIN,
   ...(process.env.CORS_ORIGINS || "").split(","),
 ]
   .filter(Boolean)
-  .map((origin) => origin.trim())
+  .map((origin) => origin.trim().replace(/\/$/, ""))
   .filter(Boolean);
 const allowedOrigins = new Set([...DEFAULT_ALLOWED_ORIGINS, ...configuredOrigins]);
+
+function normalizeOrigin(origin) {
+  return typeof origin === "string" ? origin.trim().replace(/\/$/, "") : "";
+}
+
+function isOriginAllowed(origin) {
+  const normalizedOrigin = normalizeOrigin(origin);
+  return !normalizedOrigin || allowedOrigins.has(normalizedOrigin);
+}
+
+const corsOptions = {
+  origin(origin, callback) {
+    callback(null, isOriginAllowed(origin));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  optionsSuccessStatus: 204,
+};
+
+function applyCorsHeaders(req, res) {
+  const origin = normalizeOrigin(req.headers.origin);
+  if (!origin) return true;
+  if (!allowedOrigins.has(origin)) return false;
+
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    req.headers["access-control-request-headers"] || "Content-Type,Authorization"
+  );
+  return true;
+}
 
 // uploads 目录：优先用环境变量，默认用 backend 目录下的 uploads
 const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(__dirname, "uploads");
@@ -30,14 +72,34 @@ const upload = multer({ dest: UPLOADS_DIR });
 // 旧版前端静态托管：指向同级 react-old 目录
 const LEGACY_FRONTEND_DIR = process.env.LEGACY_FRONTEND_DIR || path.join(__dirname, "..", "react-old");
 
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin || allowedOrigins.has(origin)) {
-      return callback(null, true);
-    }
-    return callback(new Error(`CORS origin not allowed: ${origin}`));
-  },
-}));
+app.use((req, res, next) => {
+  if (!applyCorsHeaders(req, res)) {
+    return res.status(403).json({
+      ok: false,
+      error: `CORS origin not allowed: ${req.headers.origin}`,
+      message: `CORS origin not allowed: ${req.headers.origin}`,
+    });
+  }
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
+  next();
+});
+app.use(cors(corsOptions));
+app.use((err, req, res, next) => {
+  console.error("CORS 中间件错误：", err);
+  if (res.headersSent) return next(err);
+  if (!applyCorsHeaders(req, res)) {
+    return res.status(403).json({
+      ok: false,
+      error: `CORS origin not allowed: ${req.headers.origin}`,
+      message: `CORS origin not allowed: ${req.headers.origin}`,
+    });
+  }
+  return sendApiError(res, 500, "CORS 配置异常");
+});
 app.use(express.json());
 app.use(express.static(LEGACY_FRONTEND_DIR));
 app.use("/uploads", express.static(UPLOADS_DIR));
@@ -55,6 +117,78 @@ app.get("/api/health", (req, res) => {
 const RUNNINGHUB_SKILL_DIR =
   process.env.RUNNINGHUB_SKILL_DIR ||
   path.join(os.homedir(), "Documents/ii/workspace-penguin/skills/runninghub");
+
+function getErrorMessage(err, fallback) {
+  if (!err) return fallback;
+  if (typeof err === "string") return err;
+  return err.message || fallback;
+}
+
+function sendApiError(res, status, error, details) {
+  if (res.headersSent) return;
+  const message = error || "后端服务异常";
+  res.status(status).json({
+    ok: false,
+    error: message,
+    message,
+    ...(details ? { details } : {}),
+  });
+}
+
+function assertRunningHubSkillReady() {
+  if (!fs.existsSync(RUNNINGHUB_SKILL_DIR)) {
+    throw new Error(`线上环境缺少 RunningHub Skill 目录：${RUNNINGHUB_SKILL_DIR}，请配置 RUNNINGHUB_SKILL_DIR 或改用后端直连 RunningHub API`);
+  }
+
+  const scriptPath = path.join(RUNNINGHUB_SKILL_DIR, "scripts", "runninghub.js");
+  if (!fs.existsSync(scriptPath)) {
+    throw new Error(`线上环境缺少 RunningHub 调用脚本：${scriptPath}，请确认部署包或 RUNNINGHUB_SKILL_DIR 配置`);
+  }
+}
+
+function runRunningHubScript(args, label) {
+  return new Promise((resolve, reject) => {
+    let child;
+    let stdout = "";
+    let stderr = "";
+
+    try {
+      assertRunningHubSkillReady();
+      child = spawn("node", args, {
+        cwd: RUNNINGHUB_SKILL_DIR,
+        env: process.env,
+      });
+    } catch (err) {
+      reject(new Error(getErrorMessage(err, `${label} 启动失败`)));
+      return;
+    }
+
+    child.stdout?.on("data", (data) => {
+      stdout += data.toString();
+    });
+
+    child.stderr?.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    child.on("error", (err) => {
+      reject(new Error(getErrorMessage(err, `${label} 进程启动失败`)));
+    });
+
+    child.on("close", (code) => {
+      console.log(`${label} 进程结束，code =`, code);
+      console.log("stdout 前 500 字：", stdout.slice(0, 500));
+      console.log("stderr 前 500 字：", stderr.slice(0, 500));
+
+      if (code !== 0) {
+        reject(new Error(stderr || stdout || `${label} 失败，退出码 ${code}`));
+        return;
+      }
+
+      resolve(stdout);
+    });
+  });
+}
 
 const DEFAULT_PROMPT = `
 请拆解用户上传的视频，并只返回严格 JSON，不要 Markdown，不要解释。
@@ -95,24 +229,22 @@ const DEFAULT_PROMPT = `
 5. 不要编造视频中不存在的内容。
 `;
 
-app.post("/api/video-to-text", upload.single("video"), (req, res) => {
+app.post("/api/video-to-text", upload.single("video"), async (req, res) => {
+  try {
     console.log("收到视频拆解请求：", req.file?.originalname, req.file?.size);
   if (!process.env.RUNNINGHUB_API_KEY) {
-    return res.status(500).json({
-      ok: false,
-      message: "后端未配置 RunningHub API Key",
-    });
+    return sendApiError(res, 500, "后端未配置 RunningHub API Key");
   }
 
   if (!req.file) {
-    return res.status(400).json({
-      ok: false,
-      message: "没有收到视频文件",
-    });
+    return sendApiError(res, 400, "没有收到视频文件");
   }
 
   const prompt = req.body.prompt || DEFAULT_PROMPT;
   const videoPath = path.resolve(req.file.path);
+  if (!fs.existsSync(videoPath)) {
+    return sendApiError(res, 500, `上传视频文件不存在：${videoPath}`);
+  }
 
   const args = [
     "scripts/runninghub.js",
@@ -124,60 +256,35 @@ app.post("/api/video-to-text", upload.single("video"), (req, res) => {
     videoPath,
   ];
 console.log("开始调用 RunningHub video-to-text...");
-  const child = spawn("node", args, {
-    cwd: RUNNINGHUB_SKILL_DIR,
-    env: process.env,
-  });
-
-  let stdout = "";
-  let stderr = "";
-
-  child.stdout.on("data", (data) => {
-    stdout += data.toString();
-  });
-
-  child.stderr.on("data", (data) => {
-    stderr += data.toString();
-  });
-
-  child.on("close", (code) => {
-    console.log("RunningHub 进程结束，code =", code);
-console.log("stdout 前 300 字：", stdout.slice(0, 300));
-console.log("stderr 前 300 字：", stderr.slice(0, 300));
-    if (code !== 0) {
-      return res.status(500).json({
-        ok: false,
-        message: "RunningHub 视频拆解失败",
-        error: stderr || stdout,
-      });
-    }
+  const stdout = await runRunningHubScript(args, "RunningHub video-to-text");
 
     res.json({
       ok: true,
       result: stdout,
     });
-  });
+  } catch (err) {
+    console.error("video-to-text 失败：", err);
+    return sendApiError(res, 500, getErrorMessage(err, "RunningHub 视频拆解失败"));
+  }
 });
 
-app.post("/api/generate-video", upload.single("image"), (req, res) => {
+app.post("/api/generate-video", upload.single("image"), async (req, res) => {
+  try {
   if (!process.env.RUNNINGHUB_API_KEY) {
-    return res.status(500).json({
-      ok: false,
-      message: "后端未配置 RunningHub API Key",
-    });
+    return sendApiError(res, 500, "后端未配置 RunningHub API Key");
   }
 
   if (!req.file) {
-    return res.status(400).json({
-      ok: false,
-      message: "没有收到生成图片",
-    });
+    return sendApiError(res, 400, "没有收到生成图片");
   }
 
   const prompt = req.body.prompt || "根据参考图生成一段动态视频，保持真实镜头质感。";
   const duration = req.body.duration || "10";
   const aspectRatio = req.body.aspectRatio || "9:16";
   const imagePath = path.resolve(req.file.path);
+  if (!fs.existsSync(imagePath)) {
+    return sendApiError(res, 500, `上传图片文件不存在：${imagePath}`);
+  }
 
  const args = [
   "scripts/runninghub.js",
@@ -202,40 +309,16 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
   console.log("收到视频生成请求：", req.file?.originalname, req.file?.size);
   console.log("开始调用 RunningHub image-to-video...");
 
-  const child = spawn("node", args, {
-    cwd: RUNNINGHUB_SKILL_DIR,
-    env: process.env,
-  });
-
-  let stdout = "";
-  let stderr = "";
-
-  child.stdout.on("data", (data) => {
-    stdout += data.toString();
-  });
-
-  child.stderr.on("data", (data) => {
-    stderr += data.toString();
-  });
-
-  child.on("close", (code) => {
-    console.log("RunningHub 生视频进程结束，code =", code);
-    console.log("stdout 前 500 字：", stdout.slice(0, 500));
-    console.log("stderr 前 500 字：", stderr.slice(0, 500));
-
-    if (code !== 0) {
-      return res.status(500).json({
-        ok: false,
-        message: "RunningHub 视频生成失败",
-        error: stderr || stdout,
-      });
-    }
+  const stdout = await runRunningHubScript(args, "RunningHub image-to-video");
 
     res.json({
       ok: true,
       result: stdout,
     });
-  });
+  } catch (err) {
+    console.error("generate-video 失败：", err);
+    return sendApiError(res, 500, getErrorMessage(err, "RunningHub 视频生成失败"));
+  }
 });
 
 // ============================================================
@@ -491,6 +574,14 @@ app.post("/api/extract-element-preview", upload.single("image"), async (req, res
       message: err.message || "抠图预览失败",
     });
   }
+});
+
+app.use((err, req, res, next) => {
+  console.error("后端接口未捕获错误：", err);
+  if (res.headersSent) {
+    return next(err);
+  }
+  return sendApiError(res, 500, getErrorMessage(err, "后端接口异常"));
 });
 
 app.listen(PORT, () => {
