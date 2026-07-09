@@ -118,6 +118,13 @@ const RUNNINGHUB_SKILL_DIR =
   process.env.RUNNINGHUB_SKILL_DIR ||
   path.join(os.homedir(), "Documents/ii/workspace-penguin/skills/runninghub");
 
+const RH_BASE = "https://www.runninghub.cn/openapi/v2";
+const RH_POLL_ENDPOINT = "/query";
+const RH_UPLOAD_ENDPOINT = "/media/upload/binary";
+const RH_VIDEO_TO_TEXT_ENDPOINT = "rhart-text-g-25-flash/video-to-text";
+const RH_MAX_POLL_SECONDS = 1200;
+const RH_POLL_INTERVAL_MS = 5000;
+
 function getErrorMessage(err, fallback) {
   if (!err) return fallback;
   if (typeof err === "string") return err;
@@ -133,6 +140,184 @@ function sendApiError(res, status, error, details) {
     message,
     ...(details ? { details } : {}),
   });
+}
+
+function contentTypeFor(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  return (
+    {
+      ".png": "image/png",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".webp": "image/webp",
+      ".gif": "image/gif",
+      ".mp4": "video/mp4",
+      ".mov": "video/quicktime",
+      ".mp3": "audio/mpeg",
+      ".wav": "audio/wav",
+    }[ext] || "application/octet-stream"
+  );
+}
+
+function requestBuffer(method, urlString, body, headers, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlString);
+    const req = https.request(
+      {
+        method,
+        hostname: url.hostname,
+        port: url.port || undefined,
+        path: `${url.pathname}${url.search}`,
+        headers,
+        timeout: timeoutMs || 60000,
+      },
+      (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("end", () => {
+          const buffer = Buffer.concat(chunks);
+          if (response.statusCode < 200 || response.statusCode >= 300) {
+            const err = new Error(buffer.toString("utf8") || `HTTP ${response.statusCode}`);
+            err.statusCode = response.statusCode;
+            err.body = buffer.toString("utf8");
+            reject(err);
+            return;
+          }
+          resolve(buffer);
+        });
+      }
+    );
+    req.on("timeout", () => req.destroy(new Error("请求超时")));
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+async function postRunningHubJson(apiKey, url, payload, timeoutMs) {
+  const body = Buffer.from(JSON.stringify(payload));
+  const buffer = await requestBuffer(
+    "POST",
+    url,
+    body,
+    {
+      "Content-Type": "application/json",
+      "Content-Length": String(body.length),
+      Authorization: `Bearer ${apiKey}`,
+    },
+    timeoutMs || 60000
+  );
+  return JSON.parse(buffer.toString("utf8"));
+}
+
+async function uploadFileToRunningHub(apiKey, filePath) {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`上传文件不存在：${filePath}`);
+  }
+
+  const boundary = `----ViralLabRunningHub${Date.now().toString(16)}`;
+  const filename = path.basename(filePath);
+  const file = fs.readFileSync(filePath);
+  const head = Buffer.from(
+    `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="file"; filename="${filename}"\r\n` +
+      `Content-Type: ${contentTypeFor(filePath)}\r\n\r\n`
+  );
+  const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
+  const body = Buffer.concat([head, file, tail]);
+  const buffer = await requestBuffer(
+    "POST",
+    `${RH_BASE}${RH_UPLOAD_ENDPOINT}`,
+    body,
+    {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": `multipart/form-data; boundary=${boundary}`,
+      "Content-Length": String(body.length),
+    },
+    120000
+  );
+  const json = JSON.parse(buffer.toString("utf8"));
+  if (json.code === 0 && json.data?.download_url) {
+    return json.data.download_url;
+  }
+  throw new Error(`视频上传失败：${JSON.stringify(json)}`);
+}
+
+async function pollRunningHubTask(apiKey, taskId) {
+  const url = `${RH_BASE}${RH_POLL_ENDPOINT}`;
+  let elapsed = 0;
+  let consecutiveFailures = 0;
+
+  while (elapsed < RH_MAX_POLL_SECONDS) {
+    await new Promise((resolve) => setTimeout(resolve, RH_POLL_INTERVAL_MS));
+    elapsed += RH_POLL_INTERVAL_MS / 1000;
+
+    try {
+      const json = await postRunningHubJson(apiKey, url, { taskId }, 30000);
+      consecutiveFailures = 0;
+
+      if (json.status === "SUCCESS") {
+        return json;
+      }
+      if (json.status === "FAILED") {
+        const taskError = new Error(`任务失败：${json.errorMessage || JSON.stringify(json)}`);
+        taskError.nonRetryable = true;
+        throw taskError;
+      }
+    } catch (err) {
+      if (err.nonRetryable) {
+        throw err;
+      }
+      consecutiveFailures += 1;
+      if (consecutiveFailures >= 5) {
+        throw err;
+      }
+    }
+  }
+
+  throw new Error(`任务轮询超时（${RH_MAX_POLL_SECONDS}s）`);
+}
+
+function formatRunningHubTextResult(finalResult) {
+  const results = finalResult.results || [];
+  const firstResult = results[0] || {};
+  const textResult = firstResult.text || firstResult.content || firstResult.output || "";
+  if (!textResult) {
+    throw new Error(`未获取到 video-to-text 文本结果：${JSON.stringify(finalResult)}`);
+  }
+
+  const usage = finalResult.usage || {};
+  const lines = [textResult];
+  const consumeMoney = usage.consumeMoney || usage.thirdPartyConsumeMoney;
+  const taskCostTime = usage.taskCostTime;
+  if (consumeMoney != null) lines.push(`COST:¥${consumeMoney}`);
+  if (taskCostTime && String(taskCostTime) !== "0") lines.push(`DURATION:${taskCostTime}s`);
+  return lines.join("\n");
+}
+
+async function runVideoToTextDirect(apiKey, videoPath, prompt) {
+  const videoUrl = await uploadFileToRunningHub(apiKey, videoPath);
+  const submitResult = await postRunningHubJson(
+    apiKey,
+    `${RH_BASE}/${RH_VIDEO_TO_TEXT_ENDPOINT}`,
+    {
+      prompt,
+      videoUrl,
+    },
+    60000
+  );
+
+  const taskId = submitResult.taskId;
+  if (!taskId) {
+    throw new Error(`未获取到 video-to-text taskId：${JSON.stringify(submitResult)}`);
+  }
+
+  const finalResult =
+    submitResult.status === "SUCCESS" && submitResult.results
+      ? submitResult
+      : await pollRunningHubTask(apiKey, taskId);
+
+  return formatRunningHubTextResult(finalResult);
 }
 
 function assertRunningHubSkillReady() {
@@ -232,31 +417,22 @@ const DEFAULT_PROMPT = `
 app.post("/api/video-to-text", upload.single("video"), async (req, res) => {
   try {
     console.log("收到视频拆解请求：", req.file?.originalname, req.file?.size);
-  if (!process.env.RUNNINGHUB_API_KEY) {
-    return sendApiError(res, 500, "后端未配置 RunningHub API Key");
-  }
+    if (!process.env.RUNNINGHUB_API_KEY) {
+      return sendApiError(res, 500, "后端未配置 RunningHub API Key");
+    }
 
-  if (!req.file) {
-    return sendApiError(res, 400, "没有收到视频文件");
-  }
+    if (!req.file) {
+      return sendApiError(res, 400, "没有收到视频文件");
+    }
 
-  const prompt = req.body.prompt || DEFAULT_PROMPT;
-  const videoPath = path.resolve(req.file.path);
-  if (!fs.existsSync(videoPath)) {
-    return sendApiError(res, 500, `上传视频文件不存在：${videoPath}`);
-  }
+    const prompt = req.body.prompt || DEFAULT_PROMPT;
+    const videoPath = path.resolve(req.file.path);
+    if (!fs.existsSync(videoPath)) {
+      return sendApiError(res, 500, `上传视频文件不存在：${videoPath}`);
+    }
 
-  const args = [
-    "scripts/runninghub.js",
-    "--endpoint",
-    "rhart-text-g-25-flash/video-to-text",
-    "--prompt",
-    prompt,
-    "--video",
-    videoPath,
-  ];
-console.log("开始调用 RunningHub video-to-text...");
-  const stdout = await runRunningHubScript(args, "RunningHub video-to-text");
+    console.log("开始直连 RunningHub video-to-text...");
+    const stdout = await runVideoToTextDirect(process.env.RUNNINGHUB_API_KEY, videoPath, prompt);
 
     res.json({
       ok: true,
@@ -264,7 +440,7 @@ console.log("开始调用 RunningHub video-to-text...");
     });
   } catch (err) {
     console.error("video-to-text 失败：", err);
-    return sendApiError(res, 500, getErrorMessage(err, "RunningHub 视频拆解失败"));
+    return sendApiError(res, 500, `RunningHub video-to-text 调用失败：${getErrorMessage(err, "未知错误")}`);
   }
 });
 
@@ -324,8 +500,6 @@ app.post("/api/generate-video", upload.single("image"), async (req, res) => {
 // ============================================================
 // /api/extract-element-preview — SAM 抠图预览
 // ============================================================
-
-const RH_BASE = "https://www.runninghub.cn/openapi/v2";
 
 /** 上传图片到 RunningHub，返回 download_url */
 function uploadImageToRunningHub(apiKey, filePath) {
