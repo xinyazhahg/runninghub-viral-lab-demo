@@ -293,7 +293,37 @@ function getCardPreviewUrl(item, group) {
 
 function getElementPlaceholder(title = '') {
   const text = String(title || '')
+if (text.includes('婚纱') || text.includes('礼服') || text.includes('裙')) {
+  return createElementSvg('dress', '服装')
+}
 
+if (text.includes('西装') || text.includes('西服')) {
+  return createElementSvg('suit', '西装')
+}
+
+if (text.includes('中式') || text.includes('唐装') || text.includes('旗袍')) {
+  return createElementSvg('chineseClothes', '服装')
+}
+
+if (text.includes('T恤') || text.includes('短袖') || text.includes('上衣')) {
+  return createElementSvg('tshirt', '上衣')
+}
+
+if (text.includes('短裤') || text.includes('长裤') || text.includes('裤')) {
+  return createElementSvg('pants', '裤装')
+}
+
+if (text.includes('吊带') || text.includes('背心')) {
+  return createElementSvg('top', '上衣')
+}
+
+if (text.includes('木门') || text.includes('门')) {
+  return createElementSvg('door', '门')
+}
+
+if (text.includes('拱门') || text.includes('花艺') || text.includes('花门')) {
+  return createElementSvg('arch', '拱门')
+}
   if (text.includes('水杯') || text.includes('保温杯') || text.includes('杯子')) {
     return createElementSvg('cup', '水杯')
   }
@@ -331,6 +361,52 @@ function getElementPlaceholder(title = '') {
 
 function createElementSvg(type, label) {
   const icons = {
+    dress: `
+  <path d="M48 24h24l8 18-10 8 14 38H36l14-38-10-8 8-18Z"/>
+  <path d="M52 24c2 8 14 8 16 0"/>
+`,
+
+suit: `
+  <path d="M42 24h36l10 64H32l10-64Z"/>
+  <path d="M52 24l8 18 8-18"/>
+  <path d="M60 42v44"/>
+  <path d="M44 38l16 10 16-10"/>
+`,
+
+chineseClothes: `
+  <path d="M38 26h44l8 18-12 8v36H42V52l-12-8 8-18Z"/>
+  <path d="M60 28v58"/>
+  <path d="M60 44c8 0 14-4 18-10"/>
+`,
+
+tshirt: `
+  <path d="M42 28l10-8h16l10 8 16 12-12 18-8-6v36H46V52l-8 6-12-18 16-12Z"/>
+`,
+
+pants: `
+  <path d="M42 26h36l-4 62H62l-2-36-2 36H46l-4-62Z"/>
+  <path d="M42 40h36"/>
+`,
+
+top: `
+  <path d="M48 24h24l10 64H38l10-64Z"/>
+  <path d="M52 24c0 10 16 10 16 0"/>
+  <path d="M48 24l-8 18"/>
+  <path d="M72 24l8 18"/>
+`,
+
+door: `
+  <rect x="34" y="20" width="52" height="78" rx="4"/>
+  <path d="M46 20v78"/>
+  <path d="M72 60h4"/>
+`,
+
+arch: `
+  <path d="M28 88V54a32 32 0 0 1 64 0v34"/>
+  <path d="M40 88V56a20 20 0 0 1 40 0v32"/>
+  <path d="M32 48c8-12 20-20 28-22"/>
+  <path d="M88 48c-8-12-20-20-28-22"/>
+`,
     cup: `
       <path d="M36 30h34v46a10 10 0 0 1-10 10H46a10 10 0 0 1-10-10V30Z"/>
       <path d="M70 42h8a12 12 0 0 1 0 24h-8"/>
@@ -561,7 +637,7 @@ class="custom-group-grid"
             :disabled="isGenerating"
             @click="emit('generate')"
           >
-            {{ generateBtnText }}
+            {{ isGenerating ? '生成中...' : generateBtnText }}
           </button>
         </div>
       </div>
@@ -626,6 +702,11 @@ class="custom-group-grid"
 </template>
 
 <style scoped>
+.generate-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  filter: grayscale(0.2);
+}
 .replace-rail {
   position: relative;
   z-index: 5;

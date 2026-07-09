@@ -8,6 +8,20 @@ const fs = require("fs");
 const https = require("https");
 
 const app = express();
+const PORT = process.env.PORT || 3000;
+
+const DEFAULT_ALLOWED_ORIGINS = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+];
+const configuredOrigins = [
+  process.env.FRONTEND_ORIGIN,
+  ...(process.env.CORS_ORIGINS || "").split(","),
+]
+  .filter(Boolean)
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const allowedOrigins = new Set([...DEFAULT_ALLOWED_ORIGINS, ...configuredOrigins]);
 
 // uploads 目录：优先用环境变量，默认用 backend 目录下的 uploads
 const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(__dirname, "uploads");
@@ -16,12 +30,27 @@ const upload = multer({ dest: UPLOADS_DIR });
 // 旧版前端静态托管：指向同级 react-old 目录
 const LEGACY_FRONTEND_DIR = process.env.LEGACY_FRONTEND_DIR || path.join(__dirname, "..", "react-old");
 
-app.use(cors());
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error(`CORS origin not allowed: ${origin}`));
+  },
+}));
 app.use(express.json());
 app.use(express.static(LEGACY_FRONTEND_DIR));
 app.use("/uploads", express.static(UPLOADS_DIR));
 app.use("/generated", express.static("/tmp/openclaw/rh-output"));
 app.use("/assets", express.static(path.join(LEGACY_FRONTEND_DIR, "assets")));
+
+app.get("/api/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "viral-lab-backend",
+    time: new Date().toISOString(),
+  });
+});
 
 const RUNNINGHUB_SKILL_DIR =
   process.env.RUNNINGHUB_SKILL_DIR ||
@@ -71,7 +100,7 @@ app.post("/api/video-to-text", upload.single("video"), (req, res) => {
   if (!process.env.RUNNINGHUB_API_KEY) {
     return res.status(500).json({
       ok: false,
-      message: "缺少 RUNNINGHUB_API_KEY，请先在终端 export RUNNINGHUB_API_KEY",
+      message: "后端未配置 RunningHub API Key",
     });
   }
 
@@ -134,7 +163,7 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
   if (!process.env.RUNNINGHUB_API_KEY) {
     return res.status(500).json({
       ok: false,
-      message: "缺少 RUNNINGHUB_API_KEY，请先在终端 export RUNNINGHUB_API_KEY",
+      message: "后端未配置 RunningHub API Key",
     });
   }
 
@@ -387,6 +416,12 @@ app.post("/api/extract-element-preview", upload.single("image"), async (req, res
   ];
   const missing = requiredVars.filter((v) => !process.env[v]);
   if (missing.length) {
+    if (missing.includes("RUNNINGHUB_API_KEY")) {
+      return res.status(500).json({
+        ok: false,
+        message: "后端未配置 RunningHub API Key",
+      });
+    }
     return res.status(500).json({
       ok: false,
       message: `缺少环境变量: ${missing.join(", ")}，请先在 .env 或终端中配置`,
@@ -458,6 +493,6 @@ app.post("/api/extract-element-preview", upload.single("image"), async (req, res
   }
 });
 
-app.listen(3000, () => {
-  console.log("爆款实验室本地服务已启动：http://localhost:3000");
+app.listen(PORT, () => {
+  console.log(`爆款实验室服务已启动：http://localhost:${PORT}`);
 });

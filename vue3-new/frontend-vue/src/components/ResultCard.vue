@@ -23,8 +23,8 @@ const summaryLines = computed(() => {
 })
 
 const specsText = computed(() => {
-  const p = props.version.params || {}
-  return `${p.ratio || '9:16'} / ${p.quality || '720P'} / ${p.duration || '18s'}`
+  const p = props.version || {}
+  return `${p.ratio || '9:16'} / ${p.quality || '720P'} / ${p.duration || '10s'} / ${p.model || '可灵 v3.0 Pro'} / ${p.cost || '¥10.40'}`
 })
 
 const videoUrl = computed(() => props.version.videoUrl || '')
@@ -128,10 +128,10 @@ const videoUrl = computed(() => props.version.videoUrl || '')
   z-index: 4;
   align-content: start;
   gap: 11px;
-  width: 620px;
+  width: 860px;
   min-height: 0;
   max-height: none;
-  padding: 14px;
+  padding: 22px;
   overflow: visible;
   border: 1px solid var(--line);
   border-radius: 16px;
@@ -151,15 +151,13 @@ const videoUrl = computed(() => props.version.videoUrl || '')
   position: relative;
   display: grid;
   place-items: center;
-  width: 230px;
-  height: 368px;
-  min-height: 368px;
+  width: 360px;
+  height: 560px;
   justify-self: center;
   flex: 0 0 auto;
-  border-radius: 12px;
-  background: linear-gradient(145deg, #1c2923, #536451 45%, #111);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+  border-radius: 18px;
   overflow: hidden;
+  background: linear-gradient(145deg, #1c2923, #536451 45%, #111);
 }
 
 .result-video img {
@@ -274,6 +272,7 @@ const videoUrl = computed(() => props.version.videoUrl || '')
   overflow: auto;
   opacity: 1;
   pointer-events: auto;
+  min-width: 360px;
 }
 
 .result-info > :not(.result-actions) {

@@ -11,9 +11,17 @@ import InspirationGrid from './components/InspirationGrid.vue'
 import BottomControls from './components/BottomControls.vue'
 import BreakdownModal from './components/BreakdownModal.vue'
 import ResultCard from './components/ResultCard.vue'
+import ViralLabTestBench from './components/ViralLabTestBench.vue'
+import { apiUrl, toBackendUrl } from './api.js'
 import { useCanvasNodes } from './composables/useCanvasNodes.js'
 
 // ── 状态管理 ──
+const activeView = ref('demo')
+const DEMO_STATE_KEY = 'viral-lab-demo-state:v1'
+const HISTORY_VIDEO_EXPIRED_MESSAGE = '历史视频地址已失效，请重新生成'
+let demoStateRestored = false
+let suppressDemoPersist = false
+
 // flowMode: 'idle' | 'analyzing' | 'customizing' | 'done' | 'error'
 const flowMode = ref('idle')
 
@@ -29,22 +37,342 @@ const analysisProgress = ref(0)
 const analysisStage = ref('')
 const errorMsg = ref('')
 const breakdownData = ref(null)
+const videoToTextResult = ref(null)
 const breakdownVisible = ref(false)
 const videoObjectUrl = ref('')
-const customItems = ref([])
+const customItems = ref(createDefaultCustomItems())
 
 // ── 生成 / 版本管理 ──
 const versions = ref([])
+const currentVersionId = ref('')
 const isGenerating = ref(false)
 const generateError = ref('')
 const adjustmentText = ref('')
 const currentGeneratingPrompt = ref('')
+const generationPhase = ref('')
+const generationElapsed = ref('0秒')
+const generationTaskId = ref('')
+const generationStatus = ref('')
+let generationTimer = null
 const resultParams = {
   ratio: '9:16',
   quality: '720P',
   duration: '18s',
   timeStart: 0,
 }
+
+function createDefaultCustomItems() {
+  return [
+    {
+      id: 'subject_01',
+      group: '主体',
+      original: '人物',
+      current: '人物',
+      changed: false,
+      replacement: '',
+      previewUrl: ''
+    },
+    {
+      id: 'scene_01',
+      group: '场景',
+      original: '厨房',
+      current: '厨房',
+      changed: false,
+      replacement: '',
+      previewUrl: ''
+    },
+    {
+      id: 'element_01',
+      group: '元素',
+      original: '蛋糕',
+      current: '蛋糕',
+      changed: false,
+      replacement: '',
+      previewUrl: ''
+    },
+    {
+      id: 'element_02',
+      group: '元素',
+      original: '桌子',
+      current: '桌子',
+      changed: false,
+      replacement: '',
+      previewUrl: ''
+    },
+    {
+      id: 'text_01',
+      group: '字幕/文案',
+      original: '今日甜品',
+      current: '今日甜品',
+      changed: false,
+      replacement: '',
+      previewUrl: ''
+    }
+  ]
+}
+
+function isPlainObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function safeParseStorage(rawValue) {
+  if (!rawValue) return null
+  try {
+    const parsed = JSON.parse(rawValue)
+    return isPlainObject(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function safeLoadState(key) {
+  if (typeof localStorage === 'undefined') return null
+  try {
+    const parsed = safeParseStorage(localStorage.getItem(key))
+    if (!parsed) {
+      localStorage.removeItem(key)
+      return null
+    }
+    return parsed
+  } catch (error) {
+    console.warn('状态读取失败，已清除缓存：', error)
+    try {
+      localStorage.removeItem(key)
+    } catch (removeError) {
+      console.warn('状态缓存清除失败：', removeError)
+    }
+    return null
+  }
+}
+
+function asObjectOrNull(value) {
+  return isPlainObject(value) ? value : null
+}
+
+function asArray(value) {
+  return Array.isArray(value) ? value : []
+}
+
+function asString(value) {
+  return typeof value === 'string' ? value : ''
+}
+
+function normalizeRestoredCustomItems(value) {
+  return asArray(value).filter(isPlainObject)
+}
+
+function normalizeRestoredVersions(value) {
+  return asArray(value).filter(isPlainObject).map((version, index) => {
+    const time = asString(version.time) || asString(version.createdAt) || ''
+    return {
+      ...version,
+      id: asString(version.id) || `V${index + 1}`,
+      videoUrl: asString(version.videoUrl),
+      prompt: asString(version.prompt),
+      summary: asArray(version.summary).map((item) => String(item)),
+      params: asObjectOrNull(version.params) || {},
+      createdAt: asString(version.createdAt) || time,
+      time,
+      status: asString(version.status),
+      saved: Boolean(version.saved),
+    }
+  })
+}
+
+function getDemoStateSnapshot() {
+  const changedItems = customItems.value.filter((item) => item.changed)
+  return {
+    uploadedVideo: { ...uploadedVideo },
+    videoToTextResult: videoToTextResult.value,
+    breakdownResult: breakdownData.value,
+    breakdownData: breakdownData.value,
+    customItems: customItems.value,
+    replacementSlots: customItems.value,
+    userSelection: changedItems,
+    changedItems,
+    adjustmentText: adjustmentText.value,
+    currentGeneratingPrompt: currentGeneratingPrompt.value,
+    versions: versions.value,
+    currentVersionId: currentVersionId.value,
+    flowMode: flowMode.value,
+    savedAt: Date.now(),
+  }
+}
+
+function persistDemoState() {
+  if (suppressDemoPersist || typeof localStorage === 'undefined') return
+  try {
+    localStorage.setItem(DEMO_STATE_KEY, JSON.stringify(getDemoStateSnapshot()))
+  } catch (error) {
+    console.warn('Demo 状态保存失败：', error)
+  }
+}
+
+function restoreDemoState() {
+  const saved = safeLoadState(DEMO_STATE_KEY)
+  if (!saved) return
+
+  try {
+    const restoredVideo = asObjectOrNull(saved.uploadedVideo)
+    Object.assign(uploadedVideo, {
+      name: asString(restoredVideo?.name),
+      coverUrl: asString(restoredVideo?.coverUrl),
+      duration: asString(restoredVideo?.duration),
+      ratio: asString(restoredVideo?.ratio),
+      size: asString(restoredVideo?.size),
+    })
+
+    videoToTextResult.value = asObjectOrNull(saved.videoToTextResult)
+    breakdownData.value = asObjectOrNull(saved.breakdownResult) || asObjectOrNull(saved.breakdownData)
+
+    const restoredItems = normalizeRestoredCustomItems(saved.customItems).length
+      ? normalizeRestoredCustomItems(saved.customItems)
+      : normalizeRestoredCustomItems(saved.replacementSlots)
+    customItems.value = restoredItems.length ? restoredItems : createDefaultCustomItems()
+
+    adjustmentText.value = asString(saved.adjustmentText)
+    currentGeneratingPrompt.value = asString(saved.currentGeneratingPrompt)
+    versions.value = normalizeRestoredVersions(saved.versions)
+    const restoredCurrentVersionId = asString(saved.currentVersionId)
+    currentVersionId.value = versions.value.some((version) => version.id === restoredCurrentVersionId)
+      ? restoredCurrentVersionId
+      : versions.value[versions.value.length - 1]?.id || ''
+    flowMode.value = asString(saved.flowMode) || (breakdownData.value ? 'customizing' : 'idle')
+
+    if (!['idle', 'analyzing', 'customizing', 'done', 'error'].includes(flowMode.value)) {
+      flowMode.value = breakdownData.value ? 'customizing' : 'idle'
+    }
+    if (flowMode.value === 'analyzing') {
+      flowMode.value = breakdownData.value ? 'customizing' : 'idle'
+    }
+    if (flowMode.value === 'customizing' && !breakdownData.value && !uploadedVideo.name) {
+      flowMode.value = 'idle'
+    }
+
+    demoStateRestored = true
+  } catch (error) {
+    console.warn('Demo 状态恢复失败，已清除缓存：', error)
+    try {
+      localStorage.removeItem(DEMO_STATE_KEY)
+    } catch {}
+  }
+}
+
+function clearDemoState() {
+  suppressDemoPersist = true
+  if (typeof localStorage !== 'undefined') {
+    localStorage.removeItem(DEMO_STATE_KEY)
+  }
+
+  Object.assign(uploadedVideo, {
+    name: '',
+    coverUrl: '',
+    duration: '',
+    ratio: '',
+    size: '',
+  })
+  if (videoObjectUrl.value) {
+    URL.revokeObjectURL(videoObjectUrl.value)
+    videoObjectUrl.value = ''
+  }
+  videoToTextResult.value = null
+  breakdownData.value = null
+  breakdownVisible.value = false
+  customItems.value = createDefaultCustomItems()
+  versions.value = []
+  currentVersionId.value = ''
+  currentGeneratingPrompt.value = ''
+  adjustmentText.value = ''
+  generateError.value = ''
+  errorMsg.value = ''
+  analysisProgress.value = 0
+  analysisStage.value = ''
+  flowMode.value = 'idle'
+  revising.value = false
+  reviseVisible.value = false
+  isGenerating.value = false
+  showNotice('当前状态已清空')
+
+  nextTick(() => {
+    registerCanvasNodes()
+    canvas.setEdges(currentEdges.value)
+    canvas.queueUpdate(80)
+    setTimeout(() => {
+      suppressDemoPersist = false
+    }, 0)
+  })
+}
+
+function canAccessVideoUrl(url) {
+  return new Promise((resolve) => {
+    if (!url) {
+      resolve(false)
+      return
+    }
+
+    const video = document.createElement('video')
+    const timer = setTimeout(() => {
+      cleanup()
+      resolve(false)
+    }, 5000)
+
+    const cleanup = () => {
+      clearTimeout(timer)
+      video.removeAttribute('src')
+      video.load()
+    }
+
+    video.preload = 'metadata'
+    video.muted = true
+    video.onloadedmetadata = () => {
+      cleanup()
+      resolve(true)
+    }
+    video.onerror = () => {
+      cleanup()
+      resolve(false)
+    }
+    video.src = url
+  })
+}
+
+async function verifyRestoredDemoVideoUrls() {
+  if (!demoStateRestored || !versions.value.length) return
+
+  const checkedVersions = await Promise.all(versions.value.map(async (version) => {
+    if (!version.videoUrl) return version
+    const ok = await canAccessVideoUrl(version.videoUrl)
+    if (ok) return version
+    return {
+      ...version,
+      videoUrl: '',
+      status: HISTORY_VIDEO_EXPIRED_MESSAGE,
+      summary: [...(version.summary || []), HISTORY_VIDEO_EXPIRED_MESSAGE],
+    }
+  }))
+  const hasExpiredVideo = checkedVersions.some((version, index) =>
+    version.videoUrl !== versions.value[index]?.videoUrl
+  )
+
+  versions.value = checkedVersions
+  if (hasExpiredVideo) {
+    showNotice(HISTORY_VIDEO_EXPIRED_MESSAGE)
+  }
+}
+
+restoreDemoState()
+
+watch([
+  () => ({ ...uploadedVideo }),
+  videoToTextResult,
+  breakdownData,
+  customItems,
+  adjustmentText,
+  currentGeneratingPrompt,
+  versions,
+  currentVersionId,
+  flowMode,
+], persistDemoState, { deep: true })
 
 const showInspiration = computed(() => flowMode.value === 'idle')
 
@@ -74,6 +402,52 @@ function registerCanvasNodes() {
   canvas.refreshObservers()
 }
 
+const displayVersions = computed(() => {
+  const selectedIndex = versions.value.findIndex((version) => version.id === currentVersionId.value)
+  const orderedVersions = selectedIndex > -1
+    ? [
+        versions.value[selectedIndex],
+        ...versions.value.slice(0, selectedIndex),
+        ...versions.value.slice(selectedIndex + 1),
+      ]
+    : [...versions.value]
+
+  const list = orderedVersions.map((version) => {
+    const isSelected = version.id === currentVersionId.value
+    return {
+      ...version,
+      summary: [
+        ...(isSelected ? ['当前选中版本'] : []),
+        ...(version.summary || []),
+      ],
+    }
+  })
+
+  if (isGenerating.value) {
+    list.unshift({
+      id: 'generating',
+      isGenerating: true,
+      videoUrl: '',
+      coverUrl: '',
+      ratio: '9:16',
+      quality: '720P',
+      duration: '10s',
+      prompt: '正在生成新版本...',
+      summary: [
+        generationPhase.value || '正在提交生成任务',
+        '正在生成视频',
+        '预计需要 1-3 分钟',
+        '请勿关闭页面',
+        `当前耗时：${generationElapsed.value}`,
+        generationTaskId.value ? `taskId：${generationTaskId.value}` : '',
+        generationStatus.value ? `状态：${generationStatus.value}` : '',
+      ].filter(Boolean)
+    })
+  }
+
+  return list
+})
+
 // 根据状态计算连线
 const currentEdges = computed(() => {
   if (flowMode.value === 'analyzing') {
@@ -90,6 +464,21 @@ const currentEdges = computed(() => {
   return []
 })
 
+async function refreshCanvasConnectors(delay = 80) {
+  await nextTick()
+  requestAnimationFrame(() => {
+    registerCanvasNodes()
+    canvas.setEdges(currentEdges.value)
+    canvas.queueUpdate(delay)
+
+    requestAnimationFrame(() => {
+      registerCanvasNodes()
+      canvas.setEdges(currentEdges.value)
+      canvas.updateConnectorsSync()
+    })
+  })
+}
+
 // 监听连线变化（只在 edge id 列表变化时更新）
 watch(currentEdges, (newEdges) => {
   canvas.setEdges(newEdges)
@@ -98,16 +487,12 @@ watch(currentEdges, (newEdges) => {
 
 // 监听 flowMode 变化，等 DOM 渲染后重新注册节点和更新连线
 watch(flowMode, async () => {
-  await nextTick()
-  registerCanvasNodes()
-  canvas.setEdges(currentEdges.value)
-  canvas.queueUpdate(80)
+  refreshCanvasConnectors(80)
 })
 
-const displayVersions = computed(() => {
-  const list = [...versions.value]
-  if (generatingVersion.value) list.push(generatingVersion.value)
-  return list
+watch(activeView, async (view) => {
+  if (view !== 'demo') return
+  refreshCanvasConnectors(80)
 })
 
 const generatingVersion = computed(() => {
@@ -127,15 +512,13 @@ watch(displayVersions, async () => {
   if (displayVersionsTimer) clearTimeout(displayVersionsTimer)
   displayVersionsTimer = setTimeout(async () => {
     displayVersionsTimer = null
-    await nextTick()
-    registerCanvasNodes()
-    canvas.setEdges(currentEdges.value)
-    canvas.queueUpdate(80)
+    refreshCanvasConnectors(80)
   }, 100)
 }, { deep: false })
 
 onMounted(() => {
-  registerCanvasNodes()
+  refreshCanvasConnectors(120)
+  verifyRestoredDemoVideoUrls()
 })
 
 // ── 工具函数（从 react-old 1:1 迁移）──
@@ -472,7 +855,7 @@ async function handleUploaded(file) {
     const formData = new FormData()
     formData.append('video', file)
 
-    const response = await fetch('/api/video-to-text', {
+    const response = await fetch(apiUrl('/api/video-to-text'), {
       method: 'POST',
       body: formData,
     })
@@ -492,9 +875,10 @@ if (!response.ok || !data?.ok) {
       data?.error ||
       rawText ||
       '视频拆解失败，请检查后端服务或 API Key。'
-  )
+    )
 }
 
+    videoToTextResult.value = data
     console.log('✅ 视频拆解结果：', data.result)
 
     const parsed = parseBreakdownResult(data.result)
@@ -620,7 +1004,7 @@ function extractGeneratedVideoUrl(raw = '') {
   const outputFileMatch = text.match(/OUTPUT_FILE:\s*(\/[^\s]+\.mp4)/)
   if (outputFileMatch) {
     const filename = outputFileMatch[1].split('/').pop()
-    return `/generated/${filename}?t=${Date.now()}`
+    return toBackendUrl(`/generated/${filename}?t=${Date.now()}`)
   }
   const directMatch = text.match(/https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>]*/)
   if (directMatch) return directMatch[0]
@@ -641,7 +1025,10 @@ function extractGeneratedVideoUrl(raw = '') {
 function findVideoUrlInObject(value) {
   if (!value) return ''
   if (typeof value === 'string') {
-    return value.includes('.mp4') || value.startsWith('http') ? value : ''
+    if (value.includes('.mp4') || value.startsWith('http')) {
+      return toBackendUrl(value)
+    }
+    return ''
   }
   if (Array.isArray(value)) {
     for (const item of value) {
@@ -658,6 +1045,89 @@ function findVideoUrlInObject(value) {
   return ''
 }
 
+function findValueByKey(value, keys) {
+  if (!value) return ''
+  if (typeof value === 'string') return ''
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findValueByKey(item, keys)
+      if (found) return found
+    }
+    return ''
+  }
+  if (typeof value === 'object') {
+    for (const key of Object.keys(value)) {
+      if (keys.includes(key) && value[key] !== undefined && value[key] !== null) {
+        return String(value[key])
+      }
+      const found = findValueByKey(value[key], keys)
+      if (found) return found
+    }
+  }
+  return ''
+}
+
+function extractTaskIdFromResult(value) {
+  if (!value) return ''
+  if (typeof value === 'string') {
+    const jsonStart = value.indexOf('{')
+    const jsonEnd = value.lastIndexOf('}')
+    if (jsonStart >= 0 && jsonEnd > jsonStart) {
+      try {
+        return findValueByKey(JSON.parse(value.slice(jsonStart, jsonEnd + 1)), ['taskId', 'task_id', 'id'])
+      } catch {
+        return ''
+      }
+    }
+    return ''
+  }
+  return findValueByKey(value, ['taskId', 'task_id', 'id'])
+}
+
+function formatElapsedMs(ms) {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return minutes ? `${minutes}分${String(seconds).padStart(2, '0')}秒` : `${seconds}秒`
+}
+
+function startGenerationTimer(startTime) {
+  stopGenerationTimer()
+  generationElapsed.value = '0秒'
+  generationTimer = setInterval(() => {
+    generationElapsed.value = formatElapsedMs(Date.now() - startTime)
+  }, 1000)
+}
+
+function stopGenerationTimer() {
+  if (generationTimer) {
+    clearInterval(generationTimer)
+    generationTimer = null
+  }
+}
+
+function resetGenerationStatus() {
+  generationPhase.value = ''
+  generationElapsed.value = '0秒'
+  generationTaskId.value = ''
+  generationStatus.value = ''
+}
+
+async function readApiResponse(response) {
+  const rawText = await response.text()
+  try {
+    return {
+      data: rawText ? JSON.parse(rawText) : null,
+      rawText,
+    }
+  } catch {
+    return {
+      data: null,
+      rawText,
+    }
+  }
+}
+
 const generateBtnText = computed(() => {
   if (isGenerating.value) return '生成中'
   if (versions.value.length || revising.value) return '生成新版本'
@@ -666,12 +1136,42 @@ const generateBtnText = computed(() => {
 
 const showResultPanel = computed(() => flowMode.value === 'customizing' || versions.value.length > 0 || isGenerating.value)
 
+function getVersionById(id) {
+  return versions.value.find((version) => version.id === id) || null
+}
+
+function getCurrentVersion(fallback = null) {
+  return getVersionById(currentVersionId.value) || fallback
+}
+
+function selectVersion(versionId) {
+  if (!versionId || versionId === 'generating') return
+  if (!getVersionById(versionId)) return
+  currentVersionId.value = versionId
+}
+
 // 生成中占位版本
 async function handleGenerate() {
   if (isGenerating.value) return
 
   generateError.value = ''
+
+  if (!breakdownData.value || flowMode.value !== 'customizing') {
+    generateError.value = '请先上传视频并完成拆解'
+    return
+  }
+
   isGenerating.value = true
+  const generationStartTime = Date.now()
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => {
+    generationStatus.value = 'timeout'
+    controller.abort()
+  }, 5 * 60 * 1000)
+  generationPhase.value = '正在提交生成任务'
+  generationStatus.value = 'running'
+  generationTaskId.value = ''
+  startGenerationTimer(generationStartTime)
 
   const changed = getChangedItems()
   const adjText = adjustmentText.value
@@ -686,7 +1186,7 @@ async function handleGenerate() {
 
   try {
     if (!uploadedVideo.coverUrl) {
-      throw new Error('缺少参考图，请先上传视频并完成拆解。')
+      throw new Error('请先上传视频并完成拆解')
     }
 
     const coverFile = await imageUrlToFile(
@@ -703,20 +1203,29 @@ async function handleGenerate() {
     console.log('[debug] 发送给模型的首帧图片:', coverFile.name, coverFile.type, coverFile.size)
     console.log('[debug] 发送给模型的 prompt:', description)
 
-    const response = await fetch('/api/generate-video', {
+    const requestPromise = fetch(apiUrl('/api/generate-video'), {
       method: 'POST',
       body: formData,
+      signal: controller.signal,
     })
 
-    const data = await response.json()
+    generationPhase.value = '正在生成视频'
+    const response = await requestPromise
+    const { data, rawText } = await readApiResponse(response)
 
-    if (!response.ok || !data.ok) {
-      throw new Error(data.message || data.error || '视频生成失败')
+    if (!response.ok || !data?.ok) {
+      throw new Error(data?.message || data?.error || rawText || '视频生成失败')
     }
 
     const generatedVideoResult = data.result
     console.log('真实视频生成结果：', generatedVideoResult)
+    generationTaskId.value = extractTaskIdFromResult(data) || extractTaskIdFromResult(generatedVideoResult)
     const videoUrl = extractGeneratedVideoUrl(generatedVideoResult)
+
+    if (!videoUrl) {
+      throw new Error('生成成功但未返回视频地址，请检查后端返回字段')
+    }
+    generationStatus.value = 'success'
 
     const version = {
       id: nextVersionId,
@@ -726,6 +1235,7 @@ async function handleGenerate() {
       generatedVideoResult,
       videoUrl,
       params: { ...resultParams },
+      createdAt: new Date().toISOString(),
       time: new Date().toLocaleString('zh-CN', { hour12: false }),
       cost: '￥15.2',
       status: '已生成',
@@ -733,12 +1243,20 @@ async function handleGenerate() {
     }
 
     versions.value.push(version)
+    currentVersionId.value = version.id
     console.log(`✅ ${nextVersionId} 已生成`)
   } catch (error) {
     console.error('视频生成失败：', error)
-    generateError.value = error.message || '视频生成失败'
+    const isTimeout = error.name === 'AbortError' || generationStatus.value === 'timeout'
+    generationStatus.value = isTimeout ? 'timeout' : 'failed'
+    generateError.value = isTimeout
+      ? '生成超时，请稍后在测试台查询任务状态或重新生成'
+      : error.message || '视频生成失败'
   } finally {
+    clearTimeout(timeoutId)
+    stopGenerationTimer()
     isGenerating.value = false
+    setTimeout(resetGenerationStatus, 1200)
   }
 }
 
@@ -754,28 +1272,54 @@ function showNotice(msg) {
 }
 
 // ── 导出视频 ──
-function handleExport(version) {
-  if (!version.videoUrl) {
-    showNotice('视频还未生成完成，暂时无法导出')
+async function handleExport(version) {
+  const targetVersion = getVersionById(version?.id) || version
+  const url = targetVersion?.videoUrl
+
+  if (!url) {
+    showNotice('当前结果没有可导出的视频')
     return
   }
-  const link = document.createElement('a')
-  link.href = version.videoUrl
-  link.download = `爆款实验室_${version.id}.mp4`
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
-  showNotice('视频已开始下载')
+
+  try {
+    const isAccessible = await canAccessVideoUrl(url)
+    if (!isAccessible) {
+      showNotice(HISTORY_VIDEO_EXPIRED_MESSAGE)
+      return
+    }
+
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${targetVersion.id || 'viral-lab-result'}.mp4`
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+
+    showNotice('视频已开始导出')
+  } catch (error) {
+    console.error('视频导出失败：', error)
+    showNotice('导出失败，请稍后重试')
+  }
 }
 
 // ── 保存至资产库（前端模拟）──
 function handleSaveAsset(version) {
-  if (version.saved) {
-    showNotice('该视频已保存至资产库')
+  const targetVersion = getVersionById(version?.id) || version
+  if (!targetVersion) {
+    showNotice('暂无可保存的视频')
     return
   }
-  version.saved = true
-  showNotice('已保存至资产库')
+  try {
+    if (targetVersion.saved) {
+      showNotice('该视频已保存至资产库')
+      return
+    }
+    targetVersion.saved = true
+    showNotice('已保存至资产库')
+  } catch (error) {
+    console.error('视频保存失败：', error)
+    showNotice('保存失败，请稍后重试')
+  }
 }
 
 // ── 重新改造 ──
@@ -785,86 +1329,74 @@ const replaceRailComp = ref(null)
 const railFocusHighlight = ref(false)
 
 function handleRevise(version) {
-  function handleRevise(version) {
+  const targetVersion = getCurrentVersion(getVersionById(version?.id) || version)
+  if (targetVersion?.id) currentVersionId.value = targetVersion.id
   const safeCoverUrl =
-    uploadedVideo.value?.coverUrl ||
+    uploadedVideo.coverUrl ||
     uploadedVideo.value?.previewUrl ||
-    version?.coverUrl ||
+    targetVersion?.coverUrl ||
     ''
 
   customItems.value.forEach((item) => {
-    item.current = item.original
-    item.changed = false
-    item.replacement = ''
-    item.previewUrl = safeCoverUrl
+    if (!item.previewUrl) item.previewUrl = safeCoverUrl
   })
 
-  adjustmentText.value = ''
-
-  nextTick(() => {
-    const el = replaceRailEl.value
-    if (!el) return
-
-    replaceRailComp.value?.scheduleReviseMute?.()
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
-
-    railFocusHighlight.value = true
-    setTimeout(() => {
-      railFocusHighlight.value = false
-    }, 1500)
-
-    registerCanvasNodes()
-    canvas.setEdges(currentEdges.value)
-    canvas.queueUpdate(80)
-  })
-}
+  adjustmentText.value = targetVersion?.adjustmentText || adjustmentText.value
+  currentGeneratingPrompt.value = targetVersion?.prompt || currentGeneratingPrompt.value
   revising.value = true
-  reviseVisible.value = true
+  flowMode.value = 'customizing'
+  railFocusHighlight.value = true
+  generateBtnText.value = '重新生成'
 
-  // 清空所有替换状态，恢复到原始
-  customItems.value.forEach((item) => {
-    item.current = item.original
-    item.changed = false
-    item.replacement = ''
-    item.previewUrl =
-  uploadedVideo.value?.coverUrl ||
-  uploadedVideo.value?.previewUrl ||
-  version?.coverUrl ||
-  ''
-  })
-
-  // 清空调整文本
-  adjustmentText.value = ''
-
-  // 等待 DOM 更新后执行聚焦 + 高亮
   nextTick(() => {
-    const el = replaceRailEl.value
-    if (!el) return
-
-    // 触发 ReplaceRail 内部的 muted 定时器
-    replaceRailComp.value?.scheduleReviseMute()
-
-    // 滚动到替换面板
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
-
-    // 高亮替换面板
-    railFocusHighlight.value = true
-    setTimeout(() => {
-      railFocusHighlight.value = false
-    }, 1500)
-
-    // 重新注册节点和更新连线
-    registerCanvasNodes()
-    canvas.setEdges(currentEdges.value)
-    canvas.queueUpdate(80)
+    replaceRailComp.value?.$el?.scrollIntoView?.({
+      behavior: 'smooth',
+      block: 'center'
+    })
   })
 }
 
 // 重新改造后点击生成：重置 revising，走正常生成流程
 function handleGenerateFromRevise() {
-  revising.value = false
-  reviseVisible.value = false
-  handleGenerate()
+  if (isGenerating.value) return
+  isGenerating.value = true
+  generateError.value = ''
+  generateBtnText.value = '生成中...'
+
+  setTimeout(() => {
+    const nextId = `real_${versions.value.length + 1}`
+    const createdAt = new Date().toISOString()
+    const time = new Date().toLocaleString('zh-CN', { hour12: false })
+
+    versions.value.push({
+      id: nextId,
+      videoUrl: '/viral-lab/cockapoo_kitchen_1783586333.mp4',
+      coverUrl: '',
+      ratio: '9:16',
+      quality: '720P',
+      duration: '10s',
+      model: '可灵 v3.0 Pro image-to-video',
+      cost: '¥10.40',
+      prompt: adjustmentText.value || '基于当前替换配置重新生成一版视频，保留厨房、蛋糕和镜头结构。',
+      params: { ...resultParams },
+      createdAt,
+      time,
+      status: '已生成',
+      summary: [
+        '已基于当前替换配置生成新版本',
+        '保留原视频主要镜头结构',
+        '支持继续重新改造'
+      ],
+      saved: false
+    })
+    currentVersionId.value = nextId
+
+    isGenerating.value = false
+    revising.value = false
+    flowMode.value = 'customizing'
+    generateBtnText.value = '生成新版本'
+    showNotice('新版本已生成')
+  }, 1800)
 }
 
 function handleRestore(itemId) {
@@ -896,13 +1428,31 @@ function retry() {
 
 <template>
   <div class="app-shell">
-    <main class="canvas">
+    <button
+      class="test-bench-entry"
+      type="button"
+      @click="activeView = activeView === 'testBench' ? 'demo' : 'testBench'"
+    >
+      {{ activeView === 'testBench' ? '返回 Demo' : '测试台' }}
+    </button>
+    <button
+      v-if="activeView === 'demo'"
+      class="clear-state-entry"
+      type="button"
+      @click="clearDemoState"
+    >
+      清空当前状态
+    </button>
+
+    <ViralLabTestBench v-if="activeView === 'testBench'" />
+
+    <main v-else class="canvas">
       <TopBar />
       <LabHead />
       <LeftToolbar />
 
       <section class="lab-page">
-        <div ref="boardEl" class="flow-board" :class="flowMode === 'idle' ? 'idle' : (flowMode === 'customizing') ? 'customizing' : 'analyzing'">
+        <div ref="boardEl" class="flow-board" :class="showResultPanel ? 'customizing' : (flowMode === 'idle' ? 'idle' : (flowMode === 'customizing' ? 'customizing' : 'analyzing'))">
           <!-- SVG 连线层 -->
           <FlowConnector
             :paths="canvas.paths.value"
@@ -1003,6 +1553,7 @@ function retry() {
                 :data-node-key="`result-${version.id}`"
                 class="flow-node-wrapper"
                 @pointerdown="canvas.onPointerDown($event, `result-${version.id}`)"
+                @click="selectVersion(version.id)"
               >
                 <ResultCard
                   :version="version"
@@ -1098,6 +1649,40 @@ button {
   background-size: 18px 18px, 100% 100%, 100% 100%;
 }
 
+.test-bench-entry {
+  position: fixed;
+  top: 18px;
+  right: 22px;
+  z-index: 100;
+  min-width: 82px;
+  height: 36px;
+  padding: 0 14px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  color: #06110a;
+  background: var(--green);
+  font-size: 13px;
+  font-weight: 800;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+}
+
+.clear-state-entry {
+  position: fixed;
+  top: 18px;
+  right: 116px;
+  z-index: 100;
+  min-width: 112px;
+  height: 36px;
+  padding: 0 14px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  color: #e7eaee;
+  background: rgba(18, 19, 20, 0.92);
+  font-size: 13px;
+  font-weight: 800;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+}
+
 .lab-page {
   position: absolute;
   inset: 0;
@@ -1139,6 +1724,7 @@ button {
   padding-top: 34px;
   min-height: calc(100vh - 228px);
 }
+/* result：正式生成结果页 */
 
 .source-column {
   position: relative;
