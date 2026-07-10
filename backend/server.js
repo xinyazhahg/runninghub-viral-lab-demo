@@ -125,6 +125,11 @@ const RH_UPLOAD_ENDPOINT = "/media/upload/binary";
 const RH_VIDEO_TO_TEXT_ENDPOINT = "rhart-text-g-25-flash/video-to-text";
 const RH_MAX_POLL_SECONDS = 1200;
 const RH_POLL_INTERVAL_MS = 5000;
+const VIDEO_ENDPOINT = "bytedance/seedance-2.0-global-fast/multimodal-video";
+const VIDEO_MODELS = [{ id: "kling-v3-pro", label: "可灵 v3.0 Pro", endpoint: VIDEO_ENDPOINT }];
+const VIDEO_RATIOS = ["9:16", "16:9", "4:3", "1:1", "3:4", "21:9"];
+const VIDEO_RESOLUTIONS = ["480p", "720p", "1080p", "2k", "4k"];
+const VIDEO_DURATIONS = Array.from({ length: 12 }, (_, index) => String(index + 4));
 const generationTasks = new Map();
 const videoToTextTasks = new Map();
 
@@ -171,6 +176,7 @@ function publicGenerationTask(taskId, task) {
       cost: task.cost,
       result: task.result,
       finalPrompt: task.finalPrompt,
+      config: task.config,
     };
   }
   if (task.status === "failed") return { ...base, error: task.error };
@@ -265,6 +271,29 @@ function buildFinalGenerationPrompt(breakdown, replacements, extraPrompt, fallba
     "只修改用户明确选择的内容，所有未选择内容保持原视频不变。不要重新设计未被替换的主体、场景或元素。不要改变动作方向、运动节奏、镜头角度、镜头运动、画面构图、景别和空间关系。不要新增无关人物、动物、物体、文字、字幕、水印或标志，不要删除未选择替换的内容。保持画面真实自然、前后镜头一致。",
     ...(userText ? ["", "【用户额外要求】", userText] : []),
   ].join("\n");
+}
+
+function validateVideoConfig(input = {}) {
+  const model = VIDEO_MODELS.find((item) => item.id === (input.model || "kling-v3-pro"));
+  const ratio = String(input.aspectRatio || "9:16");
+  const resolution = String(input.resolution || "720p").toLowerCase();
+  const duration = String(input.duration || "10");
+  if (!model) throw new Error("所选生成模型暂不支持，请重新选择");
+  if (!VIDEO_RATIOS.includes(ratio)) throw new Error("所选视频比例暂不支持，请重新选择");
+  if (!VIDEO_RESOLUTIONS.includes(resolution)) throw new Error("所选清晰度暂不支持，请重新选择");
+  if (!VIDEO_DURATIONS.includes(duration)) throw new Error("所选视频时长暂不支持，请重新选择");
+  return { model, ratio, resolution, duration };
+}
+
+function videoPricePayload(config) {
+  return {
+    prompt: "视频生成价格预估",
+    resolution: config.resolution,
+    duration: config.duration,
+    ratio: config.ratio,
+    generateAudio: false,
+    realPersonMode: true,
+  };
 }
 
 function getErrorMessage(err, fallback) {
@@ -630,6 +659,39 @@ app.get("/api/video-to-text-status", (req, res) => {
   return res.json(publicVideoToTextTask(task));
 });
 
+app.get("/api/generate-config", (req, res) => {
+  res.json({
+    ok: true,
+    models: VIDEO_MODELS.map(({ id, label }) => ({ id, label })),
+    ratios: VIDEO_RATIOS,
+    resolutions: VIDEO_RESOLUTIONS,
+    durations: VIDEO_DURATIONS,
+  });
+});
+
+app.post("/api/generate-price", async (req, res) => {
+  try {
+    if (!process.env.RUNNINGHUB_API_KEY) return sendApiError(res, 500, "后端未配置 RunningHub API Key");
+    const config = validateVideoConfig(req.body);
+    const price = await postRunningHubJson(
+      process.env.RUNNINGHUB_API_KEY,
+      `${RH_BASE}/price-preview/${config.model.endpoint}`,
+      videoPricePayload(config),
+      30000
+    );
+    if (price.errorCode || !Number.isFinite(Number(price.estimatedPrice))) {
+      throw new Error(price.errorMessage || "RunningHub 未返回有效预估费用");
+    }
+    res.json({
+      ok: true,
+      estimatedPrice: Number(price.estimatedPrice),
+      currency: price.currency || "CNY",
+    });
+  } catch (err) {
+    return sendApiError(res, 400, `暂时无法计算本次生成费用：${getErrorMessage(err, "请稍后重试")}`);
+  }
+});
+
 app.post("/api/generate-video", upload.single("image"), (req, res) => {
   try {
   if (!process.env.RUNNINGHUB_API_KEY) {
@@ -648,8 +710,7 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
     req.body.extraPrompt,
     req.body.prompt
   );
-  const duration = req.body.duration || "10";
-  const aspectRatio = req.body.aspectRatio || "9:16";
+  const config = validateVideoConfig(req.body);
   const imagePath = path.resolve(req.file.path);
   if (!fs.existsSync(imagePath)) {
     return sendApiError(res, 500, `上传图片文件不存在：${imagePath}`);
@@ -660,7 +721,7 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
   const args = [
   "scripts/runninghub.js",
   "--endpoint",
-  "bytedance/seedance-2.0-global-fast/multimodal-video",
+  config.model.endpoint,
   "--prompt",
   prompt,
   "--image",
@@ -668,11 +729,11 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
   "--output",
   outputFile,
   "--param",
-  "resolution=720p",
+  `resolution=${config.resolution}`,
   "--param",
-  `duration=${duration || "5"}`,
+  `duration=${config.duration}`,
   "--param",
-  `ratio=${aspectRatio || "adaptive"}`,
+  `ratio=${config.ratio}`,
   "--param",
   "generateAudio=false",
   "--param",
@@ -690,6 +751,13 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
     error: "",
     result: null,
     finalPrompt: prompt,
+    config: {
+      model: config.model.id,
+      modelLabel: config.model.label,
+      ratio: config.ratio,
+      resolution: config.resolution,
+      duration: config.duration,
+    },
   };
   generationTasks.set(taskId, task);
 
@@ -721,7 +789,8 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
     });
   } catch (err) {
     console.error("generate-video 失败：", err);
-    return sendApiError(res, 500, getErrorMessage(err, "RunningHub 视频生成失败"));
+    const message = getErrorMessage(err, "RunningHub 视频生成失败");
+    return sendApiError(res, message.includes("所选") ? 400 : 500, message);
   }
 });
 

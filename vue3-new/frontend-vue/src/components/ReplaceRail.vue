@@ -66,6 +66,10 @@ const props = defineProps({
     type: String,
     default: '9:16 / 720P / 10s / 可灵 v3.0 Pro',
   },
+  generationConfig: { type: Object, default: () => ({}) },
+  generationOptions: { type: Object, default: () => ({ models: [], ratios: [], resolutions: [], durations: [] }) },
+  estimatedPriceText: { type: String, default: '费用计算中' },
+  priceStatus: { type: String, default: 'loading' },
   isGenerating: {
     type: Boolean,
     default: false,
@@ -80,7 +84,11 @@ const props = defineProps({
   },
 })
 
-const emit = defineEmits(['replace', 'restore', 'update:modelValue', 'generate'])
+const emit = defineEmits(['replace', 'restore', 'update:modelValue', 'update:generationConfig', 'generate'])
+
+function updateGenerationConfig(key, value) {
+  emit('update:generationConfig', { ...props.generationConfig, [key]: value })
+}
 
 const groups = [
   { label: '主体', class: 'subject' },
@@ -632,8 +640,33 @@ class="custom-group-grid"
             placeholder="例如：画面更明亮，动作更慢，镜头更稳定，保留夜晚氛围。"
           ></textarea>
         </div>
+        <div class="generation-config-panel">
+          <strong>生成配置</strong>
+          <div class="generation-config-grid">
+            <label>视频比例
+              <select :value="generationConfig.ratio" :disabled="isGenerating" @change="updateGenerationConfig('ratio', $event.target.value)">
+                <option v-for="value in generationOptions.ratios" :key="value" :value="value">{{ value }}</option>
+              </select>
+            </label>
+            <label>视频清晰度
+              <select :value="generationConfig.quality" :disabled="isGenerating" @change="updateGenerationConfig('quality', $event.target.value)">
+                <option v-for="value in generationOptions.resolutions" :key="value" :value="value">{{ value.toUpperCase() }}</option>
+              </select>
+            </label>
+            <label>视频时长
+              <select :value="generationConfig.duration" :disabled="isGenerating" @change="updateGenerationConfig('duration', $event.target.value)">
+                <option v-for="value in generationOptions.durations" :key="value" :value="`${value}s`">{{ value }}s</option>
+              </select>
+            </label>
+            <label>生成模型
+              <select :value="generationConfig.modelId" :disabled="isGenerating" @change="updateGenerationConfig('modelId', $event.target.value)">
+                <option v-for="item in generationOptions.models" :key="item.id" :value="item.id">{{ item.label }}</option>
+              </select>
+            </label>
+          </div>
+        </div>
         <div class="custom-generate-footer">
-          <span class="generation-config-text">当前生成配置：{{ generationConfigText }}</span>
+          <span class="generation-config-text">预计消耗：{{ estimatedPriceText }}</span>
           <button
             id="customDirectGenerateBtn"
             class="primary-button branch-generate"
@@ -1330,6 +1363,39 @@ class="custom-group-grid"
   gap: 12px;
   width: 100%;
   margin-top: 14px;
+}
+
+.generation-config-panel {
+  margin-top: 14px;
+}
+
+.generation-config-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.generation-config-grid label {
+  display: grid;
+  gap: 6px;
+  color: rgba(255, 255, 255, 0.58);
+  font-size: 12px;
+}
+
+.generation-config-grid select {
+  width: 100%;
+  height: 36px;
+  padding: 0 10px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 9px;
+}
+
+.generation-config-text {
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 12px;
 }
 
 .branch-cost-pill {

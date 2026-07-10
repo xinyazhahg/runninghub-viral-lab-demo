@@ -56,14 +56,28 @@ const generationTaskId = ref('')
 const generationStatus = ref('')
 const pendingVersionId = ref('')
 let generationTimer = null
-const resultParams = {
+const resultParams = reactive({
   ratio: '9:16',
-  quality: '720P',
+  quality: '720p',
   duration: '10s',
+  modelId: 'kling-v3-pro',
   model: '可灵 v3.0 Pro',
   timeStart: 0,
-}
-const generationConfigText = `${resultParams.ratio} / ${resultParams.quality} / ${resultParams.duration} / ${resultParams.model}`
+})
+const generationOptions = ref({ models: [], ratios: [], resolutions: [], durations: [] })
+const estimatedPrice = ref(null)
+const priceStatus = ref('loading')
+const generationConfirmVisible = ref(false)
+const confirmationIsRevise = ref(false)
+const activeGenerationParams = ref(null)
+const generationConfigText = computed(() =>
+  `${resultParams.ratio} / ${resultParams.quality.toUpperCase()} / ${resultParams.duration} / ${resultParams.model}`
+)
+const estimatedPriceText = computed(() =>
+  priceStatus.value === 'ready' && estimatedPrice.value !== null
+    ? `¥${Number(estimatedPrice.value).toFixed(2)}`
+    : priceStatus.value === 'error' ? '费用暂不可用' : '费用计算中'
+)
 
 function createDefaultCustomItems() {
   return [
@@ -206,6 +220,7 @@ function getDemoStateSnapshot() {
     changedItems,
     adjustmentText: adjustmentText.value,
     currentGeneratingPrompt: currentGeneratingPrompt.value,
+    generationConfig: { ...resultParams },
     versions: versions.value,
     currentVersionId: currentVersionId.value,
     flowMode: flowMode.value,
@@ -258,6 +273,16 @@ function restoreDemoState() {
 
     adjustmentText.value = asString(saved.adjustmentText)
     currentGeneratingPrompt.value = asString(saved.currentGeneratingPrompt)
+    const restoredConfig = asObjectOrNull(saved.generationConfig)
+    if (restoredConfig) {
+      Object.assign(resultParams, {
+        ratio: asString(restoredConfig.ratio) || '9:16',
+        quality: asString(restoredConfig.quality) || '720p',
+        duration: asString(restoredConfig.duration) || '10s',
+        modelId: asString(restoredConfig.modelId) || 'kling-v3-pro',
+        model: asString(restoredConfig.model) || '可灵 v3.0 Pro',
+      })
+    }
     versions.value = normalizeRestoredVersions(saved.versions)
     const restoredCurrentVersionId = asString(saved.currentVersionId)
     currentVersionId.value = versions.value.some((version) => version.id === restoredCurrentVersionId)
@@ -317,7 +342,12 @@ function clearDemoState() {
   revising.value = false
   reviseVisible.value = false
   isGenerating.value = false
+  activeGenerationParams.value = null
   pendingVersionId.value = ''
+  Object.assign(resultParams, {
+    ratio: '9:16', quality: '720p', duration: '10s',
+    modelId: 'kling-v3-pro', model: '可灵 v3.0 Pro', timeStart: 0,
+  })
   showNotice('当前状态已清空')
 
   nextTick(() => {
@@ -396,6 +426,7 @@ watch([
   customItems,
   adjustmentText,
   currentGeneratingPrompt,
+  () => ({ ...resultParams }),
   versions,
   currentVersionId,
   flowMode,
@@ -452,12 +483,13 @@ const displayVersions = computed(() => {
   })
 
   if (isGenerating.value) {
+    const activeParams = activeGenerationParams.value || resultParams
     list.unshift({
       id: pendingVersionId.value || getNextVersionId(),
       isGenerating: true,
       videoUrl: '',
       coverUrl: '',
-      ...resultParams,
+      ...activeParams,
       prompt: '正在生成新版本...',
       summary: [
         '正在生成视频',
@@ -529,6 +561,7 @@ const generatingVersion = computed(() => {
 
 // 监听结果节点变化（防抖，避免频繁触发）
 let displayVersionsTimer = null
+let priceRequestSequence = 0
 watch(displayVersions, async () => {
   if (displayVersionsTimer) clearTimeout(displayVersionsTimer)
   displayVersionsTimer = setTimeout(async () => {
@@ -537,7 +570,52 @@ watch(displayVersions, async () => {
   }, 100)
 }, { deep: false })
 
+async function loadGenerationOptions() {
+  try {
+    const response = await fetch(apiUrl('/api/generate-config'))
+    const { data } = await readApiResponse(response)
+    if (!response.ok || !data?.ok) throw new Error('生成配置加载失败')
+    generationOptions.value = data
+  } catch (error) {
+    console.error('生成配置加载失败：', error)
+  }
+}
+
+async function refreshEstimatedPrice() {
+  const sequence = ++priceRequestSequence
+  priceStatus.value = 'loading'
+  estimatedPrice.value = null
+  try {
+    const response = await fetch(apiUrl('/api/generate-price'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: resultParams.modelId,
+        aspectRatio: resultParams.ratio,
+        resolution: resultParams.quality,
+        duration: resultParams.duration.replace(/s$/i, ''),
+      }),
+    })
+    const { data } = await readApiResponse(response)
+    if (sequence !== priceRequestSequence) return
+    if (!response.ok || !data?.ok) throw new Error(data?.message || data?.error || '费用计算失败')
+    estimatedPrice.value = data.estimatedPrice
+    priceStatus.value = 'ready'
+  } catch (error) {
+    if (sequence !== priceRequestSequence) return
+    priceStatus.value = 'error'
+    console.error('生成费用计算失败：', error)
+  }
+}
+
+watch(
+  () => [resultParams.modelId, resultParams.ratio, resultParams.quality, resultParams.duration],
+  refreshEstimatedPrice,
+  { immediate: true }
+)
+
 onMounted(() => {
+  loadGenerationOptions()
   refreshCanvasConnectors(120)
   verifyRestoredDemoVideoUrls()
 })
@@ -1203,7 +1281,49 @@ function selectVersion(versionId) {
 }
 
 // 生成中占位版本
-async function handleGenerate() {
+function updateGenerationConfig(nextConfig) {
+  priceStatus.value = 'loading'
+  estimatedPrice.value = null
+  Object.assign(resultParams, nextConfig)
+  const selectedModel = generationOptions.value.models.find((item) => item.id === resultParams.modelId)
+  if (selectedModel) resultParams.model = selectedModel.label
+}
+
+function requestGenerationConfirmation(isRevise = false) {
+  generateError.value = ''
+  if (!breakdownData.value || flowMode.value !== 'customizing') {
+    generateError.value = '请先上传视频并完成拆解'
+    return
+  }
+  if (priceStatus.value !== 'ready' || estimatedPrice.value === null) {
+    generateError.value = '暂时无法计算本次生成费用，请稍后重试。'
+    return
+  }
+  confirmationIsRevise.value = isRevise
+  generationConfirmVisible.value = true
+}
+
+function handleGenerate() {
+  requestGenerationConfirmation(false)
+}
+
+async function confirmGeneration() {
+  if (priceStatus.value !== 'ready' || estimatedPrice.value === null) {
+    generateError.value = '暂时无法计算本次生成费用，请稍后重试。'
+    return
+  }
+  const wasRevise = confirmationIsRevise.value
+  const versionCount = versions.value.length
+  generationConfirmVisible.value = false
+  await executeGenerate()
+  if (wasRevise && versions.value.length > versionCount) {
+    revising.value = false
+    flowMode.value = 'customizing'
+    showNotice('新版本已生成')
+  }
+}
+
+async function executeGenerate() {
   if (isGenerating.value) return
 
   generateError.value = ''
@@ -1213,6 +1333,8 @@ async function handleGenerate() {
     return
   }
 
+  const submittedParams = { ...resultParams }
+  activeGenerationParams.value = submittedParams
   isGenerating.value = true
   pendingVersionId.value = getNextVersionId()
   const generationStartTime = Date.now()
@@ -1288,8 +1410,10 @@ async function handleGenerate() {
       replacement: item.current || item.replacement,
     }))))
     formData.append('extraPrompt', adjText)
-    formData.append('duration', resultParams.duration.replace(/s$/i, ''))
-    formData.append('aspectRatio', resultParams.ratio)
+    formData.append('duration', submittedParams.duration.replace(/s$/i, ''))
+    formData.append('aspectRatio', submittedParams.ratio)
+    formData.append('resolution', submittedParams.quality)
+    formData.append('model', submittedParams.modelId)
 
     console.log('[debug] 实际传给 generate-video 的 image 来源:', imageSource)
     console.log('[debug] 发送给模型的图片:', imageFile.name, imageFile.type, imageFile.size)
@@ -1349,13 +1473,13 @@ async function handleGenerate() {
       id: nextVersionId,
       taskId,
       resultSource: 'generate-status',
-      ...resultParams,
+      ...submittedParams,
       summary,
       prompt: finalPrompt,
       adjustmentText: adjText,
       generatedVideoResult,
       videoUrl,
-      params: { ...resultParams },
+      params: { ...submittedParams },
       createdAt: new Date().toISOString(),
       time: new Date().toLocaleString('zh-CN', { hour12: false }),
       cost: data.cost || '',
@@ -1376,6 +1500,7 @@ async function handleGenerate() {
   } finally {
     stopGenerationTimer()
     isGenerating.value = false
+    activeGenerationParams.value = null
     pendingVersionId.value = ''
     setTimeout(resetGenerationStatus, 1200)
   }
@@ -1479,14 +1604,7 @@ function handleRevise(version) {
 
 // 重新改造后点击生成：重置 revising，走正常生成流程
 async function handleGenerateFromRevise() {
-  if (isGenerating.value) return
-  const versionCount = versions.value.length
-  await handleGenerate()
-  if (versions.value.length > versionCount) {
-    revising.value = false
-    flowMode.value = 'customizing'
-    showNotice('新版本已生成')
-  }
+  requestGenerationConfirmation(true)
 }
 
 function handleRestore(itemId) {
@@ -1622,6 +1740,11 @@ function retry() {
                   v-model="adjustmentText"
                   :generate-btn-text="generateBtnText"
                   :generation-config-text="generationConfigText"
+                  :generation-config="resultParams"
+                  :generation-options="generationOptions"
+                  :estimated-price-text="estimatedPriceText"
+                  :price-status="priceStatus"
+                  @update:generation-config="updateGenerationConfig"
                   :is-generating="isGenerating"
                   :revise-visible="reviseVisible"
                   :revising="revising"
@@ -1672,6 +1795,25 @@ function retry() {
       @close="closeBreakdown"
     />
 
+    <div v-if="generationConfirmVisible" class="modal" @click.self="generationConfirmVisible = false">
+      <div class="modal-card generation-confirm-card">
+        <h2>生成确认</h2>
+        <p>当前配置：</p>
+        <ul>
+          <li>视频比例：{{ resultParams.ratio }}</li>
+          <li>视频清晰度：{{ resultParams.quality.toUpperCase() }}</li>
+          <li>视频时长：{{ resultParams.duration }}</li>
+          <li>使用模型：{{ resultParams.model }}</li>
+        </ul>
+        <p>预计消耗：<strong>{{ estimatedPriceText }}</strong></p>
+        <p>是否确认生成？</p>
+        <div class="generation-confirm-actions">
+          <button class="ghost-button" type="button" @click="generationConfirmVisible = false">取消生成</button>
+          <button class="primary-button" type="button" :disabled="priceStatus !== 'ready'" @click="confirmGeneration">确认生成</button>
+        </div>
+      </div>
+    </div>
+
     <!-- 生成错误提示 -->
     <div v-if="generateError" class="generate-error-toast">
       {{ generateError }}
@@ -1685,6 +1827,23 @@ function retry() {
 </template>
 
 <style>
+.generation-confirm-card {
+  width: min(460px, 100%);
+}
+
+.generation-confirm-card ul {
+  margin: 12px 0;
+  padding-left: 20px;
+  line-height: 1.9;
+}
+
+.generation-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 18px;
+}
+
 :root {
   color-scheme: dark;
   --canvas: #020303;
