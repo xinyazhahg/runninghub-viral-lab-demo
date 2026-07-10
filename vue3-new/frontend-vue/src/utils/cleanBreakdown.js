@@ -33,8 +33,9 @@ const FULL_HUMAN_EVIDENCE = [
   '人物在镜头中心', '人是镜头中心', '主角', '人物承担主要动作',
 ]
 const SCENE_WORDS = [
-  '路面', '铺设路面', '石砖地', '石板地', '地砖', '砖面', '草地', '道路', '马路',
-  '地面', '小路', '步道', '天空', '墙面', '墙', '背景', '场地', '室外', '户外',
+  '路面', '铺设路面', '石砖地', '石板地', '石板路', '石砖路', '地砖', '砖面',
+  '草地', '道路', '马路', '地面', '小路', '小径', '步道', '天空', '墙面', '墙',
+  '背景', '场地', '室外', '户外',
   '室内', '房间', '街道', '公园', '广场', '庭院',
 ]
 const LOW_VALUE_ELEMENT_WORDS = [
@@ -45,10 +46,15 @@ const LOW_VALUE_ELEMENT_WORDS = [
 const HIGH_VALUE_ELEMENT_WORDS = [
   '狗绳', '牵引绳', '项圈', '玩具', '背包', '饮料', '杯子', '手机', '商品', '产品',
   '食物', '食品', '道具', '球', '雨伞', '帽子', '眼镜', '包', '瓶', '餐具',
-  '胸带', '胸背带', '胸背',
+  '胸带', '胸背带', '狗背带', '胸背',
 ]
 const PET_GEAR_WORDS = [
-  '牵引绳', '狗绳', '宠物绳', '牵狗绳', '背带', '胸带', '胸背带', '胸背', '项圈',
+  '牵引绳', '狗绳', '宠物绳', '牵狗绳', '背带', '狗背带', '胸带', '胸背带',
+  '胸背', '项圈',
+]
+const PATH_SCENE_WORDS = [
+  '小路', '小径', '道路', '马路', '路面', '石板路', '石砖路', '铺设路面', '石砖地',
+  '石板地', '地面', '步道', '地砖', '砖面',
 ]
 
 function subjectFamily(value) {
@@ -123,7 +129,19 @@ function cleanScenes(data) {
   const shotScenes = (Array.isArray(data?.shots) ? data.shots : [])
     .map((shot) => String(shot?.scene || '').trim())
     .filter((item) => item && !/^(未识别|暂无)$/.test(item))
-  return unique([...overviewScenes, ...shotScenes]).slice(0, 3)
+  const normalized = [...overviewScenes, ...shotScenes].map((scene) => {
+    if (includesAny(scene, PATH_SCENE_WORDS)) return '户外小路'
+    return scene
+  })
+  const scenes = unique(normalized)
+  if (scenes.includes('户外小路')) {
+    const redundantPathContext = ['草地', '户外', '室外', '公园', '背景', '场地']
+    return ['户外小路', ...scenes.filter((scene) =>
+      scene !== '户外小路' && !redundantPathContext.includes(scene)
+    )]
+      .slice(0, 2)
+  }
+  return scenes.slice(0, 2)
 }
 
 function cleanElements(data, subjects, scenes) {
