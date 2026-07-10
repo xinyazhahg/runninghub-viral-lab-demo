@@ -162,12 +162,22 @@ function normalizeRestoredCustomItems(value) {
   return asArray(value).filter(isPlainObject)
 }
 
+function isRealDemoVersion(version) {
+  if (!isPlainObject(version)) return false
+  const id = asString(version.id)
+  const isMockId = /(real_|mock|fake|demo|test)/i.test(id)
+  return !isMockId
+    && Boolean(asString(version.taskId))
+    && Boolean(asString(version.videoUrl))
+    && version.resultSource === 'generate-status'
+}
+
 function normalizeRestoredVersions(value) {
-  return asArray(value).filter(isPlainObject).map((version, index) => {
+  return asArray(value).filter(isRealDemoVersion).map((version, index) => {
     const time = asString(version.time) || asString(version.createdAt) || ''
     return {
       ...version,
-      id: asString(version.id) || `V${index + 1}`,
+      id: `V${index + 1}`,
       videoUrl: asString(version.videoUrl),
       prompt: asString(version.prompt),
       summary: asArray(version.summary).map((item) => String(item)),
@@ -416,14 +426,15 @@ function registerCanvasNodes() {
 }
 
 const displayVersions = computed(() => {
-  const selectedIndex = versions.value.findIndex((version) => version.id === currentVersionId.value)
+  const realVersions = versions.value.filter(isRealDemoVersion)
+  const selectedIndex = realVersions.findIndex((version) => version.id === currentVersionId.value)
   const orderedVersions = selectedIndex > -1
     ? [
-        versions.value[selectedIndex],
-        ...versions.value.slice(0, selectedIndex),
-        ...versions.value.slice(selectedIndex + 1),
+        realVersions[selectedIndex],
+        ...realVersions.slice(0, selectedIndex),
+        ...realVersions.slice(selectedIndex + 1),
       ]
-    : [...versions.value]
+    : [...realVersions]
 
   const list = orderedVersions.map((version) => {
     const isSelected = version.id === currentVersionId.value
@@ -1328,6 +1339,8 @@ async function handleGenerate() {
 
     const version = {
       id: nextVersionId,
+      taskId,
+      resultSource: 'generate-status',
       summary,
       prompt: description,
       adjustmentText: adjText,
@@ -1455,46 +1468,15 @@ function handleRevise(version) {
 }
 
 // 重新改造后点击生成：重置 revising，走正常生成流程
-function handleGenerateFromRevise() {
+async function handleGenerateFromRevise() {
   if (isGenerating.value) return
-  isGenerating.value = true
-  generateError.value = ''
-  generateBtnText.value = '生成中...'
-
-  setTimeout(() => {
-    const nextId = `real_${versions.value.length + 1}`
-    const createdAt = new Date().toISOString()
-    const time = new Date().toLocaleString('zh-CN', { hour12: false })
-
-    versions.value.push({
-      id: nextId,
-      videoUrl: '/viral-lab/cockapoo_kitchen_1783586333.mp4',
-      coverUrl: '',
-      ratio: '9:16',
-      quality: '720P',
-      duration: '10s',
-      model: '可灵 v3.0 Pro image-to-video',
-      cost: '¥10.40',
-      prompt: adjustmentText.value || '基于当前替换配置重新生成一版视频，保留厨房、蛋糕和镜头结构。',
-      params: { ...resultParams },
-      createdAt,
-      time,
-      status: '已生成',
-      summary: [
-        '已基于当前替换配置生成新版本',
-        '保留原视频主要镜头结构',
-        '支持继续重新改造'
-      ],
-      saved: false
-    })
-    currentVersionId.value = nextId
-
-    isGenerating.value = false
+  const versionCount = versions.value.length
+  await handleGenerate()
+  if (versions.value.length > versionCount) {
     revising.value = false
     flowMode.value = 'customizing'
-    generateBtnText.value = '生成新版本'
     showNotice('新版本已生成')
-  }, 1800)
+  }
 }
 
 function handleRestore(itemId) {
