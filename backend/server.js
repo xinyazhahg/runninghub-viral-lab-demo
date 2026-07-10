@@ -320,15 +320,26 @@ async function runVideoToTextDirect(apiKey, videoPath, prompt) {
   return formatRunningHubTextResult(finalResult);
 }
 
-function assertRunningHubSkillReady() {
-  if (!fs.existsSync(RUNNINGHUB_SKILL_DIR)) {
-    throw new Error(`线上环境缺少 RunningHub Skill 目录：${RUNNINGHUB_SKILL_DIR}，请配置 RUNNINGHUB_SKILL_DIR 或改用后端直连 RunningHub API`);
+function getRunningHubRunner() {
+  const bundledScriptPath = path.join(__dirname, "scripts", "runninghub.js");
+  if (fs.existsSync(bundledScriptPath)) {
+    return {
+      cwd: __dirname,
+      script: "scripts/runninghub.js",
+    };
   }
 
-  const scriptPath = path.join(RUNNINGHUB_SKILL_DIR, "scripts", "runninghub.js");
-  if (!fs.existsSync(scriptPath)) {
-    throw new Error(`线上环境缺少 RunningHub 调用脚本：${scriptPath}，请确认部署包或 RUNNINGHUB_SKILL_DIR 配置`);
+  const skillScriptPath = path.join(RUNNINGHUB_SKILL_DIR, "scripts", "runninghub.js");
+  if (fs.existsSync(skillScriptPath)) {
+    return {
+      cwd: RUNNINGHUB_SKILL_DIR,
+      script: "scripts/runninghub.js",
+    };
   }
+
+  throw new Error(
+    `未找到 RunningHub 调用脚本：请确认已部署 backend/scripts/runninghub.js，或配置 RUNNINGHUB_SKILL_DIR。已检查 ${bundledScriptPath} 和 ${skillScriptPath}`
+  );
 }
 
 function runRunningHubScript(args, label) {
@@ -338,9 +349,10 @@ function runRunningHubScript(args, label) {
     let stderr = "";
 
     try {
-      assertRunningHubSkillReady();
-      child = spawn("node", args, {
-        cwd: RUNNINGHUB_SKILL_DIR,
+      const runner = getRunningHubRunner();
+      const runnerArgs = [runner.script, ...args.slice(1)];
+      child = spawn("node", runnerArgs, {
+        cwd: runner.cwd,
         env: process.env,
       });
     } catch (err) {
