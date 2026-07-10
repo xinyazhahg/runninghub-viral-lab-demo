@@ -1282,6 +1282,13 @@ async function handleGenerate() {
     const formData = new FormData()
     formData.append('image', imageFile)
     formData.append('prompt', description)
+    formData.append('breakdown', JSON.stringify(breakdownData.value))
+    formData.append('replacements', JSON.stringify(changed.map((item) => ({
+      group: item.group,
+      original: item.title || item.original,
+      replacement: item.current || item.replacement,
+    }))))
+    formData.append('extraPrompt', adjText)
     formData.append('duration', '10')
     formData.append('aspectRatio', '9:16')
 
@@ -1335,6 +1342,8 @@ async function handleGenerate() {
     if (!videoUrl) {
       throw new Error('生成成功但未返回视频地址，请检查后端返回字段')
     }
+    const finalPrompt = data.finalPrompt || description
+    currentGeneratingPrompt.value = finalPrompt
     generationStatus.value = 'success'
 
     const version = {
@@ -1342,7 +1351,7 @@ async function handleGenerate() {
       taskId,
       resultSource: 'generate-status',
       summary,
-      prompt: description,
+      prompt: finalPrompt,
       adjustmentText: adjText,
       generatedVideoResult,
       videoUrl,

@@ -170,10 +170,101 @@ function publicGenerationTask(taskId, task) {
       outputFile: task.outputFile,
       cost: task.cost,
       result: task.result,
+      finalPrompt: task.finalPrompt,
     };
   }
   if (task.status === "failed") return { ...base, error: task.error };
   return base;
+}
+
+function parseJsonFormField(value, fallback) {
+  if (!value) return fallback;
+  if (typeof value === "object") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function promptList(value) {
+  if (Array.isArray(value)) return value.map(String).map((item) => item.trim()).filter(Boolean);
+  if (typeof value === "string" && value.trim()) {
+    return value.split(/[、,，/]/).map((item) => item.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function uniquePromptList(values) {
+  return [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))];
+}
+
+function samePromptConcept(left, right) {
+  const normalize = (value) => String(value || "")
+    .toLowerCase()
+    .replace(/小狗|泰迪犬|宠物犬|犬只/g, "狗")
+    .replace(/小猫|猫咪/g, "猫")
+    .replace(/小径|道路|路面|石板路|石砖路|铺设路面|石砖地|地面/g, "小路")
+    .replace(/[\s的、]/g, "");
+  const a = normalize(left);
+  const b = normalize(right);
+  return Boolean(a && b && (a === b || a.includes(b) || b.includes(a)));
+}
+
+function buildFinalGenerationPrompt(breakdown, replacements, extraPrompt, fallbackPrompt) {
+  if (!breakdown || typeof breakdown !== "object" || !Array.isArray(replacements)) {
+    return fallbackPrompt || "根据参考图生成一段动态视频，保持真实镜头质感。";
+  }
+
+  const overview = breakdown.overview || {};
+  const shots = Array.isArray(breakdown.shots) ? breakdown.shots : [];
+  const changed = replacements.filter((item) => item && item.group && item.original && item.replacement);
+  const changedGroups = new Set(changed.map((item) => item.group));
+  const changedOriginals = changed.map((item) => String(item.original).trim());
+  const remaining = (values) => promptList(values).filter((item) =>
+    !changedOriginals.some((original) => samePromptConcept(item, original))
+  );
+  const subjects = remaining(overview.replaceableSubjects || breakdown.replaceableSubjects);
+  const scenes = remaining(overview.replaceableScenes || breakdown.replaceableScenes);
+  const elements = remaining(overview.replaceableElements || breakdown.replaceableElements);
+  const actions = uniquePromptList(shots.map((shot) => shot?.action));
+  const perspectives = uniquePromptList(shots.map((shot) =>
+    shot?.cameraPerspective || shot?.perspective || shot?.cameraAngle
+  ));
+  const cameraMovements = uniquePromptList(shots.map((shot) =>
+    shot?.cameraMovement || shot?.movement || shot?.camera
+  ));
+  const compositions = uniquePromptList(shots.map((shot) =>
+    shot?.composition || shot?.framing || shot?.description
+  ));
+
+  const replacementText = changed.length
+    ? changed.map((item) => `${item.group}“${item.original}”替换为“${item.replacement}”`).join("；")
+    : "不替换任何未明确选择的内容，仅按用户要求进行必要调整";
+  const describe = (label, values, fallback) =>
+    `${label}：${values.length ? values.join("、") : fallback}`;
+  const preserveLines = [
+    describe("未替换主体", subjects, changedGroups.has("主体") ? "除已选主体外的其他主体与主体关系" : "原视频全部主体"),
+    describe("未替换场景", scenes, changedGroups.has("场景") ? "除已选场景外的空间和环境" : "原视频全部场景"),
+    describe("动作与运动节奏", actions, "严格沿用原视频动作方向、速度和节奏"),
+    describe("镜头视角", perspectives, "严格沿用原视频镜头角度和观察视角"),
+    describe("镜头运动", cameraMovements, "严格沿用原视频运镜方式、镜头顺序和推进节奏"),
+    describe("画面构图", compositions, "严格沿用原视频主体位置、景别和空间关系"),
+    describe("未替换关键元素", elements, changedGroups.has("元素") ? "除已选元素外的其他原有物体" : "原视频全部关键元素"),
+  ];
+
+  const userText = String(extraPrompt || "").trim();
+  return [
+    "【本次替换】",
+    `仅执行以下替换：${replacementText}。`,
+    "",
+    "【必须保持的原视频内容】",
+    ...preserveLines,
+    "",
+    "【生成约束】",
+    "只修改用户明确选择的内容，所有未选择内容保持原视频不变。不要重新设计未被替换的主体、场景或元素。不要改变动作方向、运动节奏、镜头角度、镜头运动、画面构图、景别和空间关系。不要新增无关人物、动物、物体、文字、字幕、水印或标志，不要删除未选择替换的内容。保持画面真实自然、前后镜头一致。",
+    ...(userText ? ["", "【用户额外要求】", userText] : []),
+  ].join("\n");
 }
 
 function getErrorMessage(err, fallback) {
@@ -549,7 +640,14 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
     return sendApiError(res, 400, "没有收到生成图片");
   }
 
-  const prompt = req.body.prompt || "根据参考图生成一段动态视频，保持真实镜头质感。";
+  const breakdown = parseJsonFormField(req.body.breakdown, null);
+  const replacements = parseJsonFormField(req.body.replacements, null);
+  const prompt = buildFinalGenerationPrompt(
+    breakdown,
+    replacements,
+    req.body.extraPrompt,
+    req.body.prompt
+  );
   const duration = req.body.duration || "10";
   const aspectRatio = req.body.aspectRatio || "9:16";
   const imagePath = path.resolve(req.file.path);
@@ -591,10 +689,12 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
     cost: "",
     error: "",
     result: null,
+    finalPrompt: prompt,
   };
   generationTasks.set(taskId, task);
 
   console.log("收到视频生成请求：", req.file?.originalname, req.file?.size, "本地 taskId:", taskId);
+  console.log("[generate-video] final prompt:", prompt);
   res.status(202).json({ ok: true, status: "running", taskId });
 
   runRunningHubScript(args, `RunningHub image-to-video ${taskId}`)
