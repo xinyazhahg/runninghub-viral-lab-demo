@@ -14,6 +14,7 @@ import ResultCard from './components/ResultCard.vue'
 import ViralLabTestBench from './components/ViralLabTestBench.vue'
 import { apiUrl, toBackendUrl } from './api.js'
 import { useCanvasNodes } from './composables/useCanvasNodes.js'
+import { cleanBreakdownResult } from './utils/cleanBreakdown.js'
 
 // ── 状态管理 ──
 const activeView = ref('demo')
@@ -223,12 +224,24 @@ function restoreDemoState() {
     })
 
     videoToTextResult.value = asObjectOrNull(saved.videoToTextResult)
-    breakdownData.value = asObjectOrNull(saved.breakdownResult) || asObjectOrNull(saved.breakdownData)
+    breakdownData.value = cleanBreakdownResult(
+      asObjectOrNull(saved.breakdownResult) || asObjectOrNull(saved.breakdownData)
+    )
 
     const restoredItems = normalizeRestoredCustomItems(saved.customItems).length
       ? normalizeRestoredCustomItems(saved.customItems)
       : normalizeRestoredCustomItems(saved.replacementSlots)
-    customItems.value = restoredItems.length ? restoredItems : createDefaultCustomItems()
+    const allowedElements = new Set(
+      breakdownData.value?.overview?.replaceableElements || []
+    )
+    const cleanedRestoredItems = restoredItems.filter((item) =>
+      item.group !== '元素' || allowedElements.has(item.title)
+    )
+    customItems.value = cleanedRestoredItems.length
+      ? cleanedRestoredItems
+      : breakdownData.value
+        ? buildCustomItems(breakdownData.value)
+        : createDefaultCustomItems()
 
     adjustmentText.value = asString(saved.adjustmentText)
     currentGeneratingPrompt.value = asString(saved.currentGeneratingPrompt)
@@ -676,7 +689,7 @@ function parseBreakdownResult(rawText = '') {
 
   try {
     const data = JSON.parse(jsonText)
-    return normalizeBreakdownData(data)
+    return cleanBreakdownResult(normalizeBreakdownData(data))
   } catch {
     try {
       const repairedJsonText = jsonText
@@ -685,7 +698,7 @@ function parseBreakdownResult(rawText = '') {
         .replace(/^json\s*/i, '')
         .trim()
       const data = JSON.parse(repairedJsonText)
-      return normalizeBreakdownData(data)
+      return cleanBreakdownResult(normalizeBreakdownData(data))
     } catch (secondError) {
       console.error('视频拆解 JSON 解析失败：', secondError)
       return getEmptyBreakdownData('视频拆解结果解析失败，请重新拆解')
@@ -741,14 +754,12 @@ function buildCustomItems(data) {
   const overview = data?.overview || {}
   const shots = Array.isArray(data?.shots) ? data.shots : []
 
-  const subjects = normalizeList(overview.replaceableSubjects, { filterRelationWords: true })
-  const scenes = buildSceneListFromShots(shots, overview.replaceableScenes)
+  const subjects = normalizeList(overview.replaceableSubjects, { filterRelationWords: true }).slice(0, 2)
+  const scenes = normalizeList(overview.replaceableScenes).slice(0, 3)
 
-  const elements = uniqueList([
-    ...normalizeList(overview.replaceableElements),
-    ...collectShotValues(shots, 'elements'),
-    ...collectShotValues(shots, 'replaceable'),
-  ]).filter((item) => !isInvalidElementLabel(item)).slice(0, 10)
+  const elements = normalizeList(overview.replaceableElements)
+    .filter((item) => !isInvalidElementLabel(item))
+    .slice(0, 5)
 function isEmptyCopyText(value) {
   const text = String(value || '').trim()
 

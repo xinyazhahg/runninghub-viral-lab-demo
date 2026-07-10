@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { apiUrl, toBackendUrl } from '../api.js'
+import { cleanBreakdownResult } from '../utils/cleanBreakdown.js'
 
 const TEST_BENCH_STATE_KEY = 'viral-lab-test-bench-state:v1'
 const HISTORY_VIDEO_EXPIRED_MESSAGE = '历史视频地址已失效，请重新生成'
@@ -209,7 +210,9 @@ function restoreTestBenchState() {
     videoToTextRaw.value = restoredVideoToText
 
     const restoredBreakdown = asObjectOrNull(saved.parsedBreakdown)
-    parsedBreakdown.value = restoredBreakdown || parseBreakdownFromApiData(restoredVideoToText) || null
+    parsedBreakdown.value = cleanBreakdownResult(
+      restoredBreakdown || parseBreakdownFromApiData(restoredVideoToText) || null
+    )
 
     extraPromptRequirement.value = asString(saved.extraPromptRequirement)
     generatedPrompt.value = asString(saved.generatedPrompt)
@@ -408,7 +411,7 @@ async function readResponse(response) {
 
 function parseBreakdownFromApiData(data) {
   const result = data?.result
-  if (isPlainObject(result)) return result
+  if (isPlainObject(result)) return cleanBreakdownResult(result)
 
   const text = String(result || data?.rawText || '')
   const jsonStart = text.indexOf('{')
@@ -417,7 +420,7 @@ function parseBreakdownFromApiData(data) {
 
   try {
     const parsed = JSON.parse(text.slice(jsonStart, jsonEnd + 1))
-    return isPlainObject(parsed) ? parsed : null
+    return isPlainObject(parsed) ? cleanBreakdownResult(parsed) : null
   } catch {
     return null
   }
@@ -884,7 +887,7 @@ onBeforeUnmount(() => {
             <div v-if="group.items.length" class="chips">
               <span v-for="item in group.items" :key="item" class="chip">{{ item }}</span>
             </div>
-            <p v-else>暂无数据</p>
+            <p v-else>{{ group.label === '可替换元素' ? '暂无高价值可替换元素' : '暂无数据' }}</p>
           </div>
         </div>
       </section>
