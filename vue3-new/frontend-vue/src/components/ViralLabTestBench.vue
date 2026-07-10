@@ -628,7 +628,7 @@ function normalizeGenerateResult(data) {
 
   const source = parsedResult || data || {}
   return {
-    taskId: findValueByKey(source, ['taskId', 'task_id', 'id']) || findValueByKey(data, ['taskId', 'task_id']),
+    taskId: data?.taskId || findValueByKey(source, ['taskId', 'task_id', 'id']),
     status: findValueByKey(source, ['status', 'state']) || (data?.ok ? 'ok' : ''),
     cost: findValueByKey(source, ['cost', 'creditCost', 'credits', 'consume']),
     videoUrl: findVideoUrl(data),
@@ -647,14 +647,7 @@ async function testGenerateVideo() {
 
   const startTime = performance.now()
   const startDate = Date.now()
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => {
-    generationRun.value = {
-      ...generationRun.value,
-      status: 'timeout',
-    }
-    controller.abort()
-  }, 5 * 60 * 1000)
+  const deadline = startDate + 5 * 60 * 1000
   isTestingGenerateVideo.value = true
   showBenchMessage('')
   generationRun.value = {
@@ -674,21 +667,51 @@ async function testGenerateVideo() {
     formData.append('duration', '10')
     formData.append('aspectRatio', '9:16')
 
-    const requestPromise = fetch(apiUrl('/api/generate-video'), {
+    const response = await fetch(apiUrl('/api/generate-video'), {
       method: 'POST',
       body: formData,
-      signal: controller.signal,
     })
     generationRun.value = {
       ...generationRun.value,
       phase: '生成中',
     }
-    const response = await requestPromise
-    const data = await readResponse(response)
+    let data = await readResponse(response)
 
     if (!response.ok || !data?.ok) {
       generateResult.value = { taskId: '', status: 'failed', cost: '', videoUrl: '', raw: data }
       throw new Error(data?.message || data?.error || data?.rawText || 'generate-video 请求失败')
+    }
+
+    const taskId = data.taskId
+    if (!taskId) throw new Error('后端未返回生成任务 taskId')
+    generationRun.value = {
+      ...generationRun.value,
+      phase: '生成中',
+      taskId,
+    }
+
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 4000))
+      const statusResponse = await fetch(
+        apiUrl(`/api/generate-status?taskId=${encodeURIComponent(taskId)}`)
+      )
+      data = await readResponse(statusResponse)
+      if (!statusResponse.ok || !data?.ok) {
+        throw new Error(data?.message || data?.error || data?.rawText || '查询生成任务失败')
+      }
+      generationRun.value = {
+        ...generationRun.value,
+        elapsed: `${data.elapsed || 0}秒`,
+        status: data.status,
+      }
+      if (data.status === 'success') break
+      if (data.status === 'failed') throw new Error(data.error || '视频生成失败')
+    }
+
+    if (data.status !== 'success') {
+      const timeoutError = new Error('生成超时，请稍后查看任务状态或重新生成')
+      timeoutError.name = 'GenerationTimeoutError'
+      throw timeoutError
     }
 
     generateResult.value = normalizeGenerateResult(data)
@@ -713,9 +736,9 @@ async function testGenerateVideo() {
     }
     addLog('generate-video', 'success', '请求完成', formatElapsed(startTime))
   } catch (error) {
-    const isTimeout = error.name === 'AbortError' || generationRun.value.status === 'timeout'
+    const isTimeout = error.name === 'GenerationTimeoutError'
     const message = isTimeout
-      ? '生成超时，请稍后在测试台查询任务状态或重新生成'
+      ? '生成超时，请稍后查看任务状态或重新生成'
       : error.message || 'generate-video 请求失败'
     generationRun.value = {
       ...generationRun.value,
@@ -730,7 +753,6 @@ async function testGenerateVideo() {
     showBenchMessage(message)
     addLog('generate-video', 'failed', message, formatElapsed(startTime))
   } finally {
-    clearTimeout(timeoutId)
     stopGenerationRunTimer()
     isTestingGenerateVideo.value = false
   }

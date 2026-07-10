@@ -6,6 +6,7 @@ const path = require("path");
 const os = require("os");
 const fs = require("fs");
 const https = require("https");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -124,6 +125,37 @@ const RH_UPLOAD_ENDPOINT = "/media/upload/binary";
 const RH_VIDEO_TO_TEXT_ENDPOINT = "rhart-text-g-25-flash/video-to-text";
 const RH_MAX_POLL_SECONDS = 1200;
 const RH_POLL_INTERVAL_MS = 5000;
+const generationTasks = new Map();
+
+function generationTaskElapsed(task) {
+  const finishedAt = task.finishedAt || Date.now();
+  return Math.max(0, Math.floor((finishedAt - task.startedAt) / 1000));
+}
+
+function parseGenerationOutput(stdout) {
+  const outputFile = stdout.match(/OUTPUT_FILE:\s*([^\r\n]+)/)?.[1]?.trim() || "";
+  const cost = stdout.match(/COST:\s*([^\r\n]+)/)?.[1]?.trim() || "";
+  const videoUrl = outputFile
+    ? `/generated/${encodeURIComponent(path.basename(outputFile))}`
+    : "";
+  return { outputFile, cost, videoUrl };
+}
+
+function publicGenerationTask(taskId, task) {
+  const elapsed = generationTaskElapsed(task);
+  const base = { ok: true, taskId, status: task.status, startedAt: task.startedAt, elapsed };
+  if (task.status === "success") {
+    return {
+      ...base,
+      videoUrl: task.videoUrl,
+      outputFile: task.outputFile,
+      cost: task.cost,
+      result: task.result,
+    };
+  }
+  if (task.status === "failed") return { ...base, error: task.error };
+  return base;
+}
 
 function getErrorMessage(err, fallback) {
   if (!err) return fallback;
@@ -456,7 +488,7 @@ app.post("/api/video-to-text", upload.single("video"), async (req, res) => {
   }
 });
 
-app.post("/api/generate-video", upload.single("image"), async (req, res) => {
+app.post("/api/generate-video", upload.single("image"), (req, res) => {
   try {
   if (!process.env.RUNNINGHUB_API_KEY) {
     return sendApiError(res, 500, "后端未配置 RunningHub API Key");
@@ -474,7 +506,9 @@ app.post("/api/generate-video", upload.single("image"), async (req, res) => {
     return sendApiError(res, 500, `上传图片文件不存在：${imagePath}`);
   }
 
- const args = [
+  const taskId = crypto.randomUUID();
+  const outputFile = path.join("/tmp/openclaw/rh-output", `${taskId}.mp4`);
+  const args = [
   "scripts/runninghub.js",
   "--endpoint",
   "bytedance/seedance-2.0-global-fast/multimodal-video",
@@ -482,6 +516,8 @@ app.post("/api/generate-video", upload.single("image"), async (req, res) => {
   prompt,
   "--image",
   imagePath,
+  "--output",
+  outputFile,
   "--param",
   "resolution=720p",
   "--param",
@@ -494,19 +530,57 @@ app.post("/api/generate-video", upload.single("image"), async (req, res) => {
   "realPersonMode=true"
 ];
 
-  console.log("收到视频生成请求：", req.file?.originalname, req.file?.size);
-  console.log("开始调用 RunningHub image-to-video...");
+  const task = {
+    status: "running",
+    startedAt: Date.now(),
+    finishedAt: null,
+    elapsed: 0,
+    videoUrl: "",
+    outputFile: "",
+    cost: "",
+    error: "",
+    result: null,
+  };
+  generationTasks.set(taskId, task);
 
-  const stdout = await runRunningHubScript(args, "RunningHub image-to-video");
+  console.log("收到视频生成请求：", req.file?.originalname, req.file?.size, "本地 taskId:", taskId);
+  res.status(202).json({ ok: true, status: "running", taskId });
 
-    res.json({
-      ok: true,
-      result: stdout,
+  runRunningHubScript(args, `RunningHub image-to-video ${taskId}`)
+    .then((stdout) => {
+      const parsed = parseGenerationOutput(stdout);
+      if (!parsed.outputFile || !parsed.videoUrl) {
+        throw new Error("RunningHub 生成完成但未返回输出视频文件");
+      }
+      task.status = "success";
+      task.finishedAt = Date.now();
+      task.elapsed = generationTaskElapsed(task);
+      task.videoUrl = parsed.videoUrl;
+      task.outputFile = parsed.outputFile;
+      task.cost = parsed.cost;
+      task.result = stdout;
+      console.log("generate-video 后台任务成功：", taskId, parsed.outputFile);
+    })
+    .catch((err) => {
+      task.status = "failed";
+      task.finishedAt = Date.now();
+      task.elapsed = generationTaskElapsed(task);
+      task.error = getErrorMessage(err, "RunningHub 视频生成失败");
+      console.error("generate-video 后台任务失败：", taskId, err);
     });
   } catch (err) {
     console.error("generate-video 失败：", err);
     return sendApiError(res, 500, getErrorMessage(err, "RunningHub 视频生成失败"));
   }
+});
+
+app.get("/api/generate-status", (req, res) => {
+  const taskId = typeof req.query.taskId === "string" ? req.query.taskId.trim() : "";
+  if (!taskId) return sendApiError(res, 400, "缺少 taskId");
+  const task = generationTasks.get(taskId);
+  if (!task) return sendApiError(res, 404, "未找到生成任务");
+  task.elapsed = generationTaskElapsed(task);
+  return res.json(publicGenerationTask(taskId, task));
 });
 
 // ============================================================

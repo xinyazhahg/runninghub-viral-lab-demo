@@ -1163,11 +1163,7 @@ async function handleGenerate() {
 
   isGenerating.value = true
   const generationStartTime = Date.now()
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => {
-    generationStatus.value = 'timeout'
-    controller.abort()
-  }, 5 * 60 * 1000)
+  const generationDeadline = generationStartTime + 5 * 60 * 1000
   generationPhase.value = '正在提交生成任务'
   generationStatus.value = 'running'
   generationTaskId.value = ''
@@ -1203,24 +1199,48 @@ async function handleGenerate() {
     console.log('[debug] 发送给模型的首帧图片:', coverFile.name, coverFile.type, coverFile.size)
     console.log('[debug] 发送给模型的 prompt:', description)
 
-    const requestPromise = fetch(apiUrl('/api/generate-video'), {
+    const response = await fetch(apiUrl('/api/generate-video'), {
       method: 'POST',
       body: formData,
-      signal: controller.signal,
     })
 
     generationPhase.value = '正在生成视频'
-    const response = await requestPromise
-    const { data, rawText } = await readApiResponse(response)
+    let { data, rawText } = await readApiResponse(response)
 
     if (!response.ok || !data?.ok) {
       throw new Error(data?.message || data?.error || rawText || '视频生成失败')
     }
 
+    const taskId = data.taskId
+    if (!taskId) throw new Error('后端未返回生成任务 taskId')
+    generationTaskId.value = taskId
+
+    while (Date.now() < generationDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 4000))
+      const statusResponse = await fetch(
+        apiUrl(`/api/generate-status?taskId=${encodeURIComponent(taskId)}`)
+      )
+      const statusPayload = await readApiResponse(statusResponse)
+      data = statusPayload.data
+      rawText = statusPayload.rawText
+      if (!statusResponse.ok || !data?.ok) {
+        throw new Error(data?.message || data?.error || rawText || '查询生成任务失败')
+      }
+      if (data.status === 'success') break
+      if (data.status === 'failed') throw new Error(data.error || '视频生成失败')
+    }
+
+    if (data.status !== 'success') {
+      const timeoutError = new Error('生成超时，请稍后查看任务状态或重新生成')
+      timeoutError.name = 'GenerationTimeoutError'
+      throw timeoutError
+    }
+
     const generatedVideoResult = data.result
     console.log('真实视频生成结果：', generatedVideoResult)
-    generationTaskId.value = extractTaskIdFromResult(data) || extractTaskIdFromResult(generatedVideoResult)
-    const videoUrl = extractGeneratedVideoUrl(generatedVideoResult)
+    const videoUrl = data.videoUrl
+      ? toBackendUrl(data.videoUrl)
+      : extractGeneratedVideoUrl(generatedVideoResult)
 
     if (!videoUrl) {
       throw new Error('生成成功但未返回视频地址，请检查后端返回字段')
@@ -1237,7 +1257,7 @@ async function handleGenerate() {
       params: { ...resultParams },
       createdAt: new Date().toISOString(),
       time: new Date().toLocaleString('zh-CN', { hour12: false }),
-      cost: '￥15.2',
+      cost: data.cost || '',
       status: '已生成',
       saved: false,
     }
@@ -1247,13 +1267,12 @@ async function handleGenerate() {
     console.log(`✅ ${nextVersionId} 已生成`)
   } catch (error) {
     console.error('视频生成失败：', error)
-    const isTimeout = error.name === 'AbortError' || generationStatus.value === 'timeout'
+    const isTimeout = error.name === 'GenerationTimeoutError'
     generationStatus.value = isTimeout ? 'timeout' : 'failed'
     generateError.value = isTimeout
-      ? '生成超时，请稍后在测试台查询任务状态或重新生成'
+      ? '生成超时，请稍后查看任务状态或重新生成'
       : error.message || '视频生成失败'
   } finally {
-    clearTimeout(timeoutId)
     stopGenerationTimer()
     isGenerating.value = false
     setTimeout(resetGenerationStatus, 1200)
