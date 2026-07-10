@@ -4,6 +4,7 @@ import { computed } from 'vue'
 const props = defineProps({
   version: { type: Object, required: true },
   index: { type: Number, default: 0 },
+  isExporting: { type: Boolean, default: false },
 })
 
 const emit = defineEmits(['export', 'save', 'revise'])
@@ -113,7 +114,9 @@ const videoUrl = computed(() => props.version.videoUrl || '')
 
       <!-- 操作按钮 -->
       <div v-if="!isGenerating" class="result-actions">
-        <button class="ghost-button" @click="emit('export')">导出视频</button>
+        <button class="ghost-button" :disabled="isExporting" @click="emit('export')">
+          {{ isExporting ? '正在导出...' : '导出视频' }}
+        </button>
         <button
           :class="['ghost-button', { 'is-saved': isSaved }]"
           :disabled="isSaved"

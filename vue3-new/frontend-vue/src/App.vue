@@ -311,6 +311,7 @@ function restoreDemoState() {
 
 function clearDemoState() {
   suppressDemoPersist = true
+  canvas.clearSavedOffsets()
   if (typeof localStorage !== 'undefined') {
     localStorage.removeItem(DEMO_STATE_KEY)
   }
@@ -435,7 +436,7 @@ watch([
 const showInspiration = computed(() => flowMode.value === 'idle')
 
 // ── 画布节点系统 ──
-const canvas = useCanvasNodes()
+const canvas = useCanvasNodes({ storageKey: 'viral-lab-node-layout:v1' })
 
 // 节点 ref
 const boardEl = ref(null)
@@ -443,6 +444,8 @@ const uploadNodeEl = ref(null)
 const analysisNodeEl = ref(null)
 const replaceRailEl = ref(null)
 const resultNodeRefs = ref([])
+const activeNodeKey = ref('uploadNode')
+const pulsingNodeKey = ref('')
 
 // 注册 board 和节点
 function registerCanvasNodes() {
@@ -460,31 +463,28 @@ function registerCanvasNodes() {
   canvas.refreshObservers()
 }
 
+async function focusFlowNode(nodeKey, { pulse = false } = {}) {
+  activeNodeKey.value = nodeKey
+  pulsingNodeKey.value = pulse ? nodeKey : ''
+  await nextTick()
+  refreshCanvasConnectors(40)
+  setTimeout(() => {
+    const el = canvas.nodeEls[nodeKey]
+    el?.scrollIntoView?.({ behavior: 'smooth', block: 'center', inline: 'center' })
+  }, 80)
+}
+
 const displayVersions = computed(() => {
   const realVersions = versions.value.filter(isRealDemoVersion)
-  const selectedIndex = realVersions.findIndex((version) => version.id === currentVersionId.value)
-  const orderedVersions = selectedIndex > -1
-    ? [
-        realVersions[selectedIndex],
-        ...realVersions.slice(0, selectedIndex),
-        ...realVersions.slice(selectedIndex + 1),
-      ]
-    : [...realVersions]
-
-  const list = orderedVersions.map((version) => {
-    const isSelected = version.id === currentVersionId.value
-    return {
-      ...version,
-      summary: [
-        ...(isSelected ? ['当前选中版本'] : []),
-        ...(version.summary || []),
-      ],
-    }
-  })
+  // 保持节点创建顺序稳定；选中节点不能触发整个结果列表重排。
+  const list = realVersions.map((version) => ({
+    ...version,
+    summary: [...(version.summary || [])],
+  }))
 
   if (isGenerating.value) {
     const activeParams = activeGenerationParams.value || resultParams
-    list.unshift({
+    list.push({
       id: pendingVersionId.value || getNextVersionId(),
       isGenerating: true,
       videoUrl: '',
@@ -618,6 +618,7 @@ onMounted(() => {
   loadGenerationOptions()
   refreshCanvasConnectors(120)
   verifyRestoredDemoVideoUrls()
+  if (flowMode.value === 'idle') focusFlowNode('uploadNode')
 })
 
 // ── 工具函数（从 react-old 1:1 迁移）──
@@ -947,6 +948,7 @@ async function handleUploaded(file) {
   errorMsg.value = ''
   flowMode.value = 'analyzing'
   startFakeProgress()
+  focusFlowNode('analysisNode')
   const videoToTextDeadline = Date.now() + 3 * 60 * 1000
 
   try {
@@ -1018,6 +1020,7 @@ stopFakeProgress()
     analysisProgress.value = 100
     analysisStage.value = '拆解完成，可操作内容已准备就绪。'
     flowMode.value = 'customizing'
+    focusFlowNode('replaceRail')
   } catch (err) {
     stopFakeProgress()
     console.error('❌ 视频拆解失败：', err)
@@ -1034,6 +1037,7 @@ stopFakeProgress()
 function handleReplace(itemId) {
   // item 状态已在 ReplaceRail 内更新，这里可做额外逻辑
   console.log('✅ 替换完成：', itemId)
+  pulsingNodeKey.value = ''
 }
 
 function openBreakdown() {
@@ -1335,8 +1339,11 @@ async function executeGenerate() {
 
   const submittedParams = { ...resultParams }
   activeGenerationParams.value = submittedParams
+  pulsingNodeKey.value = ''
+  railFocusHighlight.value = false
   isGenerating.value = true
   pendingVersionId.value = getNextVersionId()
+  focusFlowNode(`result-${pendingVersionId.value}`)
   const generationStartTime = Date.now()
   const generationDeadline = generationStartTime + 5 * 60 * 1000
   generationPhase.value = '正在提交生成任务'
@@ -1489,6 +1496,7 @@ async function executeGenerate() {
 
     versions.value.push(version)
     currentVersionId.value = version.id
+    focusFlowNode(`result-${version.id}`)
     console.log(`✅ ${nextVersionId} 已生成`)
   } catch (error) {
     console.error('视频生成失败：', error)
@@ -1509,6 +1517,7 @@ async function executeGenerate() {
 // ── 轻提示 ──
 const noticeText = ref('')
 const noticeVisible = ref(false)
+const exportingVersionId = ref('')
 let noticeTimer = null
 function showNotice(msg) {
   noticeText.value = msg
@@ -1521,30 +1530,39 @@ function showNotice(msg) {
 async function handleExport(version) {
   const targetVersion = getVersionById(version?.id) || version
   const url = targetVersion?.videoUrl
+  if (targetVersion?.id) selectVersion(targetVersion.id)
 
   if (!url) {
-    showNotice('当前结果没有可导出的视频')
+    showNotice('视频导出失败，请重试')
     return
   }
+  if (exportingVersionId.value) return
 
   try {
-    const isAccessible = await canAccessVideoUrl(url)
-    if (!isAccessible) {
-      showNotice(HISTORY_VIDEO_EXPIRED_MESSAGE)
-      return
-    }
+    exportingVersionId.value = targetVersion.id
+    showNotice('正在导出视频')
+    const response = await fetch(apiUrl(
+      `/api/download-video?videoUrl=${encodeURIComponent(url)}&version=${encodeURIComponent(targetVersion.id)}`
+    ))
+    if (!response.ok) throw new Error('视频下载失败')
+    const blob = await response.blob()
+    if (!blob.size) throw new Error('视频文件为空')
+    const downloadUrl = URL.createObjectURL(blob)
 
     const link = document.createElement('a')
-    link.href = url
-    link.download = `${targetVersion.id || 'viral-lab-result'}.mp4`
+    link.href = downloadUrl
+    link.download = `爆款实验室_${targetVersion.id}.mp4`
     document.body.appendChild(link)
     link.click()
     document.body.removeChild(link)
+    setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000)
 
-    showNotice('视频已开始导出')
+    showNotice('视频已导出')
   } catch (error) {
     console.error('视频导出失败：', error)
-    showNotice('导出失败，请稍后重试')
+    showNotice('视频导出失败，请重试')
+  } finally {
+    exportingVersionId.value = ''
   }
 }
 
@@ -1577,29 +1595,20 @@ const railFocusHighlight = ref(false)
 function handleRevise(version) {
   const targetVersion = getCurrentVersion(getVersionById(version?.id) || version)
   if (targetVersion?.id) currentVersionId.value = targetVersion.id
-  const safeCoverUrl =
-    uploadedVideo.coverUrl ||
-    uploadedVideo.value?.previewUrl ||
-    targetVersion?.coverUrl ||
-    ''
-
   customItems.value.forEach((item) => {
-    if (!item.previewUrl) item.previewUrl = safeCoverUrl
+    if (typeof item.previewUrl === 'string' && item.previewUrl.startsWith('blob:')) {
+      URL.revokeObjectURL(item.previewUrl)
+    }
   })
-
-  adjustmentText.value = targetVersion?.adjustmentText || adjustmentText.value
-  currentGeneratingPrompt.value = targetVersion?.prompt || currentGeneratingPrompt.value
+  customItems.value = breakdownData.value
+    ? buildCustomItems(breakdownData.value)
+    : createDefaultCustomItems()
+  adjustmentText.value = ''
+  currentGeneratingPrompt.value = ''
   revising.value = true
   flowMode.value = 'customizing'
   railFocusHighlight.value = true
-  generateBtnText.value = '重新生成'
-
-  nextTick(() => {
-    replaceRailComp.value?.$el?.scrollIntoView?.({
-      behavior: 'smooth',
-      block: 'center'
-    })
-  })
+  focusFlowNode('replaceRail', { pulse: true })
 }
 
 // 重新改造后点击生成：重置 revising，走正常生成流程
@@ -1673,7 +1682,7 @@ function retry() {
             <div
               ref="uploadNodeEl"
               data-node-key="uploadNode"
-              class="flow-node-wrapper"
+              :class="['flow-node-wrapper', { 'is-current-node': activeNodeKey === 'uploadNode', 'is-completed-node': flowMode !== 'idle' }]"
               @pointerdown="uploadedVideo.name ? canvas.onPointerDown($event, 'uploadNode') : undefined"
             >
               <UploadCard
@@ -1692,7 +1701,7 @@ function retry() {
               <div
                 ref="analysisNodeEl"
                 data-node-key="analysisNode"
-                class="flow-node-wrapper"
+                :class="['flow-node-wrapper', { 'is-current-node': activeNodeKey === 'analysisNode' }]"
                 @pointerdown="canvas.onPointerDown($event, 'analysisNode')"
               >
                 <AnalysisNode
@@ -1709,7 +1718,7 @@ function retry() {
               <div
                 ref="analysisNodeEl"
                 data-node-key="analysisNode"
-                class="flow-node-wrapper"
+                :class="['flow-node-wrapper', { 'is-current-node': activeNodeKey === 'analysisNode' }]"
                 @pointerdown="canvas.onPointerDown($event, 'analysisNode')"
               >
                 <div class="error-node flow-node">
@@ -1730,7 +1739,7 @@ function retry() {
               <div
                 ref="replaceRailEl"
                 data-node-key="replaceRail"
-                class="flow-node-wrapper"
+                :class="['flow-node-wrapper', { 'is-current-node': activeNodeKey === 'replaceRail', 'is-node-pulsing': pulsingNodeKey === 'replaceRail', 'is-completed-node': activeNodeKey.startsWith('result-') }]"
                 @pointerdown="canvas.onPointerDown($event, 'replaceRail')"
               >
                 <ReplaceRail
@@ -1765,13 +1774,14 @@ function retry() {
                 :key="version.id"
                 :ref="el => { if (el) resultNodeRefs[index] = el }"
                 :data-node-key="`result-${version.id}`"
-                class="flow-node-wrapper"
+                :class="['flow-node-wrapper', { 'is-current-node': activeNodeKey === `result-${version.id}`, 'is-completed-node': activeNodeKey !== `result-${version.id}` }]"
                 @pointerdown="canvas.onPointerDown($event, `result-${version.id}`)"
                 @click="selectVersion(version.id)"
               >
                 <ResultCard
                   :version="version"
                   :index="index"
+                  :is-exporting="exportingVersionId === version.id"
                   @export="handleExport(version)"
                   @save="handleSaveAsset(version)"
                   @revise="handleRevise(version)"
@@ -2010,6 +2020,33 @@ button {
 .flow-node-wrapper {
   position: relative;
   will-change: transform;
+  border-radius: 20px;
+  transition: opacity 180ms ease, box-shadow 220ms ease, outline-color 220ms ease;
+  touch-action: none;
+}
+
+.flow-node-wrapper.is-current-node {
+  z-index: 12;
+  opacity: 1;
+  outline: 2px solid rgba(53, 245, 154, 0.82);
+  box-shadow: 0 0 0 5px rgba(53, 245, 154, 0.1), 0 0 42px rgba(53, 245, 154, 0.26);
+}
+
+.flow-node-wrapper.is-current-node :is(h1, h2, h3, .node-caption) {
+  color: var(--green);
+}
+
+.flow-node-wrapper.is-completed-node:not(.is-current-node) {
+  opacity: 0.68;
+}
+
+.flow-node-wrapper.is-node-pulsing {
+  animation: current-node-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes current-node-pulse {
+  0%, 100% { box-shadow: 0 0 0 4px rgba(53, 245, 154, 0.08), 0 0 28px rgba(53, 245, 154, 0.2); }
+  50% { box-shadow: 0 0 0 8px rgba(53, 245, 154, 0.16), 0 0 54px rgba(53, 245, 154, 0.38); }
 }
 
 .flow-node-wrapper:active {

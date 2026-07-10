@@ -803,6 +803,28 @@ app.get("/api/generate-status", (req, res) => {
   return res.json(publicGenerationTask(taskId, task));
 });
 
+app.get("/api/download-video", (req, res) => {
+  try {
+    const rawVideoUrl = typeof req.query.videoUrl === "string" ? req.query.videoUrl : "";
+    const version = typeof req.query.version === "string" ? req.query.version.trim() : "";
+    if (!rawVideoUrl) return sendApiError(res, 400, "缺少视频地址");
+    if (!/^V\d+$/.test(version)) return sendApiError(res, 400, "版本号无效");
+    const parsedUrl = new URL(rawVideoUrl, "http://localhost");
+    if (!parsedUrl.pathname.startsWith("/generated/")) {
+      return sendApiError(res, 400, "仅支持导出真实生成视频");
+    }
+    const filename = path.basename(decodeURIComponent(parsedUrl.pathname));
+    if (!/^[a-zA-Z0-9._-]+\.mp4$/i.test(filename)) {
+      return sendApiError(res, 400, "视频文件名无效");
+    }
+    const filePath = path.join("/tmp/openclaw/rh-output", filename);
+    if (!fs.existsSync(filePath)) return sendApiError(res, 404, "视频文件不存在或已过期");
+    return res.download(filePath, `爆款实验室_${version}.mp4`);
+  } catch (err) {
+    return sendApiError(res, 500, getErrorMessage(err, "视频导出失败"));
+  }
+});
+
 // ============================================================
 // /api/extract-element-preview — SAM 抠图预览
 // ============================================================
