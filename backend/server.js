@@ -7,6 +7,15 @@ const os = require("os");
 const fs = require("fs");
 const https = require("https");
 const crypto = require("crypto");
+const FFMPEG_PATH = process.env.FFMPEG_PATH || require("ffmpeg-static");
+const FFPROBE_PATH = process.env.FFPROBE_PATH || require("ffprobe-static").path;
+for (const binaryPath of [FFMPEG_PATH, FFPROBE_PATH]) {
+  try {
+    if (binaryPath && fs.existsSync(binaryPath)) fs.chmodSync(binaryPath, 0o755);
+  } catch (error) {
+    console.warn("媒体工具权限初始化失败：", binaryPath, error.message);
+  }
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -558,6 +567,163 @@ function runRunningHubScript(args, label) {
   });
 }
 
+function runMediaCommand(command, args, label) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { env: process.env });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      callback(value);
+    };
+    const timeoutId = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(reject, new Error(`${label}超时`));
+    }, 15000);
+    child.stdout?.on("data", (data) => { stdout += data.toString(); });
+    child.stderr?.on("data", (data) => { stderr += data.toString(); });
+    child.on("error", (error) => finish(reject, error));
+    child.on("close", (code) => {
+      if (code === 0) finish(resolve, stdout);
+      else finish(reject, new Error(`${label}失败：${stderr.slice(-800) || `退出码 ${code}`}`));
+    });
+  });
+}
+
+function parseBreakdownJson(value) {
+  if (value && typeof value === "object") return value;
+  const text = String(value || "");
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  try { return JSON.parse(text.slice(start, end + 1)); } catch { return null; }
+}
+
+function parseVideoTime(value) {
+  const first = String(value || "").split(/[-–—]/)[0].trim();
+  const parts = first.split(":").map(Number);
+  if (!parts.length || parts.some((part) => !Number.isFinite(part))) return null;
+  return parts.reduce((seconds, part) => seconds * 60 + part, 0);
+}
+
+function parseVideoTimeRange(value) {
+  const parts = String(value || "").split(/[-–—]/);
+  return {
+    start: parseVideoTime(parts[0]),
+    end: parts.length > 1 ? parseVideoTime(parts[1]) : null,
+  };
+}
+
+async function probeVideo(filePath) {
+  const stdout = await runMediaCommand(FFPROBE_PATH, [
+    "-v", "error", "-select_streams", "v:0",
+    "-show_entries", "stream=width,height:format=duration", "-of", "json", filePath,
+  ], "ffprobe");
+  const data = JSON.parse(stdout);
+  return {
+    duration: Math.max(1, Number(data.format?.duration) || 1),
+    width: Number(data.streams?.[0]?.width) || 0,
+    height: Number(data.streams?.[0]?.height) || 0,
+  };
+}
+
+function previewItems(data) {
+  const overview = data.overview || {};
+  const list = (value) => Array.isArray(value) ? value.map(String).filter(Boolean) : [];
+  return [
+    ...list(overview.replaceableSubjects).slice(0, 2).map((name) => ({ type: "subject", name })),
+    ...list(overview.replaceableScenes).slice(0, 2).map((name) => ({ type: "scene", name })),
+    ...list(overview.replaceableElements).slice(0, 4).map((name) => ({ type: "element", name })),
+  ];
+}
+
+function findPreviewShot(item, shots) {
+  return shots.find((shot) => JSON.stringify(shot).includes(item.name)) || null;
+}
+
+function findBoundingBox(item, shot) {
+  const objects = Array.isArray(shot?.objects) ? shot.objects : [];
+  const candidates = [shot?.boundingBox, shot?.bbox, shot?.box, ...objects
+    .filter((object) => String(object?.name || object?.label || "").includes(item.name))
+    .map((object) => object.boundingBox || object.bbox || object.box)];
+  return candidates.find((box) => Array.isArray(box) && box.length >= 4) || null;
+}
+
+function cropFilter(item, bbox, videoInfo) {
+  if (item.type === "scene") return "scale='min(720,iw)':-2";
+  if (bbox && videoInfo.width && videoInfo.height) {
+    let [x, y, width, height] = bbox.map(Number);
+    if ([x, y, width, height].every(Number.isFinite)) {
+      if (Math.max(x, y, width, height) <= 1) {
+        x *= videoInfo.width; width *= videoInfo.width;
+        y *= videoInfo.height; height *= videoInfo.height;
+      }
+      x = Math.max(0, Math.floor(x)); y = Math.max(0, Math.floor(y));
+      width = Math.max(2, Math.min(videoInfo.width - x, Math.floor(width)));
+      height = Math.max(2, Math.min(videoInfo.height - y, Math.floor(height)));
+      return `crop=${width}:${height}:${x}:${y},scale=480:-2`;
+    }
+  }
+  const ratio = item.type === "subject" ? 0.62 : 0.48;
+  return `crop=trunc(iw*${ratio}/2)*2:trunc(ih*${ratio}/2)*2:(iw-ow)/2:(ih-oh)/2,scale=480:-2`;
+}
+
+async function generateBreakdownPreviews(result, videoPath, taskId) {
+  const data = parseBreakdownJson(result);
+  if (!data) return result;
+  const videoInfo = await probeVideo(videoPath);
+  const shots = Array.isArray(data.shots) ? data.shots : [];
+  const items = previewItems(data);
+  const outputDir = path.join("/tmp/openclaw/rh-output/previews", taskId);
+  fs.mkdirSync(outputDir, { recursive: true });
+  const previews = { subjects: [], scenes: [], elements: [] };
+  const usedSceneTimes = [];
+
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    const shot = findPreviewShot(item, shots);
+    const parsedTime = parseVideoTime(shot?.time);
+    let time = Math.min(videoInfo.duration - 0.05, Math.max(0, parsedTime ?? ((index + 1) / (items.length + 1)) * videoInfo.duration));
+    if (item.type === "scene") {
+      if (usedSceneTimes.some((used) => Math.abs(used - time) < 0.25)) {
+        const sceneIndex = usedSceneTimes.length + 1;
+        time = Math.min(videoInfo.duration - 0.05, (sceneIndex / 3) * videoInfo.duration);
+      }
+      usedSceneTimes.push(time);
+    }
+    const outputName = `${item.type}-${index}.jpg`;
+    const outputPath = path.join(outputDir, outputName);
+    try {
+      const bbox = findBoundingBox(item, shot);
+      await runMediaCommand(FFMPEG_PATH, [
+        "-ss", time.toFixed(3), "-i", videoPath, "-frames:v", "1",
+        "-vf", cropFilter(item, bbox, videoInfo), "-q:v", "3", "-y", outputPath,
+      ], "FFmpeg 截帧");
+      const record = {
+        name: item.name,
+        time,
+        ...(shot?.time ? { timeRange: shot.time } : {}),
+        ...(bbox ? { boundingBox: bbox } : {}),
+        [`${item.type}PreviewUrl`]: `/generated/previews/${taskId}/${outputName}`,
+      };
+      if (item.type === "subject") record.subjectTime = time;
+      if (item.type === "element") record.elementTime = time;
+      if (item.type === "scene") {
+        const range = parseVideoTimeRange(shot?.time);
+        record.sceneStartTime = range.start ?? time;
+        record.sceneEndTime = range.end ?? Math.min(videoInfo.duration, time + 1);
+      }
+      previews[`${item.type}s`].push(record);
+    } catch (error) {
+      console.warn(`预览生成失败 ${item.type}/${item.name}:`, error.message);
+    }
+  }
+  return { ...data, previews };
+}
+
 const DEFAULT_PROMPT = `
 请拆解用户上传的视频，并只返回严格 JSON，不要 Markdown，不要解释。
 
@@ -630,11 +796,17 @@ app.post("/api/video-to-text", upload.single("video"), (req, res) => {
     res.status(202).json({ ok: true, status: "running", taskId });
 
     runVideoToTextDirect(process.env.RUNNINGHUB_API_KEY, videoPath, prompt)
-      .then((result) => {
+      .then(async (result) => {
+        let enrichedResult = result;
+        try {
+          enrichedResult = await generateBreakdownPreviews(result, videoPath, taskId);
+        } catch (error) {
+          console.warn("video-to-text 预览生成整体失败，继续返回拆解结果：", error.message);
+        }
         task.status = "success";
         task.finishedAt = Date.now();
         task.elapsed = videoToTextTaskElapsed(task);
-        task.result = result;
+        task.result = enrichedResult;
         console.log("video-to-text 后台任务成功：", taskId);
       })
       .catch((err) => {

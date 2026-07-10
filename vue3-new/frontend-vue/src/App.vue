@@ -67,8 +67,6 @@ const resultParams = reactive({
 const generationOptions = ref({ models: [], ratios: [], resolutions: [], durations: [] })
 const estimatedPrice = ref(null)
 const priceStatus = ref('loading')
-const generationConfirmVisible = ref(false)
-const confirmationIsRevise = ref(false)
 const activeGenerationParams = ref(null)
 const generationConfigText = computed(() =>
   `${resultParams.ratio} / ${resultParams.quality.toUpperCase()} / ${resultParams.duration} / ${resultParams.model}`
@@ -760,6 +758,9 @@ function buildSceneListFromShots(shots = [], overviewScenes = []) {
 }
 
 function parseBreakdownResult(rawText = '') {
+  if (rawText && typeof rawText === 'object') {
+    return cleanBreakdownResult(normalizeBreakdownData(rawText))
+  }
   const text = String(rawText || '')
   let jsonText = ''
   const jsonStart = text.indexOf('{')
@@ -820,6 +821,7 @@ function normalizeBreakdownData(data = {}) {
       camera: shot.camera || '未识别',
       rhythm: shot.rhythm || '未识别',
     })),
+    previews: data.previews || { subjects: [], scenes: [], elements: [] },
   }
 }
 
@@ -839,7 +841,6 @@ function getEmptyBreakdownData(message = '暂无视频拆解结果') {
 
 function buildCustomItems(data) {
   const overview = data?.overview || {}
-  const shots = Array.isArray(data?.shots) ? data.shots : []
 
   const subjects = normalizeList(overview.replaceableSubjects, { filterRelationWords: true }).slice(0, 2)
   const scenes = normalizeList(overview.replaceableScenes).slice(0, 3)
@@ -874,24 +875,34 @@ const texts = normalizeList(overview.replaceableText).filter((text) => !isEmptyC
   })
   const displayTexts = filteredTexts
 
-  const makeItems = (list, group, prefix, previewPrefix) =>
-    list.map((name, index) => ({
-      id: `${prefix}${index + 1}`,
-      group,
-      title: name || `${group} ${index + 1}`,
-      preview: `${previewPrefix}-${index + 1}`,
-      previewUrl: uploadedVideo.coverUrl || '',
-      original: `保留原视频${group}`,
-      current: `保留原视频${group}`,
-      replacement: '',
-      changed: false,
-    }))
+  const previewGroups = data?.previews || {}
+  const makeItems = (list, group, prefix, previewPrefix, previewType, previewField) =>
+    list.map((name, index) => {
+      const candidates = Array.isArray(previewGroups[previewType]) ? previewGroups[previewType] : []
+      const preview = candidates.find((item) => item.name === name) || candidates[index]
+      const specificPreviewUrl = preview?.[previewField]
+      return {
+        id: `${prefix}${index + 1}`,
+        group,
+        title: name || `${group} ${index + 1}`,
+        preview: `${previewPrefix}-${index + 1}`,
+        previewUrl: specificPreviewUrl ? toBackendUrl(specificPreviewUrl) : uploadedVideo.coverUrl || '',
+        [previewField]: specificPreviewUrl ? toBackendUrl(specificPreviewUrl) : '',
+        previewTime: preview?.time ?? null,
+        previewTimeRange: preview?.timeRange || '',
+        boundingBox: preview?.boundingBox || null,
+        original: `保留原视频${group}`,
+        current: `保留原视频${group}`,
+        replacement: '',
+        changed: false,
+      }
+    })
 
   return [
-    ...makeItems(subjects, '主体', 'realSubject', 'preview-subject'),
-    ...makeItems(scenes, '场景', 'realScene', 'preview-scene'),
-    ...makeItems(elements, '元素', 'realElement', 'preview-element'),
-    ...makeItems(displayTexts, '字幕/文案', 'realCopy', 'preview-copy'),
+    ...makeItems(subjects, '主体', 'realSubject', 'preview-subject', 'subjects', 'subjectPreviewUrl'),
+    ...makeItems(scenes, '场景', 'realScene', 'preview-scene', 'scenes', 'scenePreviewUrl'),
+    ...makeItems(elements, '元素', 'realElement', 'preview-element', 'elements', 'elementPreviewUrl'),
+    ...makeItems(displayTexts, '字幕/文案', 'realCopy', 'preview-copy', 'texts', 'textPreviewUrl'),
   ]
 }
 
@@ -1293,7 +1304,7 @@ function updateGenerationConfig(nextConfig) {
   if (selectedModel) resultParams.model = selectedModel.label
 }
 
-function requestGenerationConfirmation(isRevise = false) {
+async function startGeneration(isRevise = false) {
   generateError.value = ''
   if (!breakdownData.value || flowMode.value !== 'customizing') {
     generateError.value = '请先上传视频并完成拆解'
@@ -1303,28 +1314,17 @@ function requestGenerationConfirmation(isRevise = false) {
     generateError.value = '暂时无法计算本次生成费用，请稍后重试。'
     return
   }
-  confirmationIsRevise.value = isRevise
-  generationConfirmVisible.value = true
-}
-
-function handleGenerate() {
-  requestGenerationConfirmation(false)
-}
-
-async function confirmGeneration() {
-  if (priceStatus.value !== 'ready' || estimatedPrice.value === null) {
-    generateError.value = '暂时无法计算本次生成费用，请稍后重试。'
-    return
-  }
-  const wasRevise = confirmationIsRevise.value
   const versionCount = versions.value.length
-  generationConfirmVisible.value = false
   await executeGenerate()
-  if (wasRevise && versions.value.length > versionCount) {
+  if (isRevise && versions.value.length > versionCount) {
     revising.value = false
     flowMode.value = 'customizing'
     showNotice('新版本已生成')
   }
+}
+
+function handleGenerate() {
+  return startGeneration(false)
 }
 
 async function executeGenerate() {
@@ -1613,7 +1613,7 @@ function handleRevise(version) {
 
 // 重新改造后点击生成：重置 revising，走正常生成流程
 async function handleGenerateFromRevise() {
-  requestGenerationConfirmation(true)
+  return startGeneration(true)
 }
 
 function handleRestore(itemId) {
@@ -1805,25 +1805,6 @@ function retry() {
       @close="closeBreakdown"
     />
 
-    <div v-if="generationConfirmVisible" class="modal" @click.self="generationConfirmVisible = false">
-      <div class="modal-card generation-confirm-card">
-        <h2>生成确认</h2>
-        <p>当前配置：</p>
-        <ul>
-          <li>视频比例：{{ resultParams.ratio }}</li>
-          <li>视频清晰度：{{ resultParams.quality.toUpperCase() }}</li>
-          <li>视频时长：{{ resultParams.duration }}</li>
-          <li>使用模型：{{ resultParams.model }}</li>
-        </ul>
-        <p>预计消耗：<strong>{{ estimatedPriceText }}</strong></p>
-        <p>是否确认生成？</p>
-        <div class="generation-confirm-actions">
-          <button class="ghost-button" type="button" @click="generationConfirmVisible = false">取消生成</button>
-          <button class="primary-button" type="button" :disabled="priceStatus !== 'ready'" @click="confirmGeneration">确认生成</button>
-        </div>
-      </div>
-    </div>
-
     <!-- 生成错误提示 -->
     <div v-if="generateError" class="generate-error-toast">
       {{ generateError }}
@@ -1837,23 +1818,6 @@ function retry() {
 </template>
 
 <style>
-.generation-confirm-card {
-  width: min(460px, 100%);
-}
-
-.generation-confirm-card ul {
-  margin: 12px 0;
-  padding-left: 20px;
-  line-height: 1.9;
-}
-
-.generation-confirm-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 10px;
-  margin-top: 18px;
-}
-
 :root {
   color-scheme: dark;
   --canvas: #020303;
