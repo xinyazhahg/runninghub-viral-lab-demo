@@ -432,6 +432,7 @@ async function testVideoToText() {
   }
 
   const startTime = performance.now()
+  const deadline = Date.now() + 3 * 60 * 1000
   isTestingVideoToText.value = true
   showBenchMessage('')
   addLog('video-to-text', 'running', '开始请求 /api/video-to-text')
@@ -444,12 +445,35 @@ async function testVideoToText() {
       method: 'POST',
       body: formData,
     })
-    const data = await readResponse(response)
-    videoToTextRaw.value = data
+    let data = await readResponse(response)
 
     if (!response.ok || !data?.ok) {
       throw new Error(data?.message || data?.error || data?.rawText || 'video-to-text 请求失败')
     }
+
+    const taskId = data.taskId
+    if (!taskId) throw new Error('后端未返回视频拆解任务 taskId')
+
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 4000))
+      const statusResponse = await fetch(
+        apiUrl(`/api/video-to-text-status?taskId=${encodeURIComponent(taskId)}`)
+      )
+      data = await readResponse(statusResponse)
+      if (!statusResponse.ok || !data?.ok) {
+        throw new Error(data?.message || data?.error || data?.rawText || '查询视频拆解任务失败')
+      }
+      if (data.status === 'success') break
+      if (data.status === 'failed') throw new Error(data.error || '视频拆解失败')
+    }
+
+    if (data.status !== 'success') {
+      const timeoutError = new Error('视频拆解超时，请稍后重试')
+      timeoutError.name = 'VideoToTextTimeoutError'
+      throw timeoutError
+    }
+
+    videoToTextRaw.value = data
 
     parsedBreakdown.value = parseBreakdownFromApiData(data)
     if (!parsedBreakdown.value) {
@@ -466,7 +490,9 @@ async function testVideoToText() {
     buildPrompt()
     addLog('video-to-text', 'success', '请求完成', formatElapsed(startTime))
   } catch (error) {
-    const message = error.message || 'video-to-text 请求失败'
+    const message = error.name === 'VideoToTextTimeoutError'
+      ? '视频拆解超时，请稍后重试'
+      : `视频拆解失败：${error.message || '请稍后重试'}`
     showBenchMessage(message)
     addLog('video-to-text', 'failed', message, formatElapsed(startTime))
   } finally {

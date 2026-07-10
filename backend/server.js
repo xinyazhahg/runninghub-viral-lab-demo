@@ -126,6 +126,25 @@ const RH_VIDEO_TO_TEXT_ENDPOINT = "rhart-text-g-25-flash/video-to-text";
 const RH_MAX_POLL_SECONDS = 1200;
 const RH_POLL_INTERVAL_MS = 5000;
 const generationTasks = new Map();
+const videoToTextTasks = new Map();
+
+function videoToTextTaskElapsed(task) {
+  const finishedAt = task.finishedAt || Date.now();
+  return Math.max(0, Math.floor((finishedAt - task.startedAt) / 1000));
+}
+
+function publicVideoToTextTask(task) {
+  const base = {
+    ok: true,
+    taskId: task.taskId,
+    status: task.status,
+    startedAt: task.startedAt,
+    elapsed: videoToTextTaskElapsed(task),
+  };
+  if (task.status === "success") return { ...base, result: task.result };
+  if (task.status === "failed") return { ...base, error: task.error };
+  return base;
+}
 
 function generationTaskElapsed(task) {
   const finishedAt = task.finishedAt || Date.now();
@@ -458,7 +477,7 @@ const DEFAULT_PROMPT = `
 5. 不要编造视频中不存在的内容。
 `;
 
-app.post("/api/video-to-text", upload.single("video"), async (req, res) => {
+app.post("/api/video-to-text", upload.single("video"), (req, res) => {
   try {
     console.log("收到视频拆解请求：", req.file?.originalname, req.file?.size);
     if (!process.env.RUNNINGHUB_API_KEY) {
@@ -475,17 +494,49 @@ app.post("/api/video-to-text", upload.single("video"), async (req, res) => {
       return sendApiError(res, 500, `上传视频文件不存在：${videoPath}`);
     }
 
-    console.log("开始直连 RunningHub video-to-text...");
-    const stdout = await runVideoToTextDirect(process.env.RUNNINGHUB_API_KEY, videoPath, prompt);
+    const taskId = crypto.randomUUID();
+    const task = {
+      taskId,
+      status: "running",
+      startedAt: Date.now(),
+      finishedAt: null,
+      elapsed: 0,
+      result: null,
+      error: "",
+    };
+    videoToTextTasks.set(taskId, task);
 
-    res.json({
-      ok: true,
-      result: stdout,
-    });
+    console.log("开始后台执行 RunningHub video-to-text，本地 taskId:", taskId);
+    res.status(202).json({ ok: true, status: "running", taskId });
+
+    runVideoToTextDirect(process.env.RUNNINGHUB_API_KEY, videoPath, prompt)
+      .then((result) => {
+        task.status = "success";
+        task.finishedAt = Date.now();
+        task.elapsed = videoToTextTaskElapsed(task);
+        task.result = result;
+        console.log("video-to-text 后台任务成功：", taskId);
+      })
+      .catch((err) => {
+        task.status = "failed";
+        task.finishedAt = Date.now();
+        task.elapsed = videoToTextTaskElapsed(task);
+        task.error = `RunningHub video-to-text 调用失败：${getErrorMessage(err, "未知错误")}`;
+        console.error("video-to-text 后台任务失败：", taskId, err);
+      });
   } catch (err) {
     console.error("video-to-text 失败：", err);
     return sendApiError(res, 500, `RunningHub video-to-text 调用失败：${getErrorMessage(err, "未知错误")}`);
   }
+});
+
+app.get("/api/video-to-text-status", (req, res) => {
+  const taskId = typeof req.query.taskId === "string" ? req.query.taskId.trim() : "";
+  if (!taskId) return sendApiError(res, 400, "缺少 taskId");
+  const task = videoToTextTasks.get(taskId);
+  if (!task) return sendApiError(res, 404, "未找到视频拆解任务");
+  task.elapsed = videoToTextTaskElapsed(task);
+  return res.json(publicVideoToTextTask(task));
 });
 
 app.post("/api/generate-video", upload.single("image"), (req, res) => {

@@ -850,6 +850,7 @@ async function handleUploaded(file) {
   errorMsg.value = ''
   flowMode.value = 'analyzing'
   startFakeProgress()
+  const videoToTextDeadline = Date.now() + 3 * 60 * 1000
 
   try {
     const formData = new FormData()
@@ -860,7 +861,7 @@ async function handleUploaded(file) {
       body: formData,
     })
 
-const rawText = await response.text()
+let rawText = await response.text()
 
 let data = null
 try {
@@ -877,6 +878,35 @@ if (!response.ok || !data?.ok) {
       '视频拆解失败，请检查后端服务或 API Key。'
     )
 }
+
+    const taskId = data.taskId
+    if (!taskId) throw new Error('后端未返回视频拆解任务 taskId')
+
+    while (Date.now() < videoToTextDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 4000))
+      const statusResponse = await fetch(
+        apiUrl(`/api/video-to-text-status?taskId=${encodeURIComponent(taskId)}`)
+      )
+      rawText = await statusResponse.text()
+      try {
+        data = rawText ? JSON.parse(rawText) : null
+      } catch {
+        data = null
+      }
+      if (!statusResponse.ok || !data?.ok) {
+        throw new Error(
+          data?.message || data?.error || rawText || '查询视频拆解任务失败'
+        )
+      }
+      if (data.status === 'success') break
+      if (data.status === 'failed') throw new Error(data.error || '视频拆解失败')
+    }
+
+    if (data.status !== 'success') {
+      const timeoutError = new Error('视频拆解超时，请稍后重试')
+      timeoutError.name = 'VideoToTextTimeoutError'
+      throw timeoutError
+    }
 
     videoToTextResult.value = data
     console.log('✅ 视频拆解结果：', data.result)
@@ -896,7 +926,9 @@ stopFakeProgress()
     console.error('❌ 视频拆解失败：', err)
     analysisProgress.value = 0
     analysisStage.value = ''
-    errorMsg.value = err.message || '视频拆解失败，请重试。'
+    errorMsg.value = err.name === 'VideoToTextTimeoutError'
+      ? '视频拆解超时，请稍后重试'
+      : `视频拆解失败：${err.message || '请稍后重试。'}`
     flowMode.value = 'error'
   }
 }
