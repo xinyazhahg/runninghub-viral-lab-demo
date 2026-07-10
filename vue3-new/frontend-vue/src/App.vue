@@ -1224,22 +1224,58 @@ async function handleGenerate() {
   const nextVersionId = getNextVersionId()
 
   try {
-    if (!uploadedVideo.coverUrl) {
+    const replacedSubject = customItems.value.find((item) =>
+      item.group === '主体'
+      && item.changed
+      && (
+        item.file
+        || item.replacementFile
+        || item.assetFile
+        || item.imageUrl
+        || item.assetUrl
+        || item.replacementPreviewUrl
+        || item.previewUrl
+      )
+    )
+    const subjectReplacementFile = replacedSubject?.file
+      || replacedSubject?.replacementFile
+      || replacedSubject?.assetFile
+      || null
+    const subjectReplacementUrl = replacedSubject?.imageUrl
+      || replacedSubject?.assetUrl
+      || replacedSubject?.replacementPreviewUrl
+      || replacedSubject?.previewUrl
+      || ''
+    const replacementName = subjectReplacementFile?.name
+      || replacedSubject?.replacement
+      || replacedSubject?.current
+      || 'subject-replacement.jpg'
+    const hasSubjectReplacement = Boolean(
+      replacedSubject && (subjectReplacementFile || subjectReplacementUrl)
+    )
+
+    console.log('[debug] 当前是否存在主体替换:', hasSubjectReplacement)
+    console.log('[debug] 主体替换素材名称:', hasSubjectReplacement ? replacementName : '无')
+
+    if (!hasSubjectReplacement && !uploadedVideo.coverUrl) {
       throw new Error('请先上传视频并完成拆解')
     }
 
-    const coverFile = await imageUrlToFile(
-      uploadedVideo.coverUrl,
-      'reference-cover.jpg'
-    )
+    const imageFile = hasSubjectReplacement
+      ? subjectReplacementFile instanceof File
+        ? subjectReplacementFile
+        : await imageUrlToFile(subjectReplacementUrl, replacementName)
+      : await imageUrlToFile(uploadedVideo.coverUrl, 'reference-cover.jpg')
+    const imageSource = hasSubjectReplacement ? '主体替换素材' : '原视频首帧'
 
     const formData = new FormData()
-    formData.append('image', coverFile)
+    formData.append('image', imageFile)
     formData.append('prompt', description)
     formData.append('duration', '10')
     formData.append('aspectRatio', '9:16')
 
-    console.log('[debug] 发送给模型的首帧图片:', coverFile.name, coverFile.type, coverFile.size)
+    console.log('[debug] 实际传给 generate-video 的 image 来源:', imageSource)
+    console.log('[debug] 发送给模型的图片:', imageFile.name, imageFile.type, imageFile.size)
     console.log('[debug] 发送给模型的 prompt:', description)
 
     const response = await fetch(apiUrl('/api/generate-video'), {
