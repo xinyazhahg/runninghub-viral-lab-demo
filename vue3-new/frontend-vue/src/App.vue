@@ -458,14 +458,9 @@ const displayVersions = computed(() => {
       duration: '10s',
       prompt: '正在生成新版本...',
       summary: [
-        generationPhase.value || '正在提交生成任务',
         '正在生成视频',
-        '预计需要 1-3 分钟',
-        '请勿关闭页面',
-        `当前耗时：${generationElapsed.value}`,
-        generationTaskId.value ? `taskId：${generationTaskId.value}` : '',
-        generationStatus.value ? `状态：${generationStatus.value}` : '',
-      ].filter(Boolean)
+        '预计需要 1-3 分钟，请勿关闭页面',
+      ]
     })
   }
 

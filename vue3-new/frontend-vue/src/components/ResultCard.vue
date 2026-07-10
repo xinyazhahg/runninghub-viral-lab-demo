@@ -44,8 +44,8 @@ const videoUrl = computed(() => props.version.videoUrl || '')
       <div v-if="isGenerating" class="generating-visual">
         <div class="generating-orb"></div>
         <div class="generating-ring"></div>
-        <p>正在生成...</p>
-        <span>预计 1-2 分钟，请勿关闭页面</span>
+        <p>正在生成视频</p>
+        <span>预计需要 1-3 分钟，请勿关闭页面</span>
       </div>
 
       <!-- 真实视频 -->
