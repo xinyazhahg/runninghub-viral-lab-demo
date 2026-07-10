@@ -62,6 +62,10 @@ const props = defineProps({
     type: String,
     default: '生成视频',
   },
+  generationConfigText: {
+    type: String,
+    default: '9:16 / 720P / 10s / 可灵 v3.0 Pro',
+  },
   isGenerating: {
     type: Boolean,
     default: false,
@@ -629,7 +633,7 @@ class="custom-group-grid"
           ></textarea>
         </div>
         <div class="custom-generate-footer">
-          <span class="branch-cost-pill">预计消耗：￥15.2</span>
+          <span class="generation-config-text">当前生成配置：{{ generationConfigText }}</span>
           <button
             id="customDirectGenerateBtn"
             class="primary-button branch-generate"

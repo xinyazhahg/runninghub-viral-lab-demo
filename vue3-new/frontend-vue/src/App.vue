@@ -54,13 +54,16 @@ const generationPhase = ref('')
 const generationElapsed = ref('0秒')
 const generationTaskId = ref('')
 const generationStatus = ref('')
+const pendingVersionId = ref('')
 let generationTimer = null
 const resultParams = {
   ratio: '9:16',
   quality: '720P',
-  duration: '18s',
+  duration: '10s',
+  model: '可灵 v3.0 Pro',
   timeStart: 0,
 }
+const generationConfigText = `${resultParams.ratio} / ${resultParams.quality} / ${resultParams.duration} / ${resultParams.model}`
 
 function createDefaultCustomItems() {
   return [
@@ -314,6 +317,7 @@ function clearDemoState() {
   revising.value = false
   reviseVisible.value = false
   isGenerating.value = false
+  pendingVersionId.value = ''
   showNotice('当前状态已清空')
 
   nextTick(() => {
@@ -449,13 +453,11 @@ const displayVersions = computed(() => {
 
   if (isGenerating.value) {
     list.unshift({
-      id: 'generating',
+      id: pendingVersionId.value || getNextVersionId(),
       isGenerating: true,
       videoUrl: '',
       coverUrl: '',
-      ratio: '9:16',
-      quality: '720P',
-      duration: '10s',
+      ...resultParams,
       prompt: '正在生成新版本...',
       summary: [
         '正在生成视频',
@@ -1160,6 +1162,7 @@ function resetGenerationStatus() {
   generationElapsed.value = '0秒'
   generationTaskId.value = ''
   generationStatus.value = ''
+  pendingVersionId.value = ''
 }
 
 async function readApiResponse(response) {
@@ -1211,6 +1214,7 @@ async function handleGenerate() {
   }
 
   isGenerating.value = true
+  pendingVersionId.value = getNextVersionId()
   const generationStartTime = Date.now()
   const generationDeadline = generationStartTime + 5 * 60 * 1000
   generationPhase.value = '正在提交生成任务'
@@ -1227,7 +1231,7 @@ async function handleGenerate() {
     ? summaryItems.map((item) => `${item.title} → ${item.value}`)
     : ['其他内容：保持原视频']
 
-  const nextVersionId = getNextVersionId()
+  const nextVersionId = pendingVersionId.value
 
   try {
     const replacedSubject = customItems.value.find((item) =>
@@ -1284,8 +1288,8 @@ async function handleGenerate() {
       replacement: item.current || item.replacement,
     }))))
     formData.append('extraPrompt', adjText)
-    formData.append('duration', '10')
-    formData.append('aspectRatio', '9:16')
+    formData.append('duration', resultParams.duration.replace(/s$/i, ''))
+    formData.append('aspectRatio', resultParams.ratio)
 
     console.log('[debug] 实际传给 generate-video 的 image 来源:', imageSource)
     console.log('[debug] 发送给模型的图片:', imageFile.name, imageFile.type, imageFile.size)
@@ -1345,6 +1349,7 @@ async function handleGenerate() {
       id: nextVersionId,
       taskId,
       resultSource: 'generate-status',
+      ...resultParams,
       summary,
       prompt: finalPrompt,
       adjustmentText: adjText,
@@ -1371,6 +1376,7 @@ async function handleGenerate() {
   } finally {
     stopGenerationTimer()
     isGenerating.value = false
+    pendingVersionId.value = ''
     setTimeout(resetGenerationStatus, 1200)
   }
 }
@@ -1615,6 +1621,7 @@ function retry() {
                   :cover-url="uploadedVideo.coverUrl"
                   v-model="adjustmentText"
                   :generate-btn-text="generateBtnText"
+                  :generation-config-text="generationConfigText"
                   :is-generating="isGenerating"
                   :revise-visible="reviseVisible"
                   :revising="revising"

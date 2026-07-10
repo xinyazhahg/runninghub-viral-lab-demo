@@ -11,7 +11,7 @@ const emit = defineEmits(['export', 'save', 'revise'])
 const isGenerating = computed(() => props.version.isGenerating)
 const isSaved = computed(() => !!props.version.saved)
 const versionLabel = computed(() => {
-  if (isGenerating.value) return `V${props.index + 1} 正在生成`
+  if (isGenerating.value) return `${props.version.id} 正在生成`
   return props.version.id
 })
 
@@ -24,7 +24,13 @@ const summaryLines = computed(() => {
 
 const specsText = computed(() => {
   const p = props.version || {}
-  return `${p.ratio || '9:16'} / ${p.quality || '720P'} / ${p.duration || '10s'} / ${p.model || '可灵 v3.0 Pro'} / ${p.cost || '¥10.40'}`
+  return [
+    p.ratio || '9:16',
+    p.quality || '720P',
+    p.duration || '10s',
+    p.model || '可灵 v3.0 Pro',
+    p.cost || '',
+  ].filter(Boolean).join(' / ')
 })
 
 const videoUrl = computed(() => props.version.videoUrl || '')
