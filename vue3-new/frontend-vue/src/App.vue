@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { ref, reactive, computed, watch, nextTick, onMounted } from 'vue'
 import LeftToolbar from './components/LeftToolbar.vue'
 import TopBar from './components/TopBar.vue'
 import LabHead from './components/LabHead.vue'
@@ -31,7 +31,8 @@ const currentUser = ref(null)
 const projects = ref([])
 const projectsLoading = ref(false)
 const projectsError = ref('')
-let worksRefreshTimer = null
+let worksRequestSequence = 0
+const coverRetryKeys = new Set()
 const PROJECT_ID_KEY = 'viral-lab-current-project-id'
 const HISTORY_VIDEO_EXPIRED_MESSAGE = '历史视频地址已失效，请重新生成'
 let demoStateRestored = false
@@ -274,39 +275,37 @@ async function handleAuthSubmit(mode, credentials) {
 
 async function handleLogout() {
   await signOut().catch((error) => console.warn('退出登录失败：', error))
-  clearDemoState()
+  clearDemoState({ preserveLayout: true })
   currentUser.value = null
   projects.value = []
   activeView.value = 'demo'
 }
 
 async function loadWorks({ silent = false } = {}) {
+  const requestSequence = ++worksRequestSequence
   activeView.value = 'works'
   if (!silent) projectsLoading.value = true
   projectsError.value = ''
   try {
-    projects.value = (await getProjects()).projects || []
+    const nextProjects = (await getProjects()).projects || []
+    if (requestSequence === worksRequestSequence) projects.value = nextProjects
   } catch (error) {
-    projectsError.value = `作品加载失败：${error.message}`
+    if (requestSequence === worksRequestSequence) projectsError.value = `作品加载失败：${error.message}`
   } finally {
-    if (!silent) projectsLoading.value = false
+    if (!silent && requestSequence === worksRequestSequence) projectsLoading.value = false
   }
 }
 
-function startWorksRefresh() {
-  clearInterval(worksRefreshTimer)
-  worksRefreshTimer = setInterval(() => {
-    if (activeView.value === 'works' && currentUser.value) loadWorks({ silent: true })
-  }, 5000)
-}
-
-function stopWorksRefresh() {
-  clearInterval(worksRefreshTimer)
-  worksRefreshTimer = null
+async function handleWorkCoverError(project) {
+  const coverUrl = project?.latest_result_url || project?.original_video_url || ''
+  const retryKey = `${project?.id || ''}:${coverUrl}`
+  if (!project?.id || !coverUrl || coverRetryKeys.has(retryKey)) return
+  coverRetryKeys.add(retryKey)
+  await loadWorks({ silent: true })
 }
 
 async function openHistoricalProject(project) {
-  clearDemoState()
+  clearDemoState({ preserveLayout: true })
   localStorage.setItem(PROJECT_ID_KEY, project.id)
   activeView.value = 'demo'
   await restoreProjectState()
@@ -420,7 +419,7 @@ async function restoreProjectTasksAndResults() {
 
 async function restoreProjectState() {
   if (typeof localStorage === 'undefined') return
-  ;['viral-lab-demo-state:v1', 'viral-lab-test-bench-state:v1', 'viral-lab-node-layout:v1']
+  ;['viral-lab-demo-state:v1', 'viral-lab-test-bench-state:v1']
     .forEach((key) => localStorage.removeItem(key))
   const savedProjectId = localStorage.getItem(PROJECT_ID_KEY) || ''
   if (!savedProjectId) return
@@ -433,6 +432,7 @@ async function restoreProjectState() {
       || assets.find((asset) => asset.asset_type === 'original_video')
     if (!original?.public_url) throw new Error('Project 缺少有效原视频')
     projectId.value = project.id
+    canvas.setStorageKey(`viral-lab-node-layout:${project.id}`)
     Object.assign(uploadedVideo, {
       name: original.original_filename || project.name,
       assetId: original.id,
@@ -481,12 +481,15 @@ async function restoreProjectState() {
     showNotice('历史项目无法恢复，已进入新项目')
   } finally {
     isRestoringProject.value = false
+    refreshCanvasConnectors(0, { force: true })
   }
 }
 
-function clearDemoState() {
+function clearDemoState(options = {}) {
+  const preserveLayout = options?.preserveLayout === true
   suppressDemoPersist = true
-  canvas.clearSavedOffsets()
+  canvas.clearSavedOffsets({ removePersisted: !preserveLayout })
+  canvas.setStorageKey('')
   if (typeof localStorage !== 'undefined') {
     localStorage.removeItem(PROJECT_ID_KEY)
   }
@@ -680,7 +683,8 @@ const currentEdges = computed(() => {
   return []
 })
 
-async function refreshCanvasConnectors(delay = 80) {
+async function refreshCanvasConnectors(delay = 80, { force = false } = {}) {
+  if (isRestoringProject.value && !force) return
   await nextTick()
   requestAnimationFrame(() => {
     registerCanvasNodes()
@@ -698,11 +702,13 @@ async function refreshCanvasConnectors(delay = 80) {
 // 监听连线变化（只在 edge id 列表变化时更新）
 watch(currentEdges, (newEdges) => {
   canvas.setEdges(newEdges)
+  if (isRestoringProject.value) return
   canvas.queueUpdate(50)
 })
 
 // 监听 flowMode 变化，等 DOM 渲染后重新注册节点和更新连线
 watch(flowMode, async () => {
+  if (isRestoringProject.value) return
   refreshCanvasConnectors(80)
 })
 
@@ -726,6 +732,7 @@ const generatingVersion = computed(() => {
 let displayVersionsTimer = null
 let priceRequestSequence = 0
 watch(displayVersions, async () => {
+  if (isRestoringProject.value) return
   if (displayVersionsTimer) clearTimeout(displayVersionsTimer)
   displayVersionsTimer = setTimeout(async () => {
     displayVersionsTimer = null
@@ -776,11 +783,6 @@ watch(
   () => { if (currentUser.value) refreshEstimatedPrice() }
 )
 
-watch(activeView, (view) => {
-  if (view === 'works') startWorksRefresh()
-  else stopWorksRefresh()
-})
-
 onMounted(async () => {
   await initializeAuth()
   if (currentUser.value) {
@@ -794,12 +796,10 @@ onMounted(async () => {
       localStorage.removeItem(PROJECT_ID_KEY)
     }
   })
-  refreshCanvasConnectors(120)
+  if (!demoStateRestored) refreshCanvasConnectors(120)
   verifyRestoredDemoVideoUrls()
   if (flowMode.value === 'idle') focusFlowNode('uploadNode')
 })
-
-onBeforeUnmount(stopWorksRefresh)
 
 // ── 工具函数（从 react-old 1:1 迁移）──
 function formatFileSize(bytes = 0) {
@@ -1142,6 +1142,7 @@ async function handleUploaded(file) {
   try {
     const persisted = await persistOriginalVideo(file, projectId.value)
     projectId.value = persisted.project.id
+    canvas.setStorageKey(`viral-lab-node-layout:${projectId.value}`)
     if (typeof localStorage !== 'undefined') localStorage.setItem(PROJECT_ID_KEY, projectId.value)
     uploadedVideo.assetId = persisted.asset.id
     uploadedVideo.assetUrl = toBackendUrl(persisted.asset.public_url)
@@ -1898,6 +1899,7 @@ function retry() {
     :error="projectsError"
     @open="openHistoricalProject"
     @delete="removeHistoricalProject"
+    @cover-error="handleWorkCoverError"
     @back="activeView = 'demo'"
   />
   <div v-else class="app-shell">
@@ -1919,7 +1921,7 @@ function retry() {
 
     <ViralLabTestBench v-if="activeView === 'testBench'" />
 
-    <main v-else class="canvas">
+    <main v-else class="canvas" :class="{ 'is-restoring-project': isRestoringProject }">
       <TopBar
         :project-name="uploadedVideo.name || 'Untitled'"
         :user-email="currentUser?.email || ''"
@@ -2206,14 +2208,14 @@ button {
   min-height: calc(100vh - 228px);
 }
 
-/* customizing：两列 */
+/* customizing：固定列起点；结果节点出现时不移动已有节点 */
 .flow-board.customizing {
   display: grid;
-  grid-template-columns: 310px minmax(620px, 700px);
+  grid-template-columns: 310px minmax(620px, 700px) auto;
   align-items: start;
   column-gap: 52px;
   row-gap: 0;
-  justify-content: center;
+  justify-content: start;
   padding-top: 34px;
   min-height: calc(100vh - 228px);
 }
@@ -2362,9 +2364,7 @@ button {
 }
 
 /* customizing 模式下如果有结果，扩展网格 */
-.flow-board.customizing:has(.result-column) {
-  grid-template-columns: 310px minmax(620px, 700px) auto;
-}
+.canvas.is-restoring-project .lab-page { visibility: hidden; }
 
 /* 生成错误提示 */
 .generate-error-toast {

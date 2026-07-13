@@ -25,7 +25,12 @@ function createProjectAssetService({ client = getSupabaseClient(), bucket = getS
     if (!asset?.storage_path) return asset;
     const { data, error } = await client.storage.from(bucket).createSignedUrl(asset.storage_path, 3600);
     if (error) throw error;
-    return { ...asset, public_url: data.signedUrl, signed_url: data.signedUrl };
+    return {
+      ...asset,
+      original_filename: normalizeMultipartFilename(asset.original_filename),
+      public_url: data.signedUrl,
+      signed_url: data.signedUrl,
+    };
   }
 
   async function createProject({ name, userId, status = "draft" }) {
@@ -47,7 +52,11 @@ function createProjectAssetService({ client = getSupabaseClient(), bucket = getS
       .select("*").eq("project_id", projectId).eq("status", "active")
       .order("created_at", { ascending: true });
     if (assetsError) throw assetsError;
-    return { ...project, assets: await Promise.all((assets || []).map(signedAsset)) };
+    return {
+      ...project,
+      name: normalizeMultipartFilename(project.name),
+      assets: await Promise.all((assets || []).map(signedAsset)),
+    };
   }
 
   async function uploadAsset({ projectId, userId, file, assetType, replacementType = null }) {
@@ -124,6 +133,7 @@ function createProjectAssetService({ client = getSupabaseClient(), bucket = getS
       }
       return {
         ...project,
+        name: normalizeMultipartFilename(project.name),
         status: ["created", "queued", "analyzing", "generating"].includes(tasks?.[0]?.status)
           ? tasks[0].status
           : results?.length ? "completed" : tasks?.[0]?.status || project.status,

@@ -32,16 +32,49 @@ export function useCanvasNodes(options = {}) {
   const svgSize = reactive({ width: 0, height: 0 })
   // board ref
   let boardEl = null
+  let activeStorageKey = options.storageKey || ''
 
   function loadSavedOffsets() {
-    // 阶段6第一轮仅允许 localStorage 保存 projectId；节点布局不再落盘。
+    if (!activeStorageKey || typeof localStorage === 'undefined') return {}
+    try {
+      const parsed = JSON.parse(localStorage.getItem(activeStorageKey) || '{}')
+      return parsed && typeof parsed === 'object' ? parsed : {}
+    } catch {
+      return {}
+    }
   }
 
   function persistNodeOffset(key) {
-    return key
+    if (!activeStorageKey || typeof localStorage === 'undefined' || !nodeOffsets[key]) return
+    const persisted = loadSavedOffsets()
+    persisted[key] = nodeOffsets[key]
+    localStorage.setItem(activeStorageKey, JSON.stringify(persisted))
   }
 
-  function clearSavedOffsets() {
+  function applyOffsetsToNodes() {
+    Object.entries(nodeEls).forEach(([key, el]) => {
+      const offset = nodeOffsets[key] || { x: 0, y: 0 }
+      if (el) el.style.transform = `translate(${offset.x}px, ${offset.y}px)`
+    })
+  }
+
+  function setStorageKey(storageKey) {
+    activeStorageKey = storageKey || ''
+    Object.keys(nodeOffsets).forEach((key) => delete nodeOffsets[key])
+    const saved = loadSavedOffsets()
+    Object.entries(saved).forEach(([key, offset]) => {
+      const x = Number(offset?.x)
+      const y = Number(offset?.y)
+      if (Number.isFinite(x) && Number.isFinite(y)) nodeOffsets[key] = { x, y }
+    })
+    applyOffsetsToNodes()
+    updateConnectorsSync()
+  }
+
+  function clearSavedOffsets({ removePersisted = true } = {}) {
+    if (removePersisted && activeStorageKey && typeof localStorage !== 'undefined') {
+      localStorage.removeItem(activeStorageKey)
+    }
     Object.keys(nodeOffsets).forEach((key) => {
       nodeOffsets[key] = { x: 0, y: 0 }
       const el = nodeEls[key]
@@ -49,8 +82,6 @@ export function useCanvasNodes(options = {}) {
     })
     updateConnectorsSync()
   }
-
-  loadSavedOffsets()
 
   // ── 注册节点 ──
   function registerNode(key, el) {
@@ -367,6 +398,7 @@ paths.value = validEdges
     updateConnectorsSync,
     queueUpdate,
     refreshObservers,
+    setStorageKey,
     clearSavedOffsets,
   }
 }

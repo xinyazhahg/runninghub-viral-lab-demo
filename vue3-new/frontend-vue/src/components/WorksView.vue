@@ -2,7 +2,7 @@
 import { ref } from 'vue'
 
 defineProps({ projects: { type: Array, default: () => [] }, loading: Boolean, error: String })
-defineEmits(['open', 'delete', 'back'])
+const emit = defineEmits(['open', 'delete', 'back', 'cover-error'])
 
 const failedCovers = ref(new Set())
 
@@ -26,6 +26,7 @@ function coverFailed(project) {
 
 function markCoverFailed(project) {
   failedCovers.value = new Set([...failedCovers.value, coverUrl(project)])
+  emit('cover-error', project)
 }
 </script>
 
@@ -79,7 +80,7 @@ header { display: flex; align-items: end; justify-content: space-between; margin
 header p { margin: 0 0 8px; color: #35f59a; font-size: 11px; font-weight: 800; letter-spacing: .22em; }
 h1 { margin: 0; font-size: 34px; }
 button { border: 1px solid #343b37; border-radius: 9px; background: #1a1e1c; color: #dce3df; padding: 10px 14px; }
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); align-items: start; gap: 20px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); align-items: start; gap: 20px; }
 .card { display: grid; grid-template-rows: 180px auto auto; min-width: 0; min-height: 360px; overflow: visible; border: 1px solid #272d2a; border-radius: 16px; background: #141716; }
 .preview { position: relative; min-width: 0; height: 180px; overflow: hidden; display: grid; place-items: center; border-radius: 15px 15px 0 0; background: #090b0a; color: #6f7773; }
 .preview video, .preview img { display: block; width: 100%; height: 100%; min-width: 0; min-height: 0; object-fit: cover; }
@@ -93,11 +94,17 @@ button { border: 1px solid #343b37; border-radius: 9px; background: #1a1e1c; col
 .body dl div { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 8px; font-size: 12px; }
 .body dt { color: #69726d; }
 .body dd { min-width: 0; margin: 0; color: #9aa39e; overflow-wrap: anywhere; }
-.actions { display: flex; align-self: end; flex-wrap: wrap; gap: 10px; padding: 0 18px 18px; }
-.actions button { flex: 0 0 auto; }
-.actions .open { flex: 1 1 110px; border-color: #35f59a; background: #35f59a; color: #07110c; font-weight: 800; }
+.actions { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(64px, .7fr); align-self: end; gap: 8px; padding: 0 18px 18px; }
+.actions button { width: 100%; min-width: 0; height: 38px; padding: 0 8px; white-space: nowrap; }
+.actions .open { border-color: #35f59a; background: #35f59a; color: #07110c; font-weight: 800; }
 .delete { color: #ff8585; }
 .state { min-height: 360px; display: grid; place-content: center; gap: 10px; text-align: center; color: #8e9792; }
 .state strong { color: #fff; font-size: 20px; }
 .state.error { color: #ff8585; }
+@media (max-width: 520px) {
+  .works-page { padding-inline: 16px; }
+  .grid { grid-template-columns: minmax(0, 1fr); }
+  .actions { grid-template-columns: 1fr 1fr; }
+  .actions .open { grid-column: 1 / -1; }
+}
 </style>
