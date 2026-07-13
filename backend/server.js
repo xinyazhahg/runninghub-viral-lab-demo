@@ -155,7 +155,7 @@ function publicVideoToTextTask(task) {
     startedAt: task.startedAt,
     elapsed: videoToTextTaskElapsed(task),
   };
-  if (task.status === "success") return { ...base, result: task.result };
+  if (task.status === "success") return { ...base, result: task.result, rawResult: task.rawResult };
   if (task.status === "failed") return { ...base, error: task.error };
   return base;
 }
@@ -602,6 +602,107 @@ function parseBreakdownJson(value) {
   try { return JSON.parse(text.slice(start, end + 1)); } catch { return null; }
 }
 
+function breakdownList(value) {
+  if (Array.isArray(value)) return value.map(String).map((item) => item.trim()).filter(Boolean);
+  if (typeof value === "string" && value.trim()) {
+    return value.split(/[、,，/]/).map((item) => item.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function normalizeBreakdownTerm(value) {
+  return String(value || "").toLowerCase().replace(/[\s的、一只一个个]/g, "");
+}
+
+function mergeSimilarTerms(values, limit = Infinity) {
+  const result = [];
+  for (const value of values) {
+    const normalized = normalizeBreakdownTerm(value);
+    if (!normalized) continue;
+    const duplicate = result.some((existing) => {
+      const other = normalizeBreakdownTerm(existing);
+      return normalized === other || normalized.includes(other) || other.includes(normalized);
+    });
+    if (!duplicate) result.push(value);
+    if (result.length >= limit) break;
+  }
+  return result;
+}
+
+function canonicalSubject(value) {
+  const text = String(value || "").trim();
+  if (/(狗|犬)/.test(text)) return "小狗";
+  if (/(猫|猫咪)/.test(text)) return "小猫";
+  if (/^(人物|人类|一个人|一名男子|一名女子)$/.test(text)) return "人物";
+  return text;
+}
+
+const CONCRETE_OBJECT_WORDS = [
+  "沙发", "桌子", "茶几", "椅子", "床", "柜子", "电视", "路灯", "车辆", "汽车", "自行车",
+  "手机", "杯子", "瓶子", "背包", "玩具", "牵引绳", "狗绳", "胸背带", "食物", "商品", "道具",
+];
+const ENVIRONMENT_WORDS = [
+  "客厅", "卧室", "厨房", "餐厅", "房间", "室内", "户外", "森林", "街道", "公园", "广场",
+  "商场", "办公室", "教室", "海边", "山林", "草原", "庭院", "小路", "道路", "城市", "乡村",
+];
+const MEANINGLESS_ELEMENT_WORDS = [
+  "画面", "镜头", "场景", "背景", "主体", "人物", "动作", "节奏", "光影", "阴影", "天空", "地面",
+  "墙面", "道路", "小路", "草地", "路面", "石砖地", "铺设路面",
+];
+const LOW_VALUE_SCENES = new Set(["背景", "画面", "场景", "环境", "未识别", "未知", "暂无"]);
+
+function containsAnyTerm(value, words) {
+  const text = String(value || "");
+  return words.some((word) => text.includes(word));
+}
+
+function canonicalElement(value) {
+  const text = String(value || "").trim();
+  const matched = CONCRETE_OBJECT_WORDS.find((word) => text.includes(word));
+  return matched || text;
+}
+
+function canonicalScene(value) {
+  const text = String(value || "").trim();
+  if (/(小路|小径|道路|路面|石板路|石砖路|石砖地|步道)/.test(text)) return "户外小路";
+  return text;
+}
+
+function cleanBreakdownForResponse(value) {
+  const data = parseBreakdownJson(value);
+  if (!data) return value;
+  const overview = data.overview || {};
+  const subjects = mergeSimilarTerms(
+    breakdownList(overview.replaceableSubjects).map(canonicalSubject)
+  );
+  const rawScenes = breakdownList(overview.replaceableScenes).map(canonicalScene);
+  const movedObjects = rawScenes.filter((item) => containsAnyTerm(item, CONCRETE_OBJECT_WORDS));
+  const scenes = mergeSimilarTerms(rawScenes.filter((item) =>
+    !containsAnyTerm(item, CONCRETE_OBJECT_WORDS) && !LOW_VALUE_SCENES.has(item)
+  ));
+  const subjectTerms = subjects.map(normalizeBreakdownTerm);
+  const elements = mergeSimilarTerms([
+    ...breakdownList(overview.replaceableElements),
+    ...movedObjects,
+  ].map(canonicalElement).filter((item) => {
+    if (containsAnyTerm(item, MEANINGLESS_ELEMENT_WORDS)) return false;
+    const normalized = normalizeBreakdownTerm(canonicalSubject(item));
+    return !subjectTerms.some((subject) =>
+      normalized === subject || normalized.includes(subject) || subject.includes(normalized)
+    );
+  }), 5);
+
+  return {
+    ...data,
+    overview: {
+      ...overview,
+      replaceableSubjects: subjects,
+      replaceableScenes: scenes,
+      replaceableElements: elements,
+    },
+  };
+}
+
 function parseVideoTime(value) {
   const first = String(value || "").split(/[-–—]/)[0].trim();
   const parts = first.split(":").map(Number);
@@ -788,6 +889,7 @@ app.post("/api/video-to-text", upload.single("video"), (req, res) => {
       finishedAt: null,
       elapsed: 0,
       result: null,
+      rawResult: null,
       error: "",
     };
     videoToTextTasks.set(taskId, task);
@@ -797,9 +899,11 @@ app.post("/api/video-to-text", upload.single("video"), (req, res) => {
 
     runVideoToTextDirect(process.env.RUNNINGHUB_API_KEY, videoPath, prompt)
       .then(async (result) => {
-        let enrichedResult = result;
+        task.rawResult = result;
+        const cleanedResult = cleanBreakdownForResponse(result);
+        let enrichedResult = cleanedResult;
         try {
-          enrichedResult = await generateBreakdownPreviews(result, videoPath, taskId);
+          enrichedResult = await generateBreakdownPreviews(cleanedResult, videoPath, taskId);
         } catch (error) {
           console.warn("video-to-text 预览生成整体失败，继续返回拆解结果：", error.message);
         }

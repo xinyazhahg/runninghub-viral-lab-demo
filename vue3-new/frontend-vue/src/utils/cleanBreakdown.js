@@ -121,7 +121,7 @@ function cleanSubjects(data, context) {
     cleaned = [pet, ...cleaned.filter((item) => !includesAny(item, PET_WORDS))]
   }
 
-  return unique(cleaned).slice(0, 2)
+  return unique(cleaned)
 }
 
 function cleanScenes(data) {
@@ -129,7 +129,8 @@ function cleanScenes(data) {
   const shotScenes = (Array.isArray(data?.shots) ? data.shots : [])
     .map((shot) => String(shot?.scene || '').trim())
     .filter((item) => item && !/^(未识别|暂无)$/.test(item))
-  const normalized = [...overviewScenes, ...shotScenes].map((scene) => {
+  const lowValueScenes = new Set(['背景', '画面', '场景', '环境', '未识别', '未知', '暂无'])
+  const normalized = [...overviewScenes, ...shotScenes].filter((scene) => !lowValueScenes.has(scene)).map((scene) => {
     if (includesAny(scene, PATH_SCENE_WORDS)) return '户外小路'
     return scene
   })
@@ -139,9 +140,8 @@ function cleanScenes(data) {
     return ['户外小路', ...scenes.filter((scene) =>
       scene !== '户外小路' && !redundantPathContext.includes(scene)
     )]
-      .slice(0, 2)
   }
-  return scenes.slice(0, 2)
+  return scenes
 }
 
 function cleanElements(data, subjects, scenes) {

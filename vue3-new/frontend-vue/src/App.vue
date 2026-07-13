@@ -842,8 +842,8 @@ function getEmptyBreakdownData(message = '暂无视频拆解结果') {
 function buildCustomItems(data) {
   const overview = data?.overview || {}
 
-  const subjects = normalizeList(overview.replaceableSubjects, { filterRelationWords: true }).slice(0, 2)
-  const scenes = normalizeList(overview.replaceableScenes).slice(0, 3)
+  const subjects = normalizeList(overview.replaceableSubjects, { filterRelationWords: true })
+  const scenes = normalizeList(overview.replaceableScenes)
 
   const elements = normalizeList(overview.replaceableElements)
     .filter((item) => !isInvalidElementLabel(item))
