@@ -23,13 +23,15 @@ test("createTask persists the project, type, input, and start time", async () =>
     userId: "user-1",
     taskType: "generate_video",
     status: "created",
-    inputData: { prompt: "test" },
+    inputData: { prompt: "test", generation_config: { duration: 4, aspect_ratio: "9:16" } },
   });
   assert.equal(task.id, "task-1");
   assert.equal(inserted.project_id, "project-1");
   assert.equal(inserted.user_id, "user-1");
   assert.equal(inserted.task_type, "generate_video");
-  assert.deepEqual(inserted.input_data, { prompt: "test" });
+  assert.deepEqual(inserted.input_data, {
+    prompt: "test", generation_config: { duration: 4, aspect_ratio: "9:16" },
+  });
   assert.match(inserted.started_at, /^\d{4}-\d{2}-\d{2}T/);
 });
 
@@ -77,15 +79,16 @@ test("createResult delegates atomic version allocation to the database RPC", asy
     videoUrl: "https://cdn.example/v3.mp4",
     prompt: "prompt",
     modelName: "model",
-    modelParams: { duration: 10 },
-    duration: 10,
+    modelParams: { duration: 4, aspect_ratio: "9:16" },
+    duration: 4,
     cost: "1.2",
   });
   assert.equal(rpcName, "create_project_result");
   assert.equal(rpcPayload.p_project_id, "project-1");
   assert.equal(rpcPayload.p_user_id, "user-1");
   assert.equal(rpcPayload.p_task_id, "task-3");
-  assert.deepEqual(rpcPayload.p_model_params, { duration: 10 });
+  assert.deepEqual(rpcPayload.p_model_params, { duration: 4, aspect_ratio: "9:16" });
+  assert.equal(rpcPayload.p_duration, 4);
   assert.equal(result.version, 3);
 });
 

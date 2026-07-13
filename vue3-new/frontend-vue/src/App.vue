@@ -168,8 +168,44 @@ function mapReplacementTypeToGroup(type) {
   return { subject: '主体', scene: '场景', element: '元素' }[type] || ''
 }
 
+function readPersistedGenerationConfig(source) {
+  const raw = source?.inputData?.generation_config
+    || source?.input_data?.generation_config
+    || source?.inputData?.config
+    || source?.input_data?.config
+    || source?.model_params
+    || source?.config
+    || null
+  if (!raw || typeof raw !== 'object') return null
+  const durationNumber = Number(raw.duration)
+  const timeStart = Number(raw.clip_start ?? raw.clipStart)
+  const timeEnd = Number(raw.clip_end ?? raw.clipEnd)
+  return {
+    ratio: raw.aspect_ratio || raw.ratio || resultParams.ratio,
+    quality: raw.resolution || resultParams.quality,
+    duration: Number.isFinite(durationNumber) && durationNumber > 0
+      ? `${durationNumber}s`
+      : resultParams.duration,
+    modelId: raw.model_id || raw.model || resultParams.modelId,
+    model: raw.model_name || raw.modelLabel || resultParams.model,
+    timeStart: Number.isFinite(timeStart) ? timeStart : resultParams.timeStart,
+    timeEnd: Number.isFinite(timeEnd) ? timeEnd : resultParams.timeEnd,
+  }
+}
+
+function applyPersistedGenerationConfig(source, { active = false } = {}) {
+  const restored = readPersistedGenerationConfig(source)
+  if (!restored) return null
+  Object.assign(resultParams, restored)
+  if (active) activeGenerationParams.value = { ...restored }
+  return restored
+}
+
 function hydratePersistedResults(results) {
-  versions.value = (Array.isArray(results) ? results : []).map((result) => ({
+  const persistedResults = Array.isArray(results) ? results : []
+  versions.value = persistedResults.map((result) => {
+    const restored = readPersistedGenerationConfig(result) || {}
+    return {
     id: `V${result.version}`,
     taskId: result.task_id,
     resultId: result.id,
@@ -177,18 +213,21 @@ function hydratePersistedResults(results) {
     videoUrl: toBackendUrl(result.video_url),
     prompt: result.prompt || '',
     summary: [],
-    params: result.model_params || {},
-    ratio: result.model_params?.ratio || '9:16',
-    quality: result.model_params?.resolution || '720p',
-    duration: result.duration ? `${Number(result.duration)}s` : '',
-    model: result.model_name || '',
+    params: { ...restored },
+    ratio: restored.ratio || '9:16',
+    quality: restored.quality || '720p',
+    duration: restored.duration || (result.duration ? `${Number(result.duration)}s` : ''),
+    model: restored.model || result.model_name || '',
+    modelId: restored.modelId || '',
     cost: result.cost || '',
     status: '已生成',
     createdAt: result.created_at,
     time: result.created_at ? new Date(result.created_at).toLocaleString('zh-CN', { hour12: false }) : '',
     saved: false,
-  }))
+    }
+  })
   currentVersionId.value = versions.value[versions.value.length - 1]?.id || ''
+  if (persistedResults.length) applyPersistedGenerationConfig(persistedResults[persistedResults.length - 1])
 }
 
 async function initializeAuth() {
@@ -273,9 +312,11 @@ async function removeHistoricalProject(project) {
 }
 
 async function pollRestoredTask(task) {
+  if (task.task_type === 'generate_video') applyPersistedGenerationConfig(task, { active: true })
   const deadline = Date.now() + 20 * 60 * 1000
   while (Date.now() < deadline) {
     const data = await getTask(task.id)
+    if (data.taskType === 'generate_video') applyPersistedGenerationConfig(data, { active: true })
     if (data.status === 'success') {
       if (data.taskType === 'generate_video') {
         const resultsData = await getProjectResults(projectId.value)
@@ -332,12 +373,18 @@ async function restoreProjectTasksAndResults() {
     task.task_type === 'generate_video' && ['failed', 'timeout'].includes(task.status)
   )
   if (failedGeneration) {
+    applyPersistedGenerationConfig(failedGeneration)
     lastFailedTaskId.value = failedGeneration.id
     generateError.value = failedGeneration.error_message || '上一次生成失败，可重新生成。'
   }
   const incomplete = tasks.filter((task) => ['created', 'queued', 'analyzing', 'generating'].includes(task.status))
-  incomplete.forEach((task) => {
+  const activeGenerationTask = incomplete.find((task) => task.task_type === 'generate_video')
+  const recoverableTasks = incomplete.filter((task) =>
+    task.task_type !== 'generate_video' || task.id === activeGenerationTask?.id
+  )
+  recoverableTasks.forEach((task) => {
     if (task.task_type === 'generate_video') {
+      applyPersistedGenerationConfig(task, { active: true })
       isGenerating.value = true
       generationTaskId.value = task.id
       generationStatus.value = task.status
@@ -350,6 +397,7 @@ async function restoreProjectTasksAndResults() {
     pollRestoredTask(task).finally(() => {
       if (task.task_type === 'generate_video') {
         isGenerating.value = false
+        activeGenerationParams.value = null
         pendingVersionId.value = ''
       }
     })

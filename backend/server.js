@@ -10,6 +10,7 @@ const crypto = require("crypto");
 const { createProjectAssetService } = require("./services/projectAssetService");
 const { createTaskResultService } = require("./services/taskResultService");
 const { createRequireAuth } = require("./services/authService");
+const { buildPersistedGenerationConfig } = require("./lib/generationConfig");
 const FFMPEG_PATH = process.env.FFMPEG_PATH || require("ffmpeg-static");
 const FFPROBE_PATH = process.env.FFPROBE_PATH || require("ffprobe-static").path;
 for (const binaryPath of [FFMPEG_PATH, FFPROBE_PATH]) {
@@ -378,6 +379,9 @@ function publicPersistedTask(task, result) {
     stage: task.stage,
     startedAt,
     elapsed: Math.max(0, Math.floor((finishedAt - startedAt) / 1000)),
+    inputData: task.input_data || {},
+    config: task.input_data?.generation_config || task.input_data?.config || result?.model_params || {},
+    modelParams: result?.model_params || null,
   };
   if (task.status === "success") {
     const videoToTextResult = task.task_type === "video_to_text" ? task.output_data?.result : task.output_data;
@@ -388,7 +392,7 @@ function publicPersistedTask(task, result) {
       videoUrl: result?.video_url || task.output_data?.videoUrl || "",
       finalPrompt: result?.prompt || task.output_data?.finalPrompt || "",
       cost: result?.cost || task.output_data?.cost || "",
-      config: result?.model_params || task.output_data?.config || {},
+      config: result?.model_params || task.input_data?.generation_config || task.output_data?.config || {},
       version: result?.version || null,
     };
   }
@@ -1307,6 +1311,12 @@ app.post("/api/generate-video", upload.single("image"), async (req, res) => {
   if (!fs.existsSync(imagePath)) {
     return sendApiError(res, 500, `上传图片文件不存在：${imagePath}`);
   }
+  const clipStart = Math.max(0, Number(req.body.clipStart) || 0);
+  const requestedClipEnd = Number(req.body.clipEnd);
+  const clipEnd = Number.isFinite(requestedClipEnd) && requestedClipEnd > clipStart
+    ? requestedClipEnd
+    : clipStart + Number(config.duration);
+  const persistedGenerationConfig = buildPersistedGenerationConfig(config, { clipStart, clipEnd });
 
   const persistedTask = await taskResultService().createTask({
     projectId,
@@ -1322,9 +1332,10 @@ app.post("/api/generate-video", upload.single("image"), async (req, res) => {
       sourceVideoTaskId: String(req.body.sourceVideoTaskId || "").trim(),
       sourceVideoUrl: project.assets?.find((asset) => asset.id === project.original_asset_id)?.public_url || "",
       sourceVideoStoragePath: project.assets?.find((asset) => asset.id === project.original_asset_id)?.storage_path || "",
-      config: { model: config.model.id, modelLabel: config.model.label, ratio: config.ratio, resolution: config.resolution, duration: config.duration },
-      clipStart: Number(req.body.clipStart) || 0,
-      clipEnd: Number(req.body.clipEnd) || null,
+      generation_config: persistedGenerationConfig,
+      config: persistedGenerationConfig,
+      clipStart,
+      clipEnd,
     },
   });
   const taskId = persistedTask.id;
@@ -1343,11 +1354,6 @@ app.post("/api/generate-video", upload.single("image"), async (req, res) => {
       console.warn("持久化原视频下载失败，将生成无音频版本：", error.message);
     }
   }
-  const clipStart = Math.max(0, Number(req.body.clipStart) || 0);
-  const requestedClipEnd = Number(req.body.clipEnd);
-  const clipEnd = Number.isFinite(requestedClipEnd) && requestedClipEnd > clipStart
-    ? requestedClipEnd
-    : clipStart + Number(config.duration);
   const args = [
   "scripts/runninghub.js",
   "--endpoint",
@@ -1387,13 +1393,7 @@ app.post("/api/generate-video", upload.single("image"), async (req, res) => {
     clipStart,
     clipEnd,
     generatedDuration: Number(config.duration),
-    config: {
-      model: config.model.id,
-      modelLabel: config.model.label,
-      ratio: config.ratio,
-      resolution: config.resolution,
-      duration: config.duration,
-    },
+    config: persistedGenerationConfig,
   };
   generationTasks.set(taskId, task);
 
@@ -1452,8 +1452,8 @@ app.post("/api/generate-video", upload.single("image"), async (req, res) => {
       try {
         persistedResult = await taskResultService().createResult({
           projectId, userId: req.user.id, taskId, videoUrl: resultAsset.storage_path, prompt,
-          modelName: config.model.label, modelParams: task.config,
-          duration: Number(config.duration), cost: parsed.cost,
+          modelName: persistedGenerationConfig.model_name, modelParams: persistedGenerationConfig,
+          duration: persistedGenerationConfig.duration, cost: parsed.cost,
         });
       } catch (error) {
         await projectAssetService().deleteAsset(projectId, resultAsset.id, req.user.id).catch(() => {});
