@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, computed, watch, nextTick, onMounted } from 'vue'
+import { ref, reactive, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import LeftToolbar from './components/LeftToolbar.vue'
 import TopBar from './components/TopBar.vue'
 import LabHead from './components/LabHead.vue'
@@ -31,6 +31,7 @@ const currentUser = ref(null)
 const projects = ref([])
 const projectsLoading = ref(false)
 const projectsError = ref('')
+let worksRefreshTimer = null
 const PROJECT_ID_KEY = 'viral-lab-current-project-id'
 const HISTORY_VIDEO_EXPIRED_MESSAGE = '历史视频地址已失效，请重新生成'
 let demoStateRestored = false
@@ -279,17 +280,29 @@ async function handleLogout() {
   activeView.value = 'demo'
 }
 
-async function loadWorks() {
+async function loadWorks({ silent = false } = {}) {
   activeView.value = 'works'
-  projectsLoading.value = true
+  if (!silent) projectsLoading.value = true
   projectsError.value = ''
   try {
     projects.value = (await getProjects()).projects || []
   } catch (error) {
     projectsError.value = `作品加载失败：${error.message}`
   } finally {
-    projectsLoading.value = false
+    if (!silent) projectsLoading.value = false
   }
+}
+
+function startWorksRefresh() {
+  clearInterval(worksRefreshTimer)
+  worksRefreshTimer = setInterval(() => {
+    if (activeView.value === 'works' && currentUser.value) loadWorks({ silent: true })
+  }, 5000)
+}
+
+function stopWorksRefresh() {
+  clearInterval(worksRefreshTimer)
+  worksRefreshTimer = null
 }
 
 async function openHistoricalProject(project) {
@@ -321,6 +334,7 @@ async function pollRestoredTask(task) {
       if (data.taskType === 'generate_video') {
         const resultsData = await getProjectResults(projectId.value)
         hydratePersistedResults(resultsData.results)
+        if (activeView.value === 'works') await loadWorks({ silent: true })
         generationStatus.value = 'success'
         generateError.value = ''
       } else {
@@ -762,6 +776,11 @@ watch(
   () => { if (currentUser.value) refreshEstimatedPrice() }
 )
 
+watch(activeView, (view) => {
+  if (view === 'works') startWorksRefresh()
+  else stopWorksRefresh()
+})
+
 onMounted(async () => {
   await initializeAuth()
   if (currentUser.value) {
@@ -779,6 +798,8 @@ onMounted(async () => {
   verifyRestoredDemoVideoUrls()
   if (flowMode.value === 'idle') focusFlowNode('uploadNode')
 })
+
+onBeforeUnmount(stopWorksRefresh)
 
 // ── 工具函数（从 react-old 1:1 迁移）──
 function formatFileSize(bytes = 0) {
@@ -1700,6 +1721,7 @@ async function executeGenerate() {
     versions.value = versions.value.filter((item) => item.id !== version.id)
     versions.value.push(version)
     currentVersionId.value = version.id
+    if (activeView.value === 'works') await loadWorks({ silent: true })
     focusFlowNode(`result-${version.id}`)
     console.log(`✅ ${nextVersionId} 已生成`)
   } catch (error) {

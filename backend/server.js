@@ -1456,8 +1456,11 @@ app.post("/api/generate-video", upload.single("image"), async (req, res) => {
           duration: persistedGenerationConfig.duration, cost: parsed.cost,
         });
       } catch (error) {
+        console.error("[generate-video] Result 创建失败：", {
+          taskId, projectId, userId: req.user.id, message: error.message, code: error.code || "RESULT_CREATE_FAILED",
+        });
         await projectAssetService().deleteAsset(projectId, resultAsset.id, req.user.id).catch(() => {});
-        throw error;
+        throw new Error(`Result 创建失败：${error.message}`);
       }
       await taskResultService().updateTask(taskId, {
         status: "success",
@@ -1869,8 +1872,12 @@ async function recoverGenerationTask(task) {
       modelParams: config, duration: Number(config.duration) || null, cost: parsed.cost,
     });
   } catch (error) {
+    console.error("[generate-video recovery] Result 创建失败：", {
+      taskId: task.id, projectId: task.project_id, userId: task.user_id,
+      message: error.message, code: error.code || "RESULT_CREATE_FAILED",
+    });
     await projectAssetService().deleteAsset(task.project_id, resultAsset.id, task.user_id).catch(() => {});
-    throw error;
+    throw new Error(`Result 创建失败：${error.message}`);
   }
   await taskResultService().updateTask(task.id, {
     status: "success", stage: "completed",

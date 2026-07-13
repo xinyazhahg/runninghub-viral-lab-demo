@@ -100,11 +100,12 @@ function createProjectAssetService({ client = getSupabaseClient(), bucket = getS
     return Promise.all((projects || []).map(async (project) => {
       const [
         { data: assets, error: assetError },
-        { data: results, error: resultError },
+        { data: results, error: resultError, count: resultCount },
         { data: tasks, error: taskError },
       ] = await Promise.all([
         client.from("assets").select("*").eq("project_id", project.id).eq("status", "active").order("created_at", { ascending: true }),
-        client.from("results").select("*").eq("project_id", project.id).order("version", { ascending: false }),
+        client.from("results").select("*", { count: "exact" }).eq("project_id", project.id)
+          .order("version", { ascending: false }).limit(1),
         client.from("tasks").select("status,stage").eq("project_id", project.id).order("created_at", { ascending: false }).limit(1),
       ]);
       if (assetError) throw assetError;
@@ -125,7 +126,7 @@ function createProjectAssetService({ client = getSupabaseClient(), bucket = getS
           : results?.length ? "completed" : tasks?.[0]?.status || project.status,
         original_video_url: original?.signed_url || "",
         latest_result_url: latestVideoUrl,
-        version_count: results?.length || 0,
+        version_count: Number(resultCount || 0),
       };
     }));
   }
