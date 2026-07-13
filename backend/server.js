@@ -1460,7 +1460,9 @@ app.post("/api/generate-video", upload.single("image"), async (req, res) => {
           taskId, projectId, userId: req.user.id, message: error.message, code: error.code || "RESULT_CREATE_FAILED",
         });
         await projectAssetService().deleteAsset(projectId, resultAsset.id, req.user.id).catch(() => {});
-        throw new Error(`Result 创建失败：${error.message}`);
+        const resultError = new Error(`Result 创建失败：${error.message}`);
+        resultError.code = "RESULT_CREATE_FAILED";
+        throw resultError;
       }
       await taskResultService().updateTask(taskId, {
         status: "success",
@@ -1488,7 +1490,7 @@ app.post("/api/generate-video", upload.single("image"), async (req, res) => {
       await taskResultService().updateTask(taskId, {
         status: timedOut ? "timeout" : "failed",
         stage: "failed",
-        error_code: timedOut ? "TASK_TIMEOUT" : "RUNNINGHUB_ERROR",
+        error_code: timedOut ? "TASK_TIMEOUT" : err.code || "RUNNINGHUB_ERROR",
         error_message: task.error,
       }).catch((persistError) => console.error("generate-video 失败状态持久化失败：", persistError));
       console.error("generate-video 后台任务失败：", taskId, err);
@@ -1877,7 +1879,9 @@ async function recoverGenerationTask(task) {
       message: error.message, code: error.code || "RESULT_CREATE_FAILED",
     });
     await projectAssetService().deleteAsset(task.project_id, resultAsset.id, task.user_id).catch(() => {});
-    throw new Error(`Result 创建失败：${error.message}`);
+    const resultError = new Error(`Result 创建失败：${error.message}`);
+    resultError.code = "RESULT_CREATE_FAILED";
+    throw resultError;
   }
   await taskResultService().updateTask(task.id, {
     status: "success", stage: "completed",
@@ -1907,7 +1911,7 @@ async function recoverIncompleteTasks() {
       const timedOut = /超时|timeout/i.test(error.message || "");
       await taskResultService().updateTask(task.id, {
         status: timedOut ? "timeout" : "failed", stage: "restart_recovery_failed",
-        error_code: timedOut ? "TASK_TIMEOUT" : "RECOVERY_FAILED",
+        error_code: timedOut ? "TASK_TIMEOUT" : error.code || "RECOVERY_FAILED",
         error_message: getErrorMessage(error, "任务恢复失败"),
       }).catch(() => {});
     });
