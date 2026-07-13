@@ -5,7 +5,7 @@ const props = defineProps({
   video: {
     type: Object,
     default: () => ({
-      name: '', coverUrl: '', duration: '', ratio: '', size: '',
+      name: '', coverUrl: '', assetUrl: '', duration: '', ratio: '', size: '',
     }),
   },
   status: {
@@ -60,6 +60,7 @@ function onStatusClick() {
     <div v-else class="uploaded-video-node">
       <div class="uploaded-thumb">
         <img v-if="video.coverUrl" :src="video.coverUrl" alt="" />
+        <video v-else-if="video.assetUrl" :src="video.assetUrl" muted playsinline preload="metadata"></video>
         <div class="play-dot">▶</div>
       </div>
       <strong>{{ video.name }}</strong>
@@ -154,7 +155,8 @@ function onStatusClick() {
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
 }
 
-.uploaded-thumb img {
+.uploaded-thumb img,
+.uploaded-thumb video {
   position: absolute;
   inset: 0;
   width: 100%;

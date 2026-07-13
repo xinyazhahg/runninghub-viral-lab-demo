@@ -19,6 +19,19 @@ Express 后端，提供 API 接口和静态资源托管。
 | `/api/extract-element-preview` | POST | SAM3 抠图（开发中） |
 | `/generated/*` | GET | 生成文件访问 |
 | `/uploads/*` | GET | 上传文件访问 |
+| `/api/projects` | POST | 创建持久化 Project |
+| `/api/projects/original-video` | POST | 创建/更新 Project 并持久化原视频 Asset |
+| `/api/projects/:projectId` | GET | 获取 Project 和 Asset 列表 |
+| `/api/projects/:projectId/assets/replacement` | POST | 上传替换图片 Asset |
+| `/api/projects/:projectId/assets/:assetId` | DELETE | 删除替换素材 Asset |
+
+## Project + Asset 持久化
+
+1. 在 Supabase SQL Editor 执行 `supabase/migrations/001_project_asset.sql`。
+2. 在后端环境配置 `SUPABASE_URL`、`SUPABASE_SERVICE_ROLE_KEY`、`SUPABASE_STORAGE_BUCKET`。
+3. Service Role Key 仅允许出现在后端，不能放入任何 `VITE_` 环境变量。
+
+默认 Bucket 名为 `viral-lab-assets`，migration 会创建公开 Bucket。数据库表启用 RLS，第一轮仅由后端 Service Role 访问。
 
 ## 启动方式
 

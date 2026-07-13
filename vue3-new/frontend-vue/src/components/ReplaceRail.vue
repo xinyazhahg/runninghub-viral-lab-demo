@@ -1,5 +1,6 @@
 <script setup>
 import { ref, computed } from 'vue'
+import { deleteProjectAsset, persistReplacementImage, toBackendUrl } from '../api.js'
 const reviseMuted = ref(false)
 let reviseMutedTimer = null
 function scheduleReviseMute() {
@@ -46,6 +47,7 @@ function isEmptyCopyGroup(group) {
 }
 
 const props = defineProps({
+  projectId: { type: String, default: '' },
   items: {
     type: Array,
     default: () => [],
@@ -171,6 +173,8 @@ const currentAssetChoices = computed(() => {
 
 // ── 隐藏文件 input ──
 const hiddenFileInput = ref(null)
+const assetUploadError = ref('')
+const isAssetUploading = ref(false)
 
 function openUploadModal(itemId) {
   const item = props.items.find((i) => i.id === itemId)
@@ -210,14 +214,14 @@ function triggerFilePick() {
   hiddenFileInput.value?.click()
 }
 
-function onFileChange(e) {
+async function onFileChange(e) {
   const file = e.target.files?.[0]
   if (!file) return
   if (!file.type.startsWith('image/')) {
   alert('元素替换仅支持上传图片格式，请选择 JPG、PNG、WEBP 等图片文件。')
   return
 }
-  applyReplacement(file.name, file)
+  await applyReplacement(file.name, file)
   // 重置 input 以便重复选择同一文件
   e.target.value = ''
 }
@@ -226,14 +230,26 @@ function applyAssetFromLibrary(asset) {
   applyReplacement(asset.name, null, asset.previewUrl)
 }
 
-function applyReplacement(fileName, file, previewUrl = '') {
+async function applyReplacement(fileName, file, previewUrl = '') {
   const item = props.items.find((i) => i.id === activeItemId.value)
   if (!item) return
 
-  // 如果有 file 对象，生成本地预览
+  if (file && !props.projectId) {
+    assetUploadError.value = '请先上传原视频并创建项目。'
+    alert(assetUploadError.value)
+    return
+  }
+
+  const previous = { ...item }
+  let temporaryPreviewUrl = ''
+  assetUploadError.value = ''
+  isAssetUploading.value = Boolean(file)
+
+  // Blob URL 只作为上传中的临时预览，不写入持久化状态。
   if (file && !previewUrl) {
     if (file.type.startsWith('image/')) {
-      previewUrl = URL.createObjectURL(file)
+      temporaryPreviewUrl = URL.createObjectURL(file)
+      item.previewUrl = temporaryPreviewUrl
     } else if (file.type.startsWith('video/')) {
       // 视频截帧作为预览
       const videoUrl = URL.createObjectURL(file)
@@ -258,16 +274,42 @@ function applyReplacement(fileName, file, previewUrl = '') {
     }
   }
 
-  if (previewUrl) {
-    item.previewUrl = previewUrl
+  try {
+    if (file) {
+      const replacementType = { '主体': 'subject', '场景': 'scene', '元素': 'element' }[item.group]
+      const data = await persistReplacementImage(props.projectId, file, replacementType)
+      previewUrl = toBackendUrl(data.asset.public_url)
+      const previousAssetId = previous.assetId
+      Object.assign(item, {
+        assetId: data.asset.id,
+        assetUrl: previewUrl,
+        previewUrl,
+      })
+      if (previousAssetId && previousAssetId !== data.asset.id) {
+        deleteProjectAsset(props.projectId, previousAssetId).catch((error) => {
+          console.warn('旧替换素材清理失败：', error)
+        })
+      }
+    }
+
+    if (previewUrl) item.previewUrl = previewUrl
+
+    item.current = fileName
+    item.replacement = fileName
+    item.changed = true
+
+    closeAssetModal()
+    emit('replace', item.id)
+  } catch (error) {
+    Object.keys(item).forEach((key) => delete item[key])
+    Object.assign(item, previous)
+    assetUploadError.value = `素材上传失败：${error.message}`
+    assetModalSubtitle.value = assetUploadError.value
+    alert(assetUploadError.value)
+  } finally {
+    isAssetUploading.value = false
+    if (temporaryPreviewUrl) URL.revokeObjectURL(temporaryPreviewUrl)
   }
-
-  item.current = fileName
-  item.replacement = fileName
-  item.changed = true
-
-  closeAssetModal()
-  emit('replace', item.id)
 }
 
 const groupedItems = computed(() => {

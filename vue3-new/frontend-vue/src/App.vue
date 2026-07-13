@@ -12,13 +12,13 @@ import BottomControls from './components/BottomControls.vue'
 import BreakdownModal from './components/BreakdownModal.vue'
 import ResultCard from './components/ResultCard.vue'
 import ViralLabTestBench from './components/ViralLabTestBench.vue'
-import { apiUrl, toBackendUrl } from './api.js'
+import { apiUrl, toBackendUrl, deleteProjectAsset, getProject, persistOriginalVideo } from './api.js'
 import { useCanvasNodes } from './composables/useCanvasNodes.js'
 import { cleanBreakdownResult } from './utils/cleanBreakdown.js'
 
 // ── 状态管理 ──
 const activeView = ref('demo')
-const DEMO_STATE_KEY = 'viral-lab-demo-state:v1'
+const PROJECT_ID_KEY = 'viral-lab-current-project-id'
 const HISTORY_VIDEO_EXPIRED_MESSAGE = '历史视频地址已失效，请重新生成'
 let demoStateRestored = false
 let suppressDemoPersist = false
@@ -28,11 +28,15 @@ const flowMode = ref('idle')
 
 const uploadedVideo = reactive({
   name: '',
+  assetId: '',
+  assetUrl: '',
   coverUrl: '',
   duration: '',
   ratio: '',
   size: '',
 })
+const projectId = ref('')
+const isRestoringProject = ref(false)
 
 const analysisProgress = ref(0)
 const analysisStage = ref('')
@@ -132,50 +136,8 @@ function isPlainObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function safeParseStorage(rawValue) {
-  if (!rawValue) return null
-  try {
-    const parsed = JSON.parse(rawValue)
-    return isPlainObject(parsed) ? parsed : null
-  } catch {
-    return null
-  }
-}
-
-function safeLoadState(key) {
-  if (typeof localStorage === 'undefined') return null
-  try {
-    const parsed = safeParseStorage(localStorage.getItem(key))
-    if (!parsed) {
-      localStorage.removeItem(key)
-      return null
-    }
-    return parsed
-  } catch (error) {
-    console.warn('状态读取失败，已清除缓存：', error)
-    try {
-      localStorage.removeItem(key)
-    } catch (removeError) {
-      console.warn('状态缓存清除失败：', removeError)
-    }
-    return null
-  }
-}
-
-function asObjectOrNull(value) {
-  return isPlainObject(value) ? value : null
-}
-
-function asArray(value) {
-  return Array.isArray(value) ? value : []
-}
-
 function asString(value) {
   return typeof value === 'string' ? value : ''
-}
-
-function normalizeRestoredCustomItems(value) {
-  return asArray(value).filter(isPlainObject)
 }
 
 function isRealDemoVersion(version) {
@@ -188,128 +150,72 @@ function isRealDemoVersion(version) {
     && version.resultSource === 'generate-status'
 }
 
-function normalizeRestoredVersions(value) {
-  return asArray(value).filter(isRealDemoVersion).map((version, index) => {
-    const time = asString(version.time) || asString(version.createdAt) || ''
-    return {
-      ...version,
-      id: `V${index + 1}`,
-      videoUrl: asString(version.videoUrl),
-      prompt: asString(version.prompt),
-      summary: asArray(version.summary).map((item) => String(item)),
-      params: asObjectOrNull(version.params) || {},
-      createdAt: asString(version.createdAt) || time,
-      time,
-      status: asString(version.status),
-      saved: Boolean(version.saved),
-    }
-  })
+function mapReplacementTypeToGroup(type) {
+  return { subject: '主体', scene: '场景', element: '元素' }[type] || ''
 }
 
-function getDemoStateSnapshot() {
-  const changedItems = customItems.value.filter((item) => item.changed)
-  return {
-    uploadedVideo: { ...uploadedVideo },
-    videoToTextResult: videoToTextResult.value,
-    breakdownResult: breakdownData.value,
-    breakdownData: breakdownData.value,
-    customItems: customItems.value,
-    replacementSlots: customItems.value,
-    userSelection: changedItems,
-    changedItems,
-    adjustmentText: adjustmentText.value,
-    currentGeneratingPrompt: currentGeneratingPrompt.value,
-    generationConfig: { ...resultParams },
-    versions: versions.value,
-    currentVersionId: currentVersionId.value,
-    flowMode: flowMode.value,
-    savedAt: Date.now(),
-  }
-}
-
-function persistDemoState() {
-  if (suppressDemoPersist || typeof localStorage === 'undefined') return
+async function restoreProjectState() {
+  if (typeof localStorage === 'undefined') return
+  ;['viral-lab-demo-state:v1', 'viral-lab-test-bench-state:v1', 'viral-lab-node-layout:v1']
+    .forEach((key) => localStorage.removeItem(key))
+  const savedProjectId = localStorage.getItem(PROJECT_ID_KEY) || ''
+  if (!savedProjectId) return
+  isRestoringProject.value = true
   try {
-    localStorage.setItem(DEMO_STATE_KEY, JSON.stringify(getDemoStateSnapshot()))
-  } catch (error) {
-    console.warn('Demo 状态保存失败：', error)
-  }
-}
-
-function restoreDemoState() {
-  const saved = safeLoadState(DEMO_STATE_KEY)
-  if (!saved) return
-
-  try {
-    const restoredVideo = asObjectOrNull(saved.uploadedVideo)
+    const data = await getProject(savedProjectId)
+    const project = data.project
+    const assets = Array.isArray(data.assets) ? data.assets : []
+    const original = assets.find((asset) => asset.id === project.original_asset_id)
+      || assets.find((asset) => asset.asset_type === 'original_video')
+    if (!original?.public_url) throw new Error('Project 缺少有效原视频')
+    projectId.value = project.id
     Object.assign(uploadedVideo, {
-      name: asString(restoredVideo?.name),
-      coverUrl: asString(restoredVideo?.coverUrl),
-      duration: asString(restoredVideo?.duration),
-      ratio: asString(restoredVideo?.ratio),
-      size: asString(restoredVideo?.size),
+      name: original.original_filename || project.name,
+      assetId: original.id,
+      assetUrl: toBackendUrl(original.public_url),
+      coverUrl: '', duration: '已持久化', ratio: '',
+      size: original.file_size ? formatFileSize(Number(original.file_size)) : '',
     })
-
-    videoToTextResult.value = asObjectOrNull(saved.videoToTextResult)
-    breakdownData.value = cleanBreakdownResult(
-      asObjectOrNull(saved.breakdownResult) || asObjectOrNull(saved.breakdownData)
-    )
-
-    const restoredItems = normalizeRestoredCustomItems(saved.customItems).length
-      ? normalizeRestoredCustomItems(saved.customItems)
-      : normalizeRestoredCustomItems(saved.replacementSlots)
-    const allowedElements = new Set(
-      breakdownData.value?.overview?.replaceableElements || []
-    )
-    const cleanedRestoredItems = restoredItems.filter((item) =>
-      item.group !== '元素' || allowedElements.has(item.title)
-    )
-    customItems.value = cleanedRestoredItems.length
-      ? cleanedRestoredItems
-      : breakdownData.value
-        ? buildCustomItems(breakdownData.value)
-        : createDefaultCustomItems()
-
-    adjustmentText.value = asString(saved.adjustmentText)
-    currentGeneratingPrompt.value = asString(saved.currentGeneratingPrompt)
-    const restoredConfig = asObjectOrNull(saved.generationConfig)
-    if (restoredConfig) {
-      Object.assign(resultParams, {
-        ratio: asString(restoredConfig.ratio) || '9:16',
-        quality: asString(restoredConfig.quality) || '720p',
-        duration: asString(restoredConfig.duration) || '10s',
-        modelId: asString(restoredConfig.modelId) || 'kling-v3-pro',
-        model: asString(restoredConfig.model) || '可灵 v3.0 Pro',
-        timeStart: Number(restoredConfig.timeStart) || 0,
-        timeEnd: restoredConfig.timeEnd !== null && restoredConfig.timeEnd !== ''
-          && Number.isFinite(Number(restoredConfig.timeEnd))
-          ? Number(restoredConfig.timeEnd)
-          : null,
+    videoObjectUrl.value = toBackendUrl(original.public_url)
+    try {
+      const sourceResponse = await fetch(videoObjectUrl.value)
+      if (sourceResponse.ok) {
+        const sourceBlob = await sourceResponse.blob()
+        const sourceFile = new File([sourceBlob], original.original_filename || 'source-video.mp4', {
+          type: original.mime_type || sourceBlob.type || 'video/mp4',
+        })
+        const previewInfo = await getVideoPreviewInfo(sourceFile)
+        uploadedVideo.coverUrl = previewInfo.coverUrl
+        uploadedVideo.duration = previewInfo.duration
+        uploadedVideo.ratio = previewInfo.ratio
+      }
+    } catch (error) {
+      console.warn('持久化原视频封面恢复失败：', error)
+    }
+    const restoredItems = createDefaultCustomItems()
+    assets.filter((asset) => asset.asset_type === 'replacement_image').forEach((asset) => {
+      const group = mapReplacementTypeToGroup(asset.replacement_type)
+      const item = restoredItems.find((entry) => entry.group === group && !entry.assetId)
+      if (!item) return
+      Object.assign(item, {
+        current: asset.original_filename, replacement: asset.original_filename,
+        previewUrl: toBackendUrl(asset.public_url), assetUrl: toBackendUrl(asset.public_url),
+        assetId: asset.id, changed: true,
       })
-    }
-    versions.value = normalizeRestoredVersions(saved.versions)
-    const restoredCurrentVersionId = asString(saved.currentVersionId)
-    currentVersionId.value = versions.value.some((version) => version.id === restoredCurrentVersionId)
-      ? restoredCurrentVersionId
-      : versions.value[versions.value.length - 1]?.id || ''
-    flowMode.value = asString(saved.flowMode) || (breakdownData.value ? 'customizing' : 'idle')
-
-    if (!['idle', 'analyzing', 'customizing', 'done', 'error'].includes(flowMode.value)) {
-      flowMode.value = breakdownData.value ? 'customizing' : 'idle'
-    }
-    if (flowMode.value === 'analyzing') {
-      flowMode.value = breakdownData.value ? 'customizing' : 'idle'
-    }
-    if (flowMode.value === 'customizing' && !breakdownData.value && !uploadedVideo.name) {
-      flowMode.value = 'idle'
-    }
-
+    })
+    customItems.value = restoredItems
+    // Task 持久化不在本轮范围；保留可生成的最小拆解容器，后续由 Task 恢复真实拆解结果。
+    breakdownData.value = getEmptyBreakdownData('已恢复持久化项目')
+    flowMode.value = 'customizing'
     demoStateRestored = true
   } catch (error) {
-    console.warn('Demo 状态恢复失败，已清除缓存：', error)
-    try {
-      localStorage.removeItem(DEMO_STATE_KEY)
-    } catch {}
+    console.warn('Project 恢复失败：', error)
+    localStorage.removeItem(PROJECT_ID_KEY)
+    projectId.value = ''
+    flowMode.value = 'idle'
+    showNotice('历史项目无法恢复，已进入新项目')
+  } finally {
+    isRestoringProject.value = false
   }
 }
 
@@ -317,11 +223,14 @@ function clearDemoState() {
   suppressDemoPersist = true
   canvas.clearSavedOffsets()
   if (typeof localStorage !== 'undefined') {
-    localStorage.removeItem(DEMO_STATE_KEY)
+    localStorage.removeItem(PROJECT_ID_KEY)
   }
+  projectId.value = ''
 
   Object.assign(uploadedVideo, {
     name: '',
+    assetId: '',
+    assetUrl: '',
     coverUrl: '',
     duration: '',
     ratio: '',
@@ -422,25 +331,10 @@ async function verifyRestoredDemoVideoUrls() {
   }
 }
 
-restoreDemoState()
-
-watch([
-  () => ({ ...uploadedVideo }),
-  videoToTextResult,
-  breakdownData,
-  customItems,
-  adjustmentText,
-  currentGeneratingPrompt,
-  () => ({ ...resultParams }),
-  versions,
-  currentVersionId,
-  flowMode,
-], persistDemoState, { deep: true })
-
 const showInspiration = computed(() => flowMode.value === 'idle')
 
 // ── 画布节点系统 ──
-const canvas = useCanvasNodes({ storageKey: 'viral-lab-node-layout:v1' })
+const canvas = useCanvasNodes({ storageKey: '' })
 
 // 节点 ref
 const boardEl = ref(null)
@@ -618,7 +512,8 @@ watch(
   { immediate: true }
 )
 
-onMounted(() => {
+onMounted(async () => {
+  await restoreProjectState()
   loadGenerationOptions()
   refreshCanvasConnectors(120)
   verifyRestoredDemoVideoUrls()
@@ -953,14 +848,34 @@ async function handleUploaded(file) {
   uploadedVideo.name = file?.name || '上传的视频.mp4'
   uploadedVideo.size = formatFileSize(file.size)
 
-  // 保存视频 object URL 用于拆解弹窗镜头预览
+  // Blob URL 仅用于持久化上传完成前的本地预览。
   if (videoObjectUrl.value) URL.revokeObjectURL(videoObjectUrl.value)
-  videoObjectUrl.value = URL.createObjectURL(file)
+  const temporaryVideoUrl = URL.createObjectURL(file)
+  videoObjectUrl.value = temporaryVideoUrl
 
   const info = await getVideoPreviewInfo(file)
   uploadedVideo.coverUrl = info.coverUrl
   uploadedVideo.duration = info.duration
   uploadedVideo.ratio = info.ratio
+
+  try {
+    const persisted = await persistOriginalVideo(file, projectId.value)
+    projectId.value = persisted.project.id
+    if (typeof localStorage !== 'undefined') localStorage.setItem(PROJECT_ID_KEY, projectId.value)
+    uploadedVideo.assetId = persisted.asset.id
+    uploadedVideo.assetUrl = toBackendUrl(persisted.asset.public_url)
+    if (videoObjectUrl.value === temporaryVideoUrl) URL.revokeObjectURL(temporaryVideoUrl)
+    videoObjectUrl.value = uploadedVideo.assetUrl
+  } catch (error) {
+    URL.revokeObjectURL(temporaryVideoUrl)
+    Object.assign(uploadedVideo, {
+      name: '', assetId: '', assetUrl: '', coverUrl: '', duration: '', ratio: '', size: '',
+    })
+    videoObjectUrl.value = ''
+    errorMsg.value = `原视频上传失败：${error.message}`
+    flowMode.value = 'error'
+    return
+  }
 
   errorMsg.value = ''
   flowMode.value = 'analyzing'
@@ -1631,19 +1546,31 @@ async function handleGenerateFromRevise() {
   return startGeneration(true)
 }
 
-function handleRestore(itemId) {
+async function handleRestore(itemId) {
   const item = customItems.value.find((i) => i.id === itemId)
   if (!item) return
+  if (projectId.value && item.assetId) {
+    try {
+      await deleteProjectAsset(projectId.value, item.assetId)
+    } catch (error) {
+      showNotice(`恢复失败：${error.message}`)
+      return
+    }
+  }
   item.changed = false
   item.current = item.original
   item.replacement = ''
   item.previewUrl = ''
+  item.assetId = ''
+  item.assetUrl = ''
 }
 
 function retry() {
   errorMsg.value = ''
   flowMode.value = 'idle'
   uploadedVideo.name = ''
+  uploadedVideo.assetId = ''
+  uploadedVideo.assetUrl = ''
   uploadedVideo.coverUrl = ''
   uploadedVideo.duration = ''
   uploadedVideo.ratio = ''
@@ -1759,6 +1686,7 @@ function retry() {
               >
                 <ReplaceRail
                   ref="replaceRailComp"
+                  :project-id="projectId"
                   :items="customItems"
                   :cover-url="uploadedVideo.coverUrl"
                   v-model="adjustmentText"

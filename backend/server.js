@@ -7,6 +7,7 @@ const os = require("os");
 const fs = require("fs");
 const https = require("https");
 const crypto = require("crypto");
+const { createProjectAssetService } = require("./services/projectAssetService");
 const FFMPEG_PATH = process.env.FFMPEG_PATH || require("ffmpeg-static");
 const FFPROBE_PATH = process.env.FFPROBE_PATH || require("ffprobe-static").path;
 for (const binaryPath of [FFMPEG_PATH, FFPROBE_PATH]) {
@@ -55,7 +56,7 @@ const corsOptions = {
   origin(origin, callback) {
     callback(null, isOriginAllowed(origin));
   },
-  methods: ["GET", "POST", "OPTIONS"],
+  methods: ["GET", "POST", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   optionsSuccessStatus: 204,
 };
@@ -67,7 +68,7 @@ function applyCorsHeaders(req, res) {
 
   res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
     req.headers["access-control-request-headers"] || "Content-Type,Authorization"
@@ -78,6 +79,27 @@ function applyCorsHeaders(req, res) {
 // uploads 目录：优先用环境变量，默认用 backend 目录下的 uploads
 const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(__dirname, "uploads");
 const upload = multer({ dest: UPLOADS_DIR });
+const ORIGINAL_VIDEO_MAX_BYTES = 500 * 1024 * 1024;
+const REPLACEMENT_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
+
+function runSingleUpload(fieldName, maxBytes, allowedMimePrefix) {
+  const middleware = multer({ storage: multer.memoryStorage(), limits: { fileSize: maxBytes } }).single(fieldName);
+  return (req, res, next) => middleware(req, res, (error) => {
+    if (error) return sendApiError(res, 400, `文件上传失败：${error.message}`);
+    if (!req.file) return sendApiError(res, 400, "没有收到上传文件");
+    if (!req.file.mimetype?.startsWith(allowedMimePrefix)) {
+      return sendApiError(res, 400, allowedMimePrefix === "video/" ? "仅支持视频文件" : "仅支持图片文件");
+    }
+    if (!req.file.size || req.file.size > maxBytes) {
+      return sendApiError(res, 400, `文件大小不能超过 ${Math.floor(maxBytes / 1024 / 1024)}MB`);
+    }
+    return next();
+  });
+}
+
+function projectAssetService() {
+  return createProjectAssetService();
+}
 
 // 旧版前端静态托管：指向同级 react-old 目录
 const LEGACY_FRONTEND_DIR = process.env.LEGACY_FRONTEND_DIR || path.join(__dirname, "..", "react-old");
@@ -122,6 +144,72 @@ app.get("/api/health", (req, res) => {
     service: "viral-lab-backend",
     time: new Date().toISOString(),
   });
+});
+
+app.post("/api/projects", async (req, res) => {
+  try {
+    const project = await projectAssetService().createProject({ name: req.body?.name });
+    return res.status(201).json({ ok: true, project });
+  } catch (error) {
+    return sendApiError(res, error.statusCode || 500, `创建 Project 失败：${error.message}`);
+  }
+});
+
+app.get("/api/projects/:projectId", async (req, res) => {
+  try {
+    const project = await projectAssetService().getProject(req.params.projectId);
+    if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
+    return res.json({ ok: true, project, assets: project.assets || [] });
+  } catch (error) {
+    return sendApiError(res, 500, `读取 Project 失败：${error.message}`);
+  }
+});
+
+app.post("/api/projects/original-video", runSingleUpload("video", ORIGINAL_VIDEO_MAX_BYTES, "video/"), async (req, res) => {
+  const service = projectAssetService();
+  let project;
+  let createdProject = false;
+  try {
+    const requestedProjectId = String(req.body?.projectId || "").trim();
+    if (requestedProjectId) {
+      project = await service.getProject(requestedProjectId);
+      if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
+    } else {
+      project = await service.createProject({ name: req.body?.name || req.file.originalname });
+      createdProject = true;
+    }
+    const asset = await service.uploadAsset({ projectId: project.id, file: req.file, assetType: "original_video" });
+    project = await service.setOriginalAsset(project.id, asset.id);
+    return res.status(201).json({ ok: true, project, asset });
+  } catch (error) {
+    if (createdProject && project?.id) await service.deleteProject(project.id).catch(() => {});
+    return sendApiError(res, error.statusCode || 500, `原视频持久化失败：${error.message}`);
+  }
+});
+
+app.post("/api/projects/:projectId/assets/replacement", runSingleUpload("image", REPLACEMENT_IMAGE_MAX_BYTES, "image/"), async (req, res) => {
+  try {
+    const service = projectAssetService();
+    const project = await service.getProject(req.params.projectId);
+    if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
+    const asset = await service.uploadAsset({
+      projectId: project.id, file: req.file, assetType: "replacement_image",
+      replacementType: String(req.body?.replacementType || "").trim(),
+    });
+    return res.status(201).json({ ok: true, asset });
+  } catch (error) {
+    return sendApiError(res, error.statusCode || 500, `替换素材持久化失败：${error.message}`);
+  }
+});
+
+app.delete("/api/projects/:projectId/assets/:assetId", async (req, res) => {
+  try {
+    const deleted = await projectAssetService().deleteAsset(req.params.projectId, req.params.assetId);
+    if (!deleted) return sendApiError(res, 404, "Asset 不存在");
+    return res.json({ ok: true, deleted: true });
+  } catch (error) {
+    return sendApiError(res, error.statusCode || 500, `删除 Asset 失败：${error.message}`);
+  }
 });
 
 const RUNNINGHUB_SKILL_DIR =

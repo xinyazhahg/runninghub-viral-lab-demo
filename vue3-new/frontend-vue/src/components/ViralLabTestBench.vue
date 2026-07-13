@@ -183,12 +183,7 @@ function getTestBenchSnapshot() {
 }
 
 function persistTestBenchState() {
-  if (suppressTestBenchPersist || typeof localStorage === 'undefined') return
-  try {
-    localStorage.setItem(TEST_BENCH_STATE_KEY, JSON.stringify(getTestBenchSnapshot()))
-  } catch (error) {
-    console.warn('测试台状态保存失败：', error)
-  }
+  // 阶段6第一轮不再把测试台业务数据写入 localStorage。
 }
 
 function restoreTestBenchState() {
@@ -252,9 +247,6 @@ function restoreTestBenchState() {
 
 function clearTestBenchState() {
   suppressTestBenchPersist = true
-  if (typeof localStorage !== 'undefined') {
-    localStorage.removeItem(TEST_BENCH_STATE_KEY)
-  }
   if (videoPreviewUrl.value) URL.revokeObjectURL(videoPreviewUrl.value)
 
   videoFile.value = null
@@ -786,20 +778,6 @@ async function testGenerateVideo() {
     isTestingGenerateVideo.value = false
   }
 }
-
-restoreTestBenchState()
-
-watch([
-  selectedVideoInfo,
-  videoToTextRaw,
-  parsedBreakdown,
-  extraPromptRequirement,
-  generatedPrompt,
-  generateResult,
-  generationRun,
-  logs,
-  benchMessage,
-], persistTestBenchState, { deep: true })
 
 onMounted(() => {
   verifyRestoredTestBenchVideoUrl()

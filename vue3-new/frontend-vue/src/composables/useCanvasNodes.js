@@ -20,7 +20,6 @@ import { ref, reactive, nextTick, onMounted, onUnmounted, readonly } from 'vue'
  */
 
 export function useCanvasNodes(options = {}) {
-  const storageKey = options.storageKey || ''
   // 节点 DOM 引用
   const nodeEls = reactive({})
   // 节点偏移量
@@ -35,31 +34,11 @@ export function useCanvasNodes(options = {}) {
   let boardEl = null
 
   function loadSavedOffsets() {
-    if (!storageKey || typeof localStorage === 'undefined') return
-    try {
-      const saved = JSON.parse(localStorage.getItem(storageKey) || '{}')
-      if (!saved || typeof saved !== 'object') return
-      Object.entries(saved).forEach(([key, value]) => {
-        const x = Number(value?.x)
-        const y = Number(value?.y)
-        if (Number.isFinite(x) && Number.isFinite(y)) nodeOffsets[key] = { x, y }
-      })
-    } catch (error) {
-      console.warn('节点布局恢复失败：', error)
-    }
+    // 阶段6第一轮仅允许 localStorage 保存 projectId；节点布局不再落盘。
   }
 
   function persistNodeOffset(key) {
-    if (!storageKey || typeof localStorage === 'undefined' || !nodeOffsets[key]) return
-    try {
-      const saved = JSON.parse(localStorage.getItem(storageKey) || '{}')
-      const next = saved && typeof saved === 'object' ? saved : {}
-      // 只更新本次被拖动的节点，其他节点坐标原样保留。
-      next[key] = { x: nodeOffsets[key].x, y: nodeOffsets[key].y }
-      localStorage.setItem(storageKey, JSON.stringify(next))
-    } catch (error) {
-      console.warn('节点布局保存失败：', error)
-    }
+    return key
   }
 
   function clearSavedOffsets() {
@@ -68,7 +47,6 @@ export function useCanvasNodes(options = {}) {
       const el = nodeEls[key]
       if (el) el.style.transform = 'translate(0px, 0px)'
     })
-    if (storageKey && typeof localStorage !== 'undefined') localStorage.removeItem(storageKey)
     updateConnectorsSync()
   }
 
