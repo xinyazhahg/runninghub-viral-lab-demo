@@ -63,6 +63,7 @@ const resultParams = reactive({
   modelId: 'kling-v3-pro',
   model: '可灵 v3.0 Pro',
   timeStart: 0,
+  timeEnd: null,
 })
 const generationOptions = ref({ models: [], ratios: [], resolutions: [], durations: [] })
 const estimatedPrice = ref(null)
@@ -279,6 +280,11 @@ function restoreDemoState() {
         duration: asString(restoredConfig.duration) || '10s',
         modelId: asString(restoredConfig.modelId) || 'kling-v3-pro',
         model: asString(restoredConfig.model) || '可灵 v3.0 Pro',
+        timeStart: Number(restoredConfig.timeStart) || 0,
+        timeEnd: restoredConfig.timeEnd !== null && restoredConfig.timeEnd !== ''
+          && Number.isFinite(Number(restoredConfig.timeEnd))
+          ? Number(restoredConfig.timeEnd)
+          : null,
       })
     }
     versions.value = normalizeRestoredVersions(saved.versions)
@@ -345,7 +351,7 @@ function clearDemoState() {
   pendingVersionId.value = ''
   Object.assign(resultParams, {
     ratio: '9:16', quality: '720p', duration: '10s',
-    modelId: 'kling-v3-pro', model: '可灵 v3.0 Pro', timeStart: 0,
+    modelId: 'kling-v3-pro', model: '可灵 v3.0 Pro', timeStart: 0, timeEnd: null,
   })
   showNotice('当前状态已清空')
 
@@ -1417,6 +1423,15 @@ async function executeGenerate() {
       replacement: item.current || item.replacement,
     }))))
     formData.append('extraPrompt', adjText)
+    formData.append('sourceVideoTaskId', videoToTextResult.value?.taskId || '')
+    const clipStart = Math.max(0, Number(submittedParams.timeStart) || 0)
+    const configuredDuration = Number(submittedParams.duration.replace(/s$/i, '')) || 0
+    const configuredEnd = Number(submittedParams.timeEnd)
+    const clipEnd = Number.isFinite(configuredEnd) && configuredEnd > clipStart
+      ? configuredEnd
+      : clipStart + configuredDuration
+    formData.append('clipStart', String(clipStart))
+    formData.append('clipEnd', String(clipEnd))
     formData.append('duration', submittedParams.duration.replace(/s$/i, ''))
     formData.append('aspectRatio', submittedParams.ratio)
     formData.append('resolution', submittedParams.quality)

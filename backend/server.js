@@ -731,6 +731,62 @@ async function probeVideo(filePath) {
   };
 }
 
+async function sourceVideoHasAudio(filePath) {
+  const stdout = await runMediaCommand(FFPROBE_PATH, [
+    "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type",
+    "-of", "json", filePath,
+  ], "原视频音轨检测");
+  const data = JSON.parse(stdout);
+  return Array.isArray(data.streams) && data.streams.some((stream) => stream.codec_type === "audio");
+}
+
+async function mergeOriginalAudio(generatedVideoPath, sourceVideoPath, finalOutputPath, clipStart, clipEnd) {
+  if (!sourceVideoPath || !fs.existsSync(sourceVideoPath)) {
+    console.log("[generate-video] 未找到原视频文件，返回无音频生成视频");
+    return generatedVideoPath;
+  }
+  try {
+    const hasAudio = await sourceVideoHasAudio(sourceVideoPath);
+    if (!hasAudio) {
+      console.log("[generate-video] 原视频没有音轨，返回无音频生成视频");
+      return generatedVideoPath;
+    }
+    const generatedInfo = await probeVideo(generatedVideoPath);
+    const start = Math.max(0, Number(clipStart) || 0);
+    const requestedEnd = Number(clipEnd);
+    const segmentDuration = Number.isFinite(requestedEnd) && requestedEnd > start
+      ? requestedEnd - start
+      : generatedInfo.duration;
+    const sourceAudioDuration = Math.max(0.05, Math.min(segmentDuration, generatedInfo.duration));
+    console.log(
+      `[generate-video] 音频同步区间：${start.toFixed(3)}s-${(start + sourceAudioDuration).toFixed(3)}s，` +
+      `AI 视频时长：${generatedInfo.duration.toFixed(3)}s`
+    );
+    await runMediaCommand(FFMPEG_PATH, [
+      "-i", generatedVideoPath,
+      "-ss", start.toFixed(3),
+      "-t", sourceAudioDuration.toFixed(3),
+      "-i", sourceVideoPath,
+      "-map", "0:v:0",
+      "-map", "1:a:0",
+      "-c:v", "copy",
+      "-c:a", "aac",
+      "-af", "apad",
+      "-t", generatedInfo.duration.toFixed(3),
+      "-movflags", "+faststart",
+      "-y", finalOutputPath,
+    ], "原视频音频合并");
+    console.log("[generate-video] 原视频音频合并完成：", finalOutputPath);
+    return finalOutputPath;
+  } catch (error) {
+    console.error("[generate-video] 原视频音频合并失败，返回无音频版本：", error);
+    try {
+      if (fs.existsSync(finalOutputPath)) fs.unlinkSync(finalOutputPath);
+    } catch {}
+    return generatedVideoPath;
+  }
+}
+
 function previewItems(data) {
   const overview = data.overview || {};
   const list = (value) => Array.isArray(value) ? value.map(String).filter(Boolean) : [];
@@ -888,6 +944,7 @@ app.post("/api/video-to-text", upload.single("video"), (req, res) => {
       startedAt: Date.now(),
       finishedAt: null,
       elapsed: 0,
+      videoPath,
       result: null,
       rawResult: null,
       error: "",
@@ -993,7 +1050,15 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
   }
 
   const taskId = crypto.randomUUID();
-  const outputFile = path.join("/tmp/openclaw/rh-output", `${taskId}.mp4`);
+  const generatedOutputFile = path.join("/tmp/openclaw/rh-output", `${taskId}-video.mp4`);
+  const finalOutputFile = path.join("/tmp/openclaw/rh-output", `${taskId}.mp4`);
+  const sourceVideoTaskId = String(req.body.sourceVideoTaskId || "").trim();
+  const sourceVideoPath = videoToTextTasks.get(sourceVideoTaskId)?.videoPath || "";
+  const clipStart = Math.max(0, Number(req.body.clipStart) || 0);
+  const requestedClipEnd = Number(req.body.clipEnd);
+  const clipEnd = Number.isFinite(requestedClipEnd) && requestedClipEnd > clipStart
+    ? requestedClipEnd
+    : clipStart + Number(config.duration);
   const args = [
   "scripts/runninghub.js",
   "--endpoint",
@@ -1003,7 +1068,7 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
   "--image",
   imagePath,
   "--output",
-  outputFile,
+  generatedOutputFile,
   "--param",
   `resolution=${config.resolution}`,
   "--param",
@@ -1027,6 +1092,12 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
     error: "",
     result: null,
     finalPrompt: prompt,
+    sourceVideoTaskId,
+    sourceVideoPath,
+    sourceVideoAddress: sourceVideoTaskId ? `/api/video-to-text-status?taskId=${sourceVideoTaskId}` : "",
+    clipStart,
+    clipEnd,
+    generatedDuration: Number(config.duration),
     config: {
       model: config.model.id,
       modelLabel: config.model.label,
@@ -1042,19 +1113,31 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
   res.status(202).json({ ok: true, status: "running", taskId });
 
   runRunningHubScript(args, `RunningHub image-to-video ${taskId}`)
-    .then((stdout) => {
+    .then(async (stdout) => {
       const parsed = parseGenerationOutput(stdout);
       if (!parsed.outputFile || !parsed.videoUrl) {
         throw new Error("RunningHub 生成完成但未返回输出视频文件");
       }
+      const outputFile = await mergeOriginalAudio(
+        parsed.outputFile,
+        sourceVideoPath,
+        finalOutputFile,
+        task.clipStart,
+        task.clipEnd
+      );
+      const videoUrl = `/generated/${encodeURIComponent(path.basename(outputFile))}`;
+      const finalResult = stdout.replace(
+        /OUTPUT_FILE:\s*[^\r\n]+/,
+        `OUTPUT_FILE:${outputFile}`
+      );
       task.status = "success";
       task.finishedAt = Date.now();
       task.elapsed = generationTaskElapsed(task);
-      task.videoUrl = parsed.videoUrl;
-      task.outputFile = parsed.outputFile;
+      task.videoUrl = videoUrl;
+      task.outputFile = outputFile;
       task.cost = parsed.cost;
-      task.result = stdout;
-      console.log("generate-video 后台任务成功：", taskId, parsed.outputFile);
+      task.result = finalResult;
+      console.log("generate-video 后台任务成功：", taskId, outputFile);
     })
     .catch((err) => {
       task.status = "failed";
