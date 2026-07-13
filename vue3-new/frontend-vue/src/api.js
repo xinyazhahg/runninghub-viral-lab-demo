@@ -1,3 +1,5 @@
+import { getAccessToken } from './auth.js'
+
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 
 export function apiUrl(path) {
@@ -12,8 +14,15 @@ export function toBackendUrl(url) {
   return apiUrl(url)
 }
 
+export async function authFetch(url, options = {}) {
+  const token = await getAccessToken()
+  const headers = new Headers(options.headers || {})
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  return fetch(url, { ...options, headers })
+}
+
 async function requestJson(path, options = {}) {
-  const response = await fetch(apiUrl(path), options)
+  const response = await authFetch(apiUrl(path), options)
   const data = await response.json().catch(() => null)
   if (!response.ok || !data?.ok) throw new Error(data?.message || data?.error || '请求失败')
   return data
@@ -21,6 +30,18 @@ async function requestJson(path, options = {}) {
 
 export function getProject(projectId) {
   return requestJson(`/api/projects/${encodeURIComponent(projectId)}`)
+}
+
+export function getCurrentUser() {
+  return requestJson('/api/me')
+}
+
+export function getProjects() {
+  return requestJson('/api/projects')
+}
+
+export function deleteProject(projectId) {
+  return requestJson(`/api/projects/${encodeURIComponent(projectId)}`, { method: 'DELETE' })
 }
 
 export function persistOriginalVideo(file, projectId = '') {

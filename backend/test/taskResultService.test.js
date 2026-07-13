@@ -20,12 +20,14 @@ test("createTask persists the project, type, input, and start time", async () =>
   const service = createTaskResultService({ client });
   const task = await service.createTask({
     projectId: "project-1",
+    userId: "user-1",
     taskType: "generate_video",
     status: "created",
     inputData: { prompt: "test" },
   });
   assert.equal(task.id, "task-1");
   assert.equal(inserted.project_id, "project-1");
+  assert.equal(inserted.user_id, "user-1");
   assert.equal(inserted.task_type, "generate_video");
   assert.deepEqual(inserted.input_data, { prompt: "test" });
   assert.match(inserted.started_at, /^\d{4}-\d{2}-\d{2}T/);
@@ -70,6 +72,7 @@ test("createResult delegates atomic version allocation to the database RPC", asy
   const service = createTaskResultService({ client });
   const result = await service.createResult({
     projectId: "project-1",
+    userId: "user-1",
     taskId: "task-3",
     videoUrl: "https://cdn.example/v3.mp4",
     prompt: "prompt",
@@ -80,6 +83,7 @@ test("createResult delegates atomic version allocation to the database RPC", asy
   });
   assert.equal(rpcName, "create_project_result");
   assert.equal(rpcPayload.p_project_id, "project-1");
+  assert.equal(rpcPayload.p_user_id, "user-1");
   assert.equal(rpcPayload.p_task_id, "task-3");
   assert.deepEqual(rpcPayload.p_model_params, { duration: 10 });
   assert.equal(result.version, 3);

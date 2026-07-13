@@ -1,15 +1,19 @@
 <script setup>
+defineProps({ projectName: { type: String, default: 'Untitled' }, userEmail: { type: String, default: '' } })
+defineEmits(['works', 'logout'])
 </script>
 
 <template>
   <div class="project-title">
     <span class="rh-mark">✦</span>
-    <strong>Untitled</strong>
+    <strong>{{ projectName || 'Untitled' }}</strong>
   </div>
 
   <div class="canvas-actions">
     <span class="perf-badge">HeyGen HyperFrames</span>
-    <button class="text-action">分享</button>
+    <button class="text-action" @click="$emit('works')">我的作品</button>
+    <span v-if="userEmail" class="user-email">{{ userEmail }}</span>
+    <button class="text-action" @click="$emit('logout')">退出</button>
   </div>
 </template>
 
@@ -69,4 +73,5 @@
   background: rgba(28, 29, 32, 0.88);
   color: var(--soft);
 }
+.user-email { color: #8f9993; font-size: 12px; }
 </style>

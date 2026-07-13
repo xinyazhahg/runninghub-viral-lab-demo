@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { apiUrl, toBackendUrl } from '../api.js'
+import { apiUrl, authFetch, toBackendUrl } from '../api.js'
 import { cleanBreakdownResult } from '../utils/cleanBreakdown.js'
 
 const TEST_BENCH_STATE_KEY = 'viral-lab-test-bench-state:v1'
@@ -436,7 +436,7 @@ async function testVideoToText() {
     const formData = new FormData()
     formData.append('video', videoFile.value)
 
-    const response = await fetch(apiUrl('/api/video-to-text'), {
+    const response = await authFetch(apiUrl('/api/video-to-text'), {
       method: 'POST',
       body: formData,
     })
@@ -451,7 +451,7 @@ async function testVideoToText() {
 
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 4000))
-      const statusResponse = await fetch(
+      const statusResponse = await authFetch(
         apiUrl(`/api/video-to-text-status?taskId=${encodeURIComponent(taskId)}`)
       )
       data = await readResponse(statusResponse)
@@ -688,7 +688,7 @@ async function testGenerateVideo() {
     formData.append('duration', '10')
     formData.append('aspectRatio', '9:16')
 
-    const response = await fetch(apiUrl('/api/generate-video'), {
+    const response = await authFetch(apiUrl('/api/generate-video'), {
       method: 'POST',
       body: formData,
     })
@@ -713,7 +713,7 @@ async function testGenerateVideo() {
 
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 4000))
-      const statusResponse = await fetch(
+      const statusResponse = await authFetch(
         apiUrl(`/api/generate-status?taskId=${encodeURIComponent(taskId)}`)
       )
       data = await readResponse(statusResponse)

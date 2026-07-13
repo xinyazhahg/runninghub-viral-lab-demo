@@ -60,3 +60,17 @@ test("storage failure never inserts an asset row", async () => {
   }), /storage failed/);
   assert.equal(databaseTouched, false);
 });
+
+test("project lookup always scopes authenticated requests by user_id", async () => {
+  const filters = [];
+  const query = {
+    select() { return this; },
+    eq(field, value) { filters.push([field, value]); return this; },
+    maybeSingle: async () => ({ data: null, error: null }),
+  };
+  const client = { from(table) { assert.equal(table, "projects"); return query; } };
+  const service = createProjectAssetService({ client, bucket: "test" });
+  const project = await service.getProject("project-a", "user-b");
+  assert.equal(project, null);
+  assert.deepEqual(filters, [["id", "project-a"], ["user_id", "user-b"]]);
+});

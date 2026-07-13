@@ -12,15 +12,25 @@ import BottomControls from './components/BottomControls.vue'
 import BreakdownModal from './components/BreakdownModal.vue'
 import ResultCard from './components/ResultCard.vue'
 import ViralLabTestBench from './components/ViralLabTestBench.vue'
+import AuthView from './components/AuthView.vue'
+import WorksView from './components/WorksView.vue'
 import {
-  apiUrl, toBackendUrl, deleteProjectAsset, getProject, getProjectResults,
-  getProjectTasks, getTask, persistOriginalVideo, retryTask,
+  apiUrl, authFetch, toBackendUrl, deleteProject, deleteProjectAsset, getCurrentUser,
+  getProject, getProjects, getProjectResults, getProjectTasks, getTask, persistOriginalVideo, retryTask,
 } from './api.js'
+import { getSession, isAuthConfigured, signIn, signOut, signUp, supabase } from './auth.js'
 import { useCanvasNodes } from './composables/useCanvasNodes.js'
 import { cleanBreakdownResult } from './utils/cleanBreakdown.js'
 
 // ── 状态管理 ──
 const activeView = ref('demo')
+const authReady = ref(false)
+const authLoading = ref(false)
+const authError = ref('')
+const currentUser = ref(null)
+const projects = ref([])
+const projectsLoading = ref(false)
+const projectsError = ref('')
 const PROJECT_ID_KEY = 'viral-lab-current-project-id'
 const HISTORY_VIDEO_EXPIRED_MESSAGE = '历史视频地址已失效，请重新生成'
 let demoStateRestored = false
@@ -179,6 +189,87 @@ function hydratePersistedResults(results) {
     saved: false,
   }))
   currentVersionId.value = versions.value[versions.value.length - 1]?.id || ''
+}
+
+async function initializeAuth() {
+  if (!isAuthConfigured) {
+    authError.value = '缺少 VITE_SUPABASE_URL 或 VITE_SUPABASE_ANON_KEY'
+    authReady.value = true
+    return
+  }
+  try {
+    const session = await getSession()
+    if (session) currentUser.value = (await getCurrentUser()).user
+  } catch (error) {
+    console.warn('登录状态恢复失败：', error)
+    await signOut().catch(() => {})
+    localStorage.removeItem(PROJECT_ID_KEY)
+  } finally {
+    authReady.value = true
+  }
+}
+
+async function handleAuthSubmit(mode, credentials) {
+  authLoading.value = true
+  authError.value = ''
+  try {
+    const data = mode === 'register'
+      ? await signUp(credentials.email, credentials.password)
+      : await signIn(credentials.email, credentials.password)
+    if (!data.session) {
+      authError.value = '注册成功，请先完成邮箱验证后登录。'
+      return
+    }
+    currentUser.value = (await getCurrentUser()).user
+    activeView.value = 'demo'
+    await restoreProjectState()
+    await loadGenerationOptions()
+    await refreshEstimatedPrice()
+  } catch (error) {
+    authError.value = error.message || '登录失败'
+  } finally {
+    authLoading.value = false
+  }
+}
+
+async function handleLogout() {
+  await signOut().catch((error) => console.warn('退出登录失败：', error))
+  clearDemoState()
+  currentUser.value = null
+  projects.value = []
+  activeView.value = 'demo'
+}
+
+async function loadWorks() {
+  activeView.value = 'works'
+  projectsLoading.value = true
+  projectsError.value = ''
+  try {
+    projects.value = (await getProjects()).projects || []
+  } catch (error) {
+    projectsError.value = `作品加载失败：${error.message}`
+  } finally {
+    projectsLoading.value = false
+  }
+}
+
+async function openHistoricalProject(project) {
+  clearDemoState()
+  localStorage.setItem(PROJECT_ID_KEY, project.id)
+  activeView.value = 'demo'
+  await restoreProjectState()
+}
+
+async function removeHistoricalProject(project) {
+  if (!window.confirm(`确认删除“${project.name}”？该操作不可撤销。`)) return
+  try {
+    const outcome = await deleteProject(project.id)
+    projects.value = projects.value.filter((item) => item.id !== project.id)
+    if (projectId.value === project.id) clearDemoState()
+    if (outcome.warnings?.length) showNotice('项目已删除，部分存储文件需后台清理')
+  } catch (error) {
+    projectsError.value = `删除失败：${error.message}`
+  }
 }
 
 async function pollRestoredTask(task) {
@@ -582,7 +673,7 @@ watch(displayVersions, async () => {
 
 async function loadGenerationOptions() {
   try {
-    const response = await fetch(apiUrl('/api/generate-config'))
+    const response = await authFetch(apiUrl('/api/generate-config'))
     const { data } = await readApiResponse(response)
     if (!response.ok || !data?.ok) throw new Error('生成配置加载失败')
     generationOptions.value = data
@@ -596,7 +687,7 @@ async function refreshEstimatedPrice() {
   priceStatus.value = 'loading'
   estimatedPrice.value = null
   try {
-    const response = await fetch(apiUrl('/api/generate-price'), {
+    const response = await authFetch(apiUrl('/api/generate-price'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -620,13 +711,22 @@ async function refreshEstimatedPrice() {
 
 watch(
   () => [resultParams.modelId, resultParams.ratio, resultParams.quality, resultParams.duration],
-  refreshEstimatedPrice,
-  { immediate: true }
+  () => { if (currentUser.value) refreshEstimatedPrice() }
 )
 
 onMounted(async () => {
-  await restoreProjectState()
-  loadGenerationOptions()
+  await initializeAuth()
+  if (currentUser.value) {
+    await restoreProjectState()
+    await loadGenerationOptions()
+    await refreshEstimatedPrice()
+  }
+  supabase?.auth.onAuthStateChange((_event, session) => {
+    if (!session && currentUser.value) {
+      currentUser.value = null
+      localStorage.removeItem(PROJECT_ID_KEY)
+    }
+  })
   refreshCanvasConnectors(120)
   verifyRestoredDemoVideoUrls()
   if (flowMode.value === 'idle') focusFlowNode('uploadNode')
@@ -1002,7 +1102,7 @@ async function handleUploaded(file) {
     formData.append('originalAssetId', uploadedVideo.assetId)
     formData.append('originalVideoUrl', uploadedVideo.assetUrl)
 
-    const response = await fetch(apiUrl('/api/video-to-text'), {
+    const response = await authFetch(apiUrl('/api/video-to-text'), {
       method: 'POST',
       body: formData,
     })
@@ -1030,7 +1130,7 @@ if (!response.ok || !data?.ok) {
 
     while (Date.now() < videoToTextDeadline) {
       await new Promise((resolve) => setTimeout(resolve, 4000))
-      const statusResponse = await fetch(
+      const statusResponse = await authFetch(
         apiUrl(`/api/video-to-text-status?taskId=${encodeURIComponent(taskId)}`)
       )
       rawText = await statusResponse.text()
@@ -1481,7 +1581,7 @@ async function executeGenerate() {
     console.log('[debug] 发送给模型的图片:', imageFile.name, imageFile.type, imageFile.size)
     console.log('[debug] 发送给模型的 prompt:', description)
 
-    const response = await fetch(apiUrl('/api/generate-video'), {
+    const response = await authFetch(apiUrl('/api/generate-video'), {
       method: 'POST',
       body: formData,
     })
@@ -1499,7 +1599,7 @@ async function executeGenerate() {
 
     while (Date.now() < generationDeadline) {
       await new Promise((resolve) => setTimeout(resolve, 4000))
-      const statusResponse = await fetch(
+      const statusResponse = await authFetch(
         apiUrl(`/api/generate-status?taskId=${encodeURIComponent(taskId)}`)
       )
       const statusPayload = await readApiResponse(statusResponse)
@@ -1598,8 +1698,8 @@ async function handleExport(version) {
   try {
     exportingVersionId.value = targetVersion.id
     showNotice('正在导出视频')
-    const response = await fetch(apiUrl(
-      `/api/download-video?videoUrl=${encodeURIComponent(url)}&version=${encodeURIComponent(targetVersion.id)}`
+    const response = await authFetch(apiUrl(
+      `/api/download-video?projectId=${encodeURIComponent(projectId.value)}&version=${encodeURIComponent(targetVersion.id)}`
     ))
     if (!response.ok) throw new Error('视频下载失败')
     const blob = await response.blob()
@@ -1713,7 +1813,24 @@ function retry() {
 </script>
 
 <template>
-  <div class="app-shell">
+  <AuthView
+    v-if="authReady && !currentUser"
+    :loading="authLoading"
+    :config-error="authError"
+    @login="handleAuthSubmit('login', $event)"
+    @register="handleAuthSubmit('register', $event)"
+  />
+  <main v-else-if="!authReady" class="auth-loading">正在恢复登录状态…</main>
+  <WorksView
+    v-else-if="activeView === 'works'"
+    :projects="projects"
+    :loading="projectsLoading"
+    :error="projectsError"
+    @open="openHistoricalProject"
+    @delete="removeHistoricalProject"
+    @back="activeView = 'demo'"
+  />
+  <div v-else class="app-shell">
     <button
       class="test-bench-entry"
       type="button"
@@ -1733,7 +1850,12 @@ function retry() {
     <ViralLabTestBench v-if="activeView === 'testBench'" />
 
     <main v-else class="canvas">
-      <TopBar />
+      <TopBar
+        :project-name="uploadedVideo.name || 'Untitled'"
+        :user-email="currentUser?.email || ''"
+        @works="loadWorks"
+        @logout="handleLogout"
+      />
       <LabHead />
       <LeftToolbar />
 
@@ -1888,6 +2010,13 @@ function retry() {
 </template>
 
 <style>
+.auth-loading {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: #0b0d0e;
+  color: #8f9993;
+}
 :root {
   color-scheme: dark;
   --canvas: #020303;

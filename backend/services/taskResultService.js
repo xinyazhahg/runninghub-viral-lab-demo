@@ -3,10 +3,10 @@ const { getSupabaseClient } = require('../lib/supabase');
 const INCOMPLETE_STATUSES = ['created', 'queued', 'analyzing', 'generating'];
 
 function createTaskResultService({ client = getSupabaseClient() } = {}) {
-  async function createTask({ projectId, taskType, status = 'created', stage = 'created', inputData = {} }) {
+  async function createTask({ projectId, userId, taskType, status = 'created', stage = 'created', inputData = {} }) {
     const now = new Date().toISOString();
     const { data, error } = await client.from('tasks').insert({
-      project_id: projectId, task_type: taskType, status, stage,
+      project_id: projectId, user_id: userId, task_type: taskType, status, stage,
       input_data: inputData, started_at: now,
     }).select('*').single();
     if (error) throw error;
@@ -23,14 +23,18 @@ function createTaskResultService({ client = getSupabaseClient() } = {}) {
     return data;
   }
 
-  async function getTask(taskId) {
-    const { data, error } = await client.from('tasks').select('*').eq('id', taskId).maybeSingle();
+  async function getTask(taskId, userId) {
+    let query = client.from('tasks').select('*').eq('id', taskId);
+    if (userId) query = query.eq('user_id', userId);
+    const { data, error } = await query.maybeSingle();
     if (error) throw error;
     return data;
   }
 
-  async function listProjectTasks(projectId) {
-    const { data, error } = await client.from('tasks').select('*').eq('project_id', projectId)
+  async function listProjectTasks(projectId, userId) {
+    let query = client.from('tasks').select('*').eq('project_id', projectId);
+    if (userId) query = query.eq('user_id', userId);
+    const { data, error } = await query
       .order('created_at', { ascending: false });
     if (error) throw error;
     return data || [];
@@ -43,8 +47,10 @@ function createTaskResultService({ client = getSupabaseClient() } = {}) {
     return data || [];
   }
 
-  async function listProjectResults(projectId) {
-    const { data, error } = await client.from('results').select('*').eq('project_id', projectId)
+  async function listProjectResults(projectId, userId) {
+    let query = client.from('results').select('*').eq('project_id', projectId);
+    if (userId) query = query.eq('user_id', userId);
+    const { data, error } = await query
       .order('version', { ascending: true });
     if (error) throw error;
     return data || [];
@@ -54,6 +60,7 @@ function createTaskResultService({ client = getSupabaseClient() } = {}) {
     const { data, error } = await client.rpc('create_project_result', {
       p_project_id: input.projectId,
       p_task_id: input.taskId,
+      p_user_id: input.userId,
       p_video_url: input.videoUrl,
       p_prompt: input.prompt,
       p_model_name: input.modelName,
@@ -65,8 +72,10 @@ function createTaskResultService({ client = getSupabaseClient() } = {}) {
     return Array.isArray(data) ? data[0] : data;
   }
 
-  async function getResultByTask(taskId) {
-    const { data, error } = await client.from('results').select('*').eq('task_id', taskId).maybeSingle();
+  async function getResultByTask(taskId, userId) {
+    let query = client.from('results').select('*').eq('task_id', taskId);
+    if (userId) query = query.eq('user_id', userId);
+    const { data, error } = await query.maybeSingle();
     if (error) throw error;
     return data;
   }

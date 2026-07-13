@@ -9,6 +9,7 @@ const https = require("https");
 const crypto = require("crypto");
 const { createProjectAssetService } = require("./services/projectAssetService");
 const { createTaskResultService } = require("./services/taskResultService");
+const { createRequireAuth } = require("./services/authService");
 const FFMPEG_PATH = process.env.FFMPEG_PATH || require("ffmpeg-static");
 const FFPROBE_PATH = process.env.FFPROBE_PATH || require("ffprobe-static").path;
 for (const binaryPath of [FFMPEG_PATH, FFPROBE_PATH]) {
@@ -106,6 +107,12 @@ function taskResultService() {
   return createTaskResultService();
 }
 
+async function materializeResult(result) {
+  if (!result?.video_url || /^https?:\/\//i.test(result.video_url)) return result;
+  const asset = await projectAssetService().signedAsset({ storage_path: result.video_url });
+  return { ...result, video_url: asset.signed_url };
+}
+
 // 旧版前端静态托管：指向同级 react-old 目录
 const LEGACY_FRONTEND_DIR = process.env.LEGACY_FRONTEND_DIR || path.join(__dirname, "..", "react-old");
 
@@ -151,9 +158,24 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+app.use("/api", createRequireAuth());
+
+app.get("/api/me", (req, res) => {
+  res.json({ ok: true, user: { id: req.user.id, email: req.user.email || "", createdAt: req.user.created_at } });
+});
+
+app.get("/api/projects", async (req, res) => {
+  try {
+    const projects = await projectAssetService().listProjects(req.user.id);
+    return res.json({ ok: true, projects });
+  } catch (error) {
+    return sendApiError(res, 500, `读取我的作品失败：${error.message}`);
+  }
+});
+
 app.post("/api/projects", async (req, res) => {
   try {
-    const project = await projectAssetService().createProject({ name: req.body?.name });
+    const project = await projectAssetService().createProject({ name: req.body?.name, userId: req.user.id });
     return res.status(201).json({ ok: true, project });
   } catch (error) {
     return sendApiError(res, error.statusCode || 500, `创建 Project 失败：${error.message}`);
@@ -162,11 +184,21 @@ app.post("/api/projects", async (req, res) => {
 
 app.get("/api/projects/:projectId", async (req, res) => {
   try {
-    const project = await projectAssetService().getProject(req.params.projectId);
+    const project = await projectAssetService().getProject(req.params.projectId, req.user.id);
     if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
     return res.json({ ok: true, project, assets: project.assets || [] });
   } catch (error) {
     return sendApiError(res, 500, `读取 Project 失败：${error.message}`);
+  }
+});
+
+app.delete("/api/projects/:projectId", async (req, res) => {
+  try {
+    const outcome = await projectAssetService().deleteProject(req.params.projectId, req.user.id);
+    if (!outcome.deleted) return sendApiError(res, 404, "Project 不存在或无权访问");
+    return res.json({ ok: true, deleted: true, warnings: outcome.warnings });
+  } catch (error) {
+    return sendApiError(res, 500, `删除 Project 失败：${error.message}`);
   }
 });
 
@@ -177,17 +209,17 @@ app.post("/api/projects/original-video", runSingleUpload("video", ORIGINAL_VIDEO
   try {
     const requestedProjectId = String(req.body?.projectId || "").trim();
     if (requestedProjectId) {
-      project = await service.getProject(requestedProjectId);
+      project = await service.getProject(requestedProjectId, req.user.id);
       if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
     } else {
-      project = await service.createProject({ name: req.body?.name || req.file.originalname });
+      project = await service.createProject({ name: req.body?.name || req.file.originalname, userId: req.user.id });
       createdProject = true;
     }
-    const asset = await service.uploadAsset({ projectId: project.id, file: req.file, assetType: "original_video" });
-    project = await service.setOriginalAsset(project.id, asset.id);
+    const asset = await service.uploadAsset({ projectId: project.id, userId: req.user.id, file: req.file, assetType: "original_video" });
+    project = await service.setOriginalAsset(project.id, asset.id, req.user.id);
     return res.status(201).json({ ok: true, project, asset });
   } catch (error) {
-    if (createdProject && project?.id) await service.deleteProject(project.id).catch(() => {});
+    if (createdProject && project?.id) await service.deleteProject(project.id, req.user.id).catch(() => {});
     return sendApiError(res, error.statusCode || 500, `原视频持久化失败：${error.message}`);
   }
 });
@@ -195,10 +227,10 @@ app.post("/api/projects/original-video", runSingleUpload("video", ORIGINAL_VIDEO
 app.post("/api/projects/:projectId/assets/replacement", runSingleUpload("image", REPLACEMENT_IMAGE_MAX_BYTES, "image/"), async (req, res) => {
   try {
     const service = projectAssetService();
-    const project = await service.getProject(req.params.projectId);
+    const project = await service.getProject(req.params.projectId, req.user.id);
     if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
     const asset = await service.uploadAsset({
-      projectId: project.id, file: req.file, assetType: "replacement_image",
+      projectId: project.id, userId: req.user.id, file: req.file, assetType: "replacement_image",
       replacementType: String(req.body?.replacementType || "").trim(),
     });
     return res.status(201).json({ ok: true, asset });
@@ -209,7 +241,7 @@ app.post("/api/projects/:projectId/assets/replacement", runSingleUpload("image",
 
 app.delete("/api/projects/:projectId/assets/:assetId", async (req, res) => {
   try {
-    const deleted = await projectAssetService().deleteAsset(req.params.projectId, req.params.assetId);
+    const deleted = await projectAssetService().deleteAsset(req.params.projectId, req.params.assetId, req.user.id);
     if (!deleted) return sendApiError(res, 404, "Asset 不存在");
     return res.json({ ok: true, deleted: true });
   } catch (error) {
@@ -219,9 +251,9 @@ app.delete("/api/projects/:projectId/assets/:assetId", async (req, res) => {
 
 app.get("/api/projects/:projectId/tasks", async (req, res) => {
   try {
-    const project = await projectAssetService().getProject(req.params.projectId);
+    const project = await projectAssetService().getProject(req.params.projectId, req.user.id);
     if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
-    const tasks = await taskResultService().listProjectTasks(project.id);
+    const tasks = await taskResultService().listProjectTasks(project.id, req.user.id);
     return res.json({ ok: true, tasks });
   } catch (error) {
     return sendApiError(res, 500, `读取项目任务失败：${error.message}`);
@@ -230,11 +262,12 @@ app.get("/api/projects/:projectId/tasks", async (req, res) => {
 
 app.get("/api/tasks/:taskId", async (req, res) => {
   try {
-    const task = await taskResultService().getTask(req.params.taskId);
+    const task = await taskResultService().getTask(req.params.taskId, req.user.id);
     if (!task) return sendApiError(res, 404, "Task 不存在");
     const result = task.status === "success" && task.task_type === "generate_video"
-      ? await taskResultService().getResultByTask(task.id) : null;
-    return res.json(publicPersistedTask(task, result));
+      ? await taskResultService().getResultByTask(task.id, req.user.id) : null;
+    const safeResult = result ? await materializeResult(result) : null;
+    return res.json(publicPersistedTask(task, safeResult));
   } catch (error) {
     return sendApiError(res, 500, `读取 Task 失败：${error.message}`);
   }
@@ -242,10 +275,10 @@ app.get("/api/tasks/:taskId", async (req, res) => {
 
 app.get("/api/projects/:projectId/results", async (req, res) => {
   try {
-    const project = await projectAssetService().getProject(req.params.projectId);
+    const project = await projectAssetService().getProject(req.params.projectId, req.user.id);
     if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
-    const results = await taskResultService().listProjectResults(project.id);
-    return res.json({ ok: true, results });
+    const results = await taskResultService().listProjectResults(project.id, req.user.id);
+    return res.json({ ok: true, results: await Promise.all(results.map(materializeResult)) });
   } catch (error) {
     return sendApiError(res, 500, `读取项目结果失败：${error.message}`);
   }
@@ -253,7 +286,7 @@ app.get("/api/projects/:projectId/results", async (req, res) => {
 
 app.post("/api/tasks/:taskId/retry", async (req, res) => {
   try {
-    const task = await taskResultService().getTask(req.params.taskId);
+    const task = await taskResultService().getTask(req.params.taskId, req.user.id);
     if (!task) return sendApiError(res, 404, "Task 不存在");
     if (task.task_type !== "generate_video") return sendApiError(res, 409, "仅视频生成任务支持重新生成");
     if (!["failed", "timeout"].includes(task.status)) return sendApiError(res, 409, "只有失败或超时任务可以重新生成");
@@ -1111,6 +1144,8 @@ app.post("/api/video-to-text", upload.single("video"), async (req, res) => {
     const prompt = req.body.prompt || DEFAULT_PROMPT;
     const projectId = String(req.body.projectId || "").trim();
     if (!projectId) return sendApiError(res, 400, "缺少 projectId");
+    const ownedProject = await projectAssetService().getProject(projectId, req.user.id);
+    if (!ownedProject) return sendApiError(res, 404, "Project 不存在或无权访问");
     const videoPath = path.resolve(req.file.path);
     if (!fs.existsSync(videoPath)) {
       return sendApiError(res, 500, `上传视频文件不存在：${videoPath}`);
@@ -1118,6 +1153,7 @@ app.post("/api/video-to-text", upload.single("video"), async (req, res) => {
 
     const persistedTask = await taskResultService().createTask({
       projectId,
+      userId: req.user.id,
       taskType: "video_to_text",
       status: "analyzing",
       stage: "uploading_to_runninghub",
@@ -1125,6 +1161,7 @@ app.post("/api/video-to-text", upload.single("video"), async (req, res) => {
         prompt,
         originalAssetId: String(req.body.originalAssetId || "").trim(),
         originalVideoUrl: String(req.body.originalVideoUrl || "").trim(),
+        originalVideoPath: ownedProject.assets?.find((asset) => asset.id === ownedProject.original_asset_id)?.storage_path || "",
       },
     });
     const taskId = persistedTask.id;
@@ -1200,7 +1237,7 @@ app.get("/api/video-to-text-status", async (req, res) => {
   const taskId = typeof req.query.taskId === "string" ? req.query.taskId.trim() : "";
   if (!taskId) return sendApiError(res, 400, "缺少 taskId");
   try {
-    const task = await taskResultService().getTask(taskId);
+    const task = await taskResultService().getTask(taskId, req.user.id);
     if (!task || task.task_type !== "video_to_text") return sendApiError(res, 404, "未找到视频拆解任务");
     const payload = publicPersistedTask(task);
     if (task.status === "success") payload.result = task.output_data?.result;
@@ -1264,7 +1301,7 @@ app.post("/api/generate-video", upload.single("image"), async (req, res) => {
   const config = validateVideoConfig(req.body);
   const projectId = String(req.body.projectId || "").trim();
   if (!projectId) return sendApiError(res, 400, "缺少 projectId");
-  const project = await projectAssetService().getProject(projectId);
+  const project = await projectAssetService().getProject(projectId, req.user.id);
   if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
   const imagePath = path.resolve(req.file.path);
   if (!fs.existsSync(imagePath)) {
@@ -1273,6 +1310,7 @@ app.post("/api/generate-video", upload.single("image"), async (req, res) => {
 
   const persistedTask = await taskResultService().createTask({
     projectId,
+    userId: req.user.id,
     taskType: "generate_video",
     status: "queued",
     stage: "queued",
@@ -1283,6 +1321,7 @@ app.post("/api/generate-video", upload.single("image"), async (req, res) => {
       extraPrompt: req.body.extraPrompt || "",
       sourceVideoTaskId: String(req.body.sourceVideoTaskId || "").trim(),
       sourceVideoUrl: project.assets?.find((asset) => asset.id === project.original_asset_id)?.public_url || "",
+      sourceVideoStoragePath: project.assets?.find((asset) => asset.id === project.original_asset_id)?.storage_path || "",
       config: { model: config.model.id, modelLabel: config.model.label, ratio: config.ratio, resolution: config.resolution, duration: config.duration },
       clipStart: Number(req.body.clipStart) || 0,
       clipEnd: Number(req.body.clipEnd) || null,
@@ -1402,6 +1441,7 @@ app.post("/api/generate-video", upload.single("image"), async (req, res) => {
       task.result = finalResult;
       const resultAsset = await projectAssetService().uploadAsset({
         projectId,
+        userId: req.user.id,
         assetType: "result_video",
         file: {
           originalname: `${taskId}.mp4`, mimetype: "video/mp4",
@@ -1411,12 +1451,12 @@ app.post("/api/generate-video", upload.single("image"), async (req, res) => {
       let persistedResult;
       try {
         persistedResult = await taskResultService().createResult({
-          projectId, taskId, videoUrl: resultAsset.public_url, prompt,
+          projectId, userId: req.user.id, taskId, videoUrl: resultAsset.storage_path, prompt,
           modelName: config.model.label, modelParams: task.config,
           duration: Number(config.duration), cost: parsed.cost,
         });
       } catch (error) {
-        await projectAssetService().deleteAsset(projectId, resultAsset.id).catch(() => {});
+        await projectAssetService().deleteAsset(projectId, resultAsset.id, req.user.id).catch(() => {});
         throw error;
       }
       await taskResultService().updateTask(taskId, {
@@ -1461,32 +1501,32 @@ app.get("/api/generate-status", async (req, res) => {
   const taskId = typeof req.query.taskId === "string" ? req.query.taskId.trim() : "";
   if (!taskId) return sendApiError(res, 400, "缺少 taskId");
   try {
-    const task = await taskResultService().getTask(taskId);
+    const task = await taskResultService().getTask(taskId, req.user.id);
     if (!task || task.task_type !== "generate_video") return sendApiError(res, 404, "未找到生成任务");
-    const result = task.status === "success" ? await taskResultService().getResultByTask(task.id) : null;
-    return res.json(publicPersistedTask(task, result));
+    const result = task.status === "success" ? await taskResultService().getResultByTask(task.id, req.user.id) : null;
+    return res.json(publicPersistedTask(task, result ? await materializeResult(result) : null));
   } catch (error) {
     return sendApiError(res, 500, `查询生成任务失败：${error.message}`);
   }
 });
 
-app.get("/api/download-video", (req, res) => {
+app.get("/api/download-video", async (req, res) => {
   try {
-    const rawVideoUrl = typeof req.query.videoUrl === "string" ? req.query.videoUrl : "";
+    const projectId = typeof req.query.projectId === "string" ? req.query.projectId.trim() : "";
     const version = typeof req.query.version === "string" ? req.query.version.trim() : "";
-    if (!rawVideoUrl) return sendApiError(res, 400, "缺少视频地址");
+    if (!projectId) return sendApiError(res, 400, "缺少 projectId");
     if (!/^V\d+$/.test(version)) return sendApiError(res, 400, "版本号无效");
-    const parsedUrl = new URL(rawVideoUrl, "http://localhost");
-    if (!parsedUrl.pathname.startsWith("/generated/")) {
-      return sendApiError(res, 400, "仅支持导出真实生成视频");
-    }
-    const filename = path.basename(decodeURIComponent(parsedUrl.pathname));
-    if (!/^[a-zA-Z0-9._-]+\.mp4$/i.test(filename)) {
-      return sendApiError(res, 400, "视频文件名无效");
-    }
-    const filePath = path.join("/tmp/openclaw/rh-output", filename);
-    if (!fs.existsSync(filePath)) return sendApiError(res, 404, "视频文件不存在或已过期");
-    return res.download(filePath, `爆款实验室_${version}.mp4`);
+    const project = await projectAssetService().getProject(projectId, req.user.id);
+    if (!project) return sendApiError(res, 404, "Project 不存在或无权访问");
+    const results = await taskResultService().listProjectResults(projectId, req.user.id);
+    const result = results.find((item) => Number(item.version) === Number(version.slice(1)));
+    if (!result) return sendApiError(res, 404, "生成版本不存在");
+    const safeResult = await materializeResult(result);
+    const response = await fetch(safeResult.video_url);
+    if (!response.ok) return sendApiError(res, 502, `读取生成视频失败：HTTP ${response.status}`);
+    res.setHeader("Content-Type", response.headers.get("content-type") || "video/mp4");
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(`爆款实验室_${version}.mp4`)}`);
+    return res.send(Buffer.from(await response.arrayBuffer()));
   } catch (err) {
     return sendApiError(res, 500, getErrorMessage(err, "视频导出失败"));
   }
@@ -1761,7 +1801,10 @@ async function recoverVideoToTextTask(task) {
   const rawResult = formatRunningHubTextResult(final);
   const cleanedResult = cleanBreakdownForResponse(rawResult);
   let result = cleanedResult;
-  const originalVideoUrl = task.input_data?.originalVideoUrl;
+  let originalVideoUrl = task.input_data?.originalVideoUrl;
+  if (task.input_data?.originalVideoPath) {
+    originalVideoUrl = (await projectAssetService().signedAsset({ storage_path: task.input_data.originalVideoPath })).signed_url;
+  }
   if (originalVideoUrl) {
     try {
       const videoPath = await downloadRemoteFile(
@@ -1793,8 +1836,12 @@ async function recoverGenerationTask(task) {
   if (!parsed.outputFile) throw new Error("恢复生成任务后未返回输出视频文件");
   let sourceVideoPath = "";
   try {
+    let sourceVideoUrl = task.input_data?.sourceVideoUrl;
+    if (task.input_data?.sourceVideoStoragePath) {
+      sourceVideoUrl = (await projectAssetService().signedAsset({ storage_path: task.input_data.sourceVideoStoragePath })).signed_url;
+    }
     sourceVideoPath = await downloadRemoteFile(
-      task.input_data?.sourceVideoUrl,
+      sourceVideoUrl,
       path.join("/tmp/openclaw/rh-recovery", `${task.id}-source.mp4`)
     );
   } catch (error) {
@@ -1807,6 +1854,7 @@ async function recoverGenerationTask(task) {
   );
   const resultAsset = await projectAssetService().uploadAsset({
     projectId: task.project_id,
+    userId: task.user_id,
     assetType: "result_video",
     file: {
       originalname: `${task.id}.mp4`, mimetype: "video/mp4",
@@ -1816,12 +1864,12 @@ async function recoverGenerationTask(task) {
   let result;
   try {
     result = await taskResultService().createResult({
-      projectId: task.project_id, taskId: task.id, videoUrl: resultAsset.public_url,
+      projectId: task.project_id, userId: task.user_id, taskId: task.id, videoUrl: resultAsset.storage_path,
       prompt: task.input_data?.prompt || "", modelName: config.modelLabel || config.model || "",
       modelParams: config, duration: Number(config.duration) || null, cost: parsed.cost,
     });
   } catch (error) {
-    await projectAssetService().deleteAsset(task.project_id, resultAsset.id).catch(() => {});
+    await projectAssetService().deleteAsset(task.project_id, resultAsset.id, task.user_id).catch(() => {});
     throw error;
   }
   await taskResultService().updateTask(task.id, {
