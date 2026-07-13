@@ -12,7 +12,10 @@ import BottomControls from './components/BottomControls.vue'
 import BreakdownModal from './components/BreakdownModal.vue'
 import ResultCard from './components/ResultCard.vue'
 import ViralLabTestBench from './components/ViralLabTestBench.vue'
-import { apiUrl, toBackendUrl, deleteProjectAsset, getProject, persistOriginalVideo } from './api.js'
+import {
+  apiUrl, toBackendUrl, deleteProjectAsset, getProject, getProjectResults,
+  getProjectTasks, getTask, persistOriginalVideo, retryTask,
+} from './api.js'
 import { useCanvasNodes } from './composables/useCanvasNodes.js'
 import { cleanBreakdownResult } from './utils/cleanBreakdown.js'
 
@@ -59,6 +62,7 @@ const generationElapsed = ref('0秒')
 const generationTaskId = ref('')
 const generationStatus = ref('')
 const pendingVersionId = ref('')
+const lastFailedTaskId = ref('')
 let generationTimer = null
 const resultParams = reactive({
   ratio: '9:16',
@@ -147,11 +151,118 @@ function isRealDemoVersion(version) {
   return !isMockId
     && Boolean(asString(version.taskId))
     && Boolean(asString(version.videoUrl))
-    && version.resultSource === 'generate-status'
+    && ['generate-status', 'database'].includes(version.resultSource)
 }
 
 function mapReplacementTypeToGroup(type) {
   return { subject: '主体', scene: '场景', element: '元素' }[type] || ''
+}
+
+function hydratePersistedResults(results) {
+  versions.value = (Array.isArray(results) ? results : []).map((result) => ({
+    id: `V${result.version}`,
+    taskId: result.task_id,
+    resultId: result.id,
+    resultSource: 'database',
+    videoUrl: toBackendUrl(result.video_url),
+    prompt: result.prompt || '',
+    summary: [],
+    params: result.model_params || {},
+    ratio: result.model_params?.ratio || '9:16',
+    quality: result.model_params?.resolution || '720p',
+    duration: result.duration ? `${Number(result.duration)}s` : '',
+    model: result.model_name || '',
+    cost: result.cost || '',
+    status: '已生成',
+    createdAt: result.created_at,
+    time: result.created_at ? new Date(result.created_at).toLocaleString('zh-CN', { hour12: false }) : '',
+    saved: false,
+  }))
+  currentVersionId.value = versions.value[versions.value.length - 1]?.id || ''
+}
+
+async function pollRestoredTask(task) {
+  const deadline = Date.now() + 20 * 60 * 1000
+  while (Date.now() < deadline) {
+    const data = await getTask(task.id)
+    if (data.status === 'success') {
+      if (data.taskType === 'generate_video') {
+        const resultsData = await getProjectResults(projectId.value)
+        hydratePersistedResults(resultsData.results)
+        generationStatus.value = 'success'
+        generateError.value = ''
+      } else {
+        videoToTextResult.value = data
+        const parsed = parseBreakdownResult(data.result)
+        breakdownData.value = parsed
+        customItems.value = buildCustomItems(parsed)
+        flowMode.value = 'customizing'
+      }
+      return
+    }
+    if (['failed', 'timeout', 'cancelled'].includes(data.status)) {
+      const message = data.error || '任务失败'
+      if (data.taskType === 'generate_video') {
+        generationStatus.value = data.status
+        generateError.value = message
+        lastFailedTaskId.value = data.taskId
+      } else {
+        errorMsg.value = message
+        flowMode.value = 'error'
+      }
+      return
+    }
+    await new Promise((resolve) => setTimeout(resolve, 4000))
+  }
+}
+
+async function restoreProjectTasksAndResults() {
+  const [tasksData, resultsData] = await Promise.all([
+    getProjectTasks(projectId.value),
+    getProjectResults(projectId.value),
+  ])
+  hydratePersistedResults(resultsData.results)
+  const tasks = Array.isArray(tasksData.tasks) ? tasksData.tasks : []
+  const latestSuccessfulBreakdown = tasks.find((task) =>
+    task.task_type === 'video_to_text' && task.status === 'success' && task.output_data?.result
+  )
+  if (latestSuccessfulBreakdown) {
+    const result = latestSuccessfulBreakdown.output_data.result
+    videoToTextResult.value = {
+      taskId: latestSuccessfulBreakdown.id,
+      status: 'success',
+      result,
+      rawResult: latestSuccessfulBreakdown.output_data.rawResult,
+    }
+    breakdownData.value = parseBreakdownResult(result)
+    flowMode.value = 'customizing'
+  }
+  const failedGeneration = tasks.find((task) =>
+    task.task_type === 'generate_video' && ['failed', 'timeout'].includes(task.status)
+  )
+  if (failedGeneration) {
+    lastFailedTaskId.value = failedGeneration.id
+    generateError.value = failedGeneration.error_message || '上一次生成失败，可重新生成。'
+  }
+  const incomplete = tasks.filter((task) => ['created', 'queued', 'analyzing', 'generating'].includes(task.status))
+  incomplete.forEach((task) => {
+    if (task.task_type === 'generate_video') {
+      isGenerating.value = true
+      generationTaskId.value = task.id
+      generationStatus.value = task.status
+      generationPhase.value = task.stage || '正在恢复生成任务'
+      pendingVersionId.value = `V${versions.value.length + 1}`
+    } else {
+      flowMode.value = 'analyzing'
+      analysisStage.value = task.stage || '正在恢复视频拆解任务'
+    }
+    pollRestoredTask(task).finally(() => {
+      if (task.task_type === 'generate_video') {
+        isGenerating.value = false
+        pendingVersionId.value = ''
+      }
+    })
+  })
 }
 
 async function restoreProjectState() {
@@ -204,9 +315,10 @@ async function restoreProjectState() {
       })
     })
     customItems.value = restoredItems
-    // Task 持久化不在本轮范围；保留可生成的最小拆解容器，后续由 Task 恢复真实拆解结果。
+    // Task 恢复前先提供安全的最小容器，避免历史任务读取失败时页面黑屏。
     breakdownData.value = getEmptyBreakdownData('已恢复持久化项目')
     flowMode.value = 'customizing'
+    await restoreProjectTasksAndResults()
     demoStateRestored = true
   } catch (error) {
     console.warn('Project 恢复失败：', error)
@@ -886,6 +998,9 @@ async function handleUploaded(file) {
   try {
     const formData = new FormData()
     formData.append('video', file)
+    formData.append('projectId', projectId.value)
+    formData.append('originalAssetId', uploadedVideo.assetId)
+    formData.append('originalVideoUrl', uploadedVideo.assetUrl)
 
     const response = await fetch(apiUrl('/api/video-to-text'), {
       method: 'POST',
@@ -1244,7 +1359,16 @@ async function startGeneration(isRevise = false) {
   }
 }
 
-function handleGenerate() {
+async function handleGenerate() {
+  if (lastFailedTaskId.value) {
+    try {
+      await retryTask(lastFailedTaskId.value)
+      lastFailedTaskId.value = ''
+    } catch (error) {
+      generateError.value = `重新生成准备失败：${error.message}`
+      return
+    }
+  }
   return startGeneration(false)
 }
 
@@ -1330,6 +1454,7 @@ async function executeGenerate() {
 
     const formData = new FormData()
     formData.append('image', imageFile)
+    formData.append('projectId', projectId.value)
     formData.append('prompt', description)
     formData.append('breakdown', JSON.stringify(breakdownData.value))
     formData.append('replacements', JSON.stringify(changed.map((item) => ({
@@ -1407,7 +1532,7 @@ async function executeGenerate() {
     generationStatus.value = 'success'
 
     const version = {
-      id: nextVersionId,
+      id: data.version ? `V${data.version}` : nextVersionId,
       taskId,
       resultSource: 'generate-status',
       ...submittedParams,
@@ -1424,6 +1549,7 @@ async function executeGenerate() {
       saved: false,
     }
 
+    versions.value = versions.value.filter((item) => item.id !== version.id)
     versions.value.push(version)
     currentVersionId.value = version.id
     focusFlowNode(`result-${version.id}`)
@@ -1432,6 +1558,7 @@ async function executeGenerate() {
     console.error('视频生成失败：', error)
     const isTimeout = error.name === 'GenerationTimeoutError'
     generationStatus.value = isTimeout ? 'timeout' : 'failed'
+    lastFailedTaskId.value = generationTaskId.value || lastFailedTaskId.value
     generateError.value = isTimeout
       ? '生成超时，请稍后查看任务状态或重新生成'
       : error.message || '视频生成失败'

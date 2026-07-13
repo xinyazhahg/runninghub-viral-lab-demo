@@ -45,3 +45,19 @@ export function deleteProjectAsset(projectId, assetId) {
     method: 'DELETE',
   })
 }
+
+export function getProjectTasks(projectId) {
+  return requestJson(`/api/projects/${encodeURIComponent(projectId)}/tasks`)
+}
+
+export function getTask(taskId) {
+  return requestJson(`/api/tasks/${encodeURIComponent(taskId)}`)
+}
+
+export function getProjectResults(projectId) {
+  return requestJson(`/api/projects/${encodeURIComponent(projectId)}/results`)
+}
+
+export function retryTask(taskId) {
+  return requestJson(`/api/tasks/${encodeURIComponent(taskId)}/retry`, { method: 'POST' })
+}

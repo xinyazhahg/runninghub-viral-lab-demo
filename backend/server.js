@@ -8,6 +8,7 @@ const fs = require("fs");
 const https = require("https");
 const crypto = require("crypto");
 const { createProjectAssetService } = require("./services/projectAssetService");
+const { createTaskResultService } = require("./services/taskResultService");
 const FFMPEG_PATH = process.env.FFMPEG_PATH || require("ffmpeg-static");
 const FFPROBE_PATH = process.env.FFPROBE_PATH || require("ffprobe-static").path;
 for (const binaryPath of [FFMPEG_PATH, FFPROBE_PATH]) {
@@ -99,6 +100,10 @@ function runSingleUpload(fieldName, maxBytes, allowedMimePrefix) {
 
 function projectAssetService() {
   return createProjectAssetService();
+}
+
+function taskResultService() {
+  return createTaskResultService();
 }
 
 // 旧版前端静态托管：指向同级 react-old 目录
@@ -212,6 +217,53 @@ app.delete("/api/projects/:projectId/assets/:assetId", async (req, res) => {
   }
 });
 
+app.get("/api/projects/:projectId/tasks", async (req, res) => {
+  try {
+    const project = await projectAssetService().getProject(req.params.projectId);
+    if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
+    const tasks = await taskResultService().listProjectTasks(project.id);
+    return res.json({ ok: true, tasks });
+  } catch (error) {
+    return sendApiError(res, 500, `读取项目任务失败：${error.message}`);
+  }
+});
+
+app.get("/api/tasks/:taskId", async (req, res) => {
+  try {
+    const task = await taskResultService().getTask(req.params.taskId);
+    if (!task) return sendApiError(res, 404, "Task 不存在");
+    const result = task.status === "success" && task.task_type === "generate_video"
+      ? await taskResultService().getResultByTask(task.id) : null;
+    return res.json(publicPersistedTask(task, result));
+  } catch (error) {
+    return sendApiError(res, 500, `读取 Task 失败：${error.message}`);
+  }
+});
+
+app.get("/api/projects/:projectId/results", async (req, res) => {
+  try {
+    const project = await projectAssetService().getProject(req.params.projectId);
+    if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
+    const results = await taskResultService().listProjectResults(project.id);
+    return res.json({ ok: true, results });
+  } catch (error) {
+    return sendApiError(res, 500, `读取项目结果失败：${error.message}`);
+  }
+});
+
+app.post("/api/tasks/:taskId/retry", async (req, res) => {
+  try {
+    const task = await taskResultService().getTask(req.params.taskId);
+    if (!task) return sendApiError(res, 404, "Task 不存在");
+    if (task.task_type !== "generate_video") return sendApiError(res, 409, "仅视频生成任务支持重新生成");
+    if (!["failed", "timeout"].includes(task.status)) return sendApiError(res, 409, "只有失败或超时任务可以重新生成");
+    const updated = await taskResultService().updateTask(task.id, { retry_count: Number(task.retry_count || 0) + 1 });
+    return res.json({ ok: true, retry: true, projectId: task.project_id, task: updated, inputData: task.input_data });
+  } catch (error) {
+    return sendApiError(res, 500, `准备重新生成失败：${error.message}`);
+  }
+});
+
 const RUNNINGHUB_SKILL_DIR =
   process.env.RUNNINGHUB_SKILL_DIR ||
   path.join(os.homedir(), "Documents/ii/workspace-penguin/skills/runninghub");
@@ -277,6 +329,39 @@ function publicGenerationTask(taskId, task) {
     };
   }
   if (task.status === "failed") return { ...base, error: task.error };
+  return base;
+}
+
+function publicPersistedTask(task, result) {
+  const startedAt = task.started_at ? new Date(task.started_at).getTime() : Date.now();
+  const finishedAt = task.finished_at ? new Date(task.finished_at).getTime() : Date.now();
+  const base = {
+    ok: true,
+    taskId: task.id,
+    externalTaskId: task.external_task_id,
+    projectId: task.project_id,
+    taskType: task.task_type,
+    status: task.status,
+    stage: task.stage,
+    startedAt,
+    elapsed: Math.max(0, Math.floor((finishedAt - startedAt) / 1000)),
+  };
+  if (task.status === "success") {
+    const videoToTextResult = task.task_type === "video_to_text" ? task.output_data?.result : task.output_data;
+    return {
+      ...base,
+      result: videoToTextResult,
+      rawResult: task.task_type === "video_to_text" ? task.output_data?.rawResult : task.output_data,
+      videoUrl: result?.video_url || task.output_data?.videoUrl || "",
+      finalPrompt: result?.prompt || task.output_data?.finalPrompt || "",
+      cost: result?.cost || task.output_data?.cost || "",
+      config: result?.model_params || task.output_data?.config || {},
+      version: result?.version || null,
+    };
+  }
+  if (["failed", "timeout", "cancelled"].includes(task.status)) {
+    return { ...base, error: task.error_message || "任务失败", errorCode: task.error_code || "TASK_FAILED" };
+  }
   return base;
 }
 
@@ -511,7 +596,7 @@ async function uploadFileToRunningHub(apiKey, filePath) {
   throw new Error(`视频上传失败：${JSON.stringify(json)}`);
 }
 
-async function pollRunningHubTask(apiKey, taskId) {
+async function pollRunningHubTask(apiKey, taskId, onPoll) {
   const url = `${RH_BASE}${RH_POLL_ENDPOINT}`;
   let elapsed = 0;
   let consecutiveFailures = 0;
@@ -523,6 +608,7 @@ async function pollRunningHubTask(apiKey, taskId) {
     try {
       const json = await postRunningHubJson(apiKey, url, { taskId }, 30000);
       consecutiveFailures = 0;
+      if (onPoll) await onPoll(json);
 
       if (json.status === "SUCCESS") {
         return json;
@@ -563,7 +649,7 @@ function formatRunningHubTextResult(finalResult) {
   return lines.join("\n");
 }
 
-async function runVideoToTextDirect(apiKey, videoPath, prompt) {
+async function runVideoToTextDirect(apiKey, videoPath, prompt, onSubmitted, onPoll) {
   const videoUrl = await uploadFileToRunningHub(apiKey, videoPath);
   const submitResult = await postRunningHubJson(
     apiKey,
@@ -579,11 +665,12 @@ async function runVideoToTextDirect(apiKey, videoPath, prompt) {
   if (!taskId) {
     throw new Error(`未获取到 video-to-text taskId：${JSON.stringify(submitResult)}`);
   }
+  if (onSubmitted) await onSubmitted(taskId, submitResult);
 
   const finalResult =
     submitResult.status === "SUCCESS" && submitResult.results
       ? submitResult
-      : await pollRunningHubTask(apiKey, taskId);
+      : await pollRunningHubTask(apiKey, taskId, onPoll);
 
   return formatRunningHubTextResult(finalResult);
 }
@@ -610,7 +697,7 @@ function getRunningHubRunner() {
   );
 }
 
-function runRunningHubScript(args, label) {
+function runRunningHubScript(args, label, onStdout) {
   return new Promise((resolve, reject) => {
     let child;
     let stdout = "";
@@ -629,7 +716,9 @@ function runRunningHubScript(args, label) {
     }
 
     child.stdout?.on("data", (data) => {
-      stdout += data.toString();
+      const text = data.toString();
+      stdout += text;
+      if (onStdout) onStdout(text);
     });
 
     child.stderr?.on("data", (data) => {
@@ -1008,7 +1097,7 @@ const DEFAULT_PROMPT = `
 5. 不要编造视频中不存在的内容。
 `;
 
-app.post("/api/video-to-text", upload.single("video"), (req, res) => {
+app.post("/api/video-to-text", upload.single("video"), async (req, res) => {
   try {
     console.log("收到视频拆解请求：", req.file?.originalname, req.file?.size);
     if (!process.env.RUNNINGHUB_API_KEY) {
@@ -1020,12 +1109,25 @@ app.post("/api/video-to-text", upload.single("video"), (req, res) => {
     }
 
     const prompt = req.body.prompt || DEFAULT_PROMPT;
+    const projectId = String(req.body.projectId || "").trim();
+    if (!projectId) return sendApiError(res, 400, "缺少 projectId");
     const videoPath = path.resolve(req.file.path);
     if (!fs.existsSync(videoPath)) {
       return sendApiError(res, 500, `上传视频文件不存在：${videoPath}`);
     }
 
-    const taskId = crypto.randomUUID();
+    const persistedTask = await taskResultService().createTask({
+      projectId,
+      taskType: "video_to_text",
+      status: "analyzing",
+      stage: "uploading_to_runninghub",
+      inputData: {
+        prompt,
+        originalAssetId: String(req.body.originalAssetId || "").trim(),
+        originalVideoUrl: String(req.body.originalVideoUrl || "").trim(),
+      },
+    });
+    const taskId = persistedTask.id;
     const task = {
       taskId,
       status: "running",
@@ -1042,7 +1144,17 @@ app.post("/api/video-to-text", upload.single("video"), (req, res) => {
     console.log("开始后台执行 RunningHub video-to-text，本地 taskId:", taskId);
     res.status(202).json({ ok: true, status: "running", taskId });
 
-    runVideoToTextDirect(process.env.RUNNINGHUB_API_KEY, videoPath, prompt)
+    runVideoToTextDirect(
+      process.env.RUNNINGHUB_API_KEY,
+      videoPath,
+      prompt,
+      async (externalTaskId) => taskResultService().updateTask(taskId, {
+        external_task_id: externalTaskId,
+        status: "analyzing",
+        stage: "analyzing",
+      }),
+      async () => taskResultService().updateTask(taskId, { status: "analyzing", stage: "polling" })
+    )
       .then(async (result) => {
         task.rawResult = result;
         const cleanedResult = cleanBreakdownForResponse(result);
@@ -1056,13 +1168,26 @@ app.post("/api/video-to-text", upload.single("video"), (req, res) => {
         task.finishedAt = Date.now();
         task.elapsed = videoToTextTaskElapsed(task);
         task.result = enrichedResult;
+        await taskResultService().updateTask(taskId, {
+          status: "success",
+          stage: "completed",
+          output_data: { result: enrichedResult, rawResult: result },
+          error_code: null,
+          error_message: null,
+        });
         console.log("video-to-text 后台任务成功：", taskId);
       })
-      .catch((err) => {
+      .catch(async (err) => {
         task.status = "failed";
         task.finishedAt = Date.now();
         task.elapsed = videoToTextTaskElapsed(task);
         task.error = `RunningHub video-to-text 调用失败：${getErrorMessage(err, "未知错误")}`;
+        await taskResultService().updateTask(taskId, {
+          status: /超时|timeout/i.test(task.error) ? "timeout" : "failed",
+          stage: "failed",
+          error_code: /超时|timeout/i.test(task.error) ? "TASK_TIMEOUT" : "RUNNINGHUB_ERROR",
+          error_message: task.error,
+        }).catch((persistError) => console.error("video-to-text 失败状态持久化失败：", persistError));
         console.error("video-to-text 后台任务失败：", taskId, err);
       });
   } catch (err) {
@@ -1071,13 +1196,18 @@ app.post("/api/video-to-text", upload.single("video"), (req, res) => {
   }
 });
 
-app.get("/api/video-to-text-status", (req, res) => {
+app.get("/api/video-to-text-status", async (req, res) => {
   const taskId = typeof req.query.taskId === "string" ? req.query.taskId.trim() : "";
   if (!taskId) return sendApiError(res, 400, "缺少 taskId");
-  const task = videoToTextTasks.get(taskId);
-  if (!task) return sendApiError(res, 404, "未找到视频拆解任务");
-  task.elapsed = videoToTextTaskElapsed(task);
-  return res.json(publicVideoToTextTask(task));
+  try {
+    const task = await taskResultService().getTask(taskId);
+    if (!task || task.task_type !== "video_to_text") return sendApiError(res, 404, "未找到视频拆解任务");
+    const payload = publicPersistedTask(task);
+    if (task.status === "success") payload.result = task.output_data?.result;
+    return res.json(payload);
+  } catch (error) {
+    return sendApiError(res, 500, `查询视频拆解任务失败：${error.message}`);
+  }
 });
 
 app.get("/api/generate-config", (req, res) => {
@@ -1113,7 +1243,7 @@ app.post("/api/generate-price", async (req, res) => {
   }
 });
 
-app.post("/api/generate-video", upload.single("image"), (req, res) => {
+app.post("/api/generate-video", upload.single("image"), async (req, res) => {
   try {
   if (!process.env.RUNNINGHUB_API_KEY) {
     return sendApiError(res, 500, "后端未配置 RunningHub API Key");
@@ -1132,16 +1262,48 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
     req.body.prompt
   );
   const config = validateVideoConfig(req.body);
+  const projectId = String(req.body.projectId || "").trim();
+  if (!projectId) return sendApiError(res, 400, "缺少 projectId");
+  const project = await projectAssetService().getProject(projectId);
+  if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
   const imagePath = path.resolve(req.file.path);
   if (!fs.existsSync(imagePath)) {
     return sendApiError(res, 500, `上传图片文件不存在：${imagePath}`);
   }
 
-  const taskId = crypto.randomUUID();
+  const persistedTask = await taskResultService().createTask({
+    projectId,
+    taskType: "generate_video",
+    status: "queued",
+    stage: "queued",
+    inputData: {
+      prompt,
+      breakdown,
+      replacements,
+      extraPrompt: req.body.extraPrompt || "",
+      sourceVideoTaskId: String(req.body.sourceVideoTaskId || "").trim(),
+      sourceVideoUrl: project.assets?.find((asset) => asset.id === project.original_asset_id)?.public_url || "",
+      config: { model: config.model.id, modelLabel: config.model.label, ratio: config.ratio, resolution: config.resolution, duration: config.duration },
+      clipStart: Number(req.body.clipStart) || 0,
+      clipEnd: Number(req.body.clipEnd) || null,
+    },
+  });
+  const taskId = persistedTask.id;
   const generatedOutputFile = path.join("/tmp/openclaw/rh-output", `${taskId}-video.mp4`);
   const finalOutputFile = path.join("/tmp/openclaw/rh-output", `${taskId}.mp4`);
   const sourceVideoTaskId = String(req.body.sourceVideoTaskId || "").trim();
-  const sourceVideoPath = videoToTextTasks.get(sourceVideoTaskId)?.videoPath || "";
+  let sourceVideoPath = videoToTextTasks.get(sourceVideoTaskId)?.videoPath || "";
+  const sourceVideoUrl = project.assets?.find((asset) => asset.id === project.original_asset_id)?.public_url || "";
+  if (!sourceVideoPath && sourceVideoUrl) {
+    try {
+      sourceVideoPath = await downloadRemoteFile(
+        sourceVideoUrl,
+        path.join("/tmp/openclaw/rh-source", `${taskId}-source.mp4`)
+      );
+    } catch (error) {
+      console.warn("持久化原视频下载失败，将生成无音频版本：", error.message);
+    }
+  }
   const clipStart = Math.max(0, Number(req.body.clipStart) || 0);
   const requestedClipEnd = Number(req.body.clipEnd);
   const clipEnd = Number.isFinite(requestedClipEnd) && requestedClipEnd > clipStart
@@ -1198,10 +1360,23 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
 
   console.log("收到视频生成请求：", req.file?.originalname, req.file?.size, "本地 taskId:", taskId);
   console.log("[generate-video] final prompt:", prompt);
+  let externalTaskBuffer = "";
+  let externalTaskUpdate = Promise.resolve();
+  await taskResultService().updateTask(taskId, { status: "generating", stage: "submitting" });
   res.status(202).json({ ok: true, status: "running", taskId });
-
-  runRunningHubScript(args, `RunningHub image-to-video ${taskId}`)
+  runRunningHubScript(args, `RunningHub image-to-video ${taskId}`, (text) => {
+    externalTaskBuffer += text;
+    const externalTaskId = externalTaskBuffer.match(/TASK_ID:([^\s]+)/)?.[1];
+    if (externalTaskId) {
+      externalTaskUpdate = taskResultService().updateTask(taskId, {
+        external_task_id: externalTaskId,
+        status: "generating",
+        stage: "polling",
+      }).catch((error) => console.error("生成任务 external_task_id 持久化失败：", error));
+    }
+  })
     .then(async (stdout) => {
+      await externalTaskUpdate;
       const parsed = parseGenerationOutput(stdout);
       if (!parsed.outputFile || !parsed.videoUrl) {
         throw new Error("RunningHub 生成完成但未返回输出视频文件");
@@ -1225,13 +1400,54 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
       task.outputFile = outputFile;
       task.cost = parsed.cost;
       task.result = finalResult;
+      const resultAsset = await projectAssetService().uploadAsset({
+        projectId,
+        assetType: "result_video",
+        file: {
+          originalname: `${taskId}.mp4`, mimetype: "video/mp4",
+          size: fs.statSync(outputFile).size, buffer: fs.readFileSync(outputFile),
+        },
+      });
+      let persistedResult;
+      try {
+        persistedResult = await taskResultService().createResult({
+          projectId, taskId, videoUrl: resultAsset.public_url, prompt,
+          modelName: config.model.label, modelParams: task.config,
+          duration: Number(config.duration), cost: parsed.cost,
+        });
+      } catch (error) {
+        await projectAssetService().deleteAsset(projectId, resultAsset.id).catch(() => {});
+        throw error;
+      }
+      await taskResultService().updateTask(taskId, {
+        status: "success",
+        stage: "completed",
+        output_data: {
+          videoUrl: resultAsset.public_url,
+          assetId: resultAsset.id,
+          finalPrompt: prompt,
+          cost: parsed.cost,
+          config: task.config,
+          version: persistedResult.version,
+        },
+        error_code: null,
+        error_message: null,
+      });
+      task.videoUrl = resultAsset.public_url;
       console.log("generate-video 后台任务成功：", taskId, outputFile);
     })
-    .catch((err) => {
+    .catch(async (err) => {
       task.status = "failed";
       task.finishedAt = Date.now();
       task.elapsed = generationTaskElapsed(task);
       task.error = getErrorMessage(err, "RunningHub 视频生成失败");
+      const timedOut = /超时|timeout/i.test(task.error);
+      await taskResultService().updateTask(taskId, {
+        status: timedOut ? "timeout" : "failed",
+        stage: "failed",
+        error_code: timedOut ? "TASK_TIMEOUT" : "RUNNINGHUB_ERROR",
+        error_message: task.error,
+      }).catch((persistError) => console.error("generate-video 失败状态持久化失败：", persistError));
       console.error("generate-video 后台任务失败：", taskId, err);
     });
   } catch (err) {
@@ -1241,13 +1457,17 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
   }
 });
 
-app.get("/api/generate-status", (req, res) => {
+app.get("/api/generate-status", async (req, res) => {
   const taskId = typeof req.query.taskId === "string" ? req.query.taskId.trim() : "";
   if (!taskId) return sendApiError(res, 400, "缺少 taskId");
-  const task = generationTasks.get(taskId);
-  if (!task) return sendApiError(res, 404, "未找到生成任务");
-  task.elapsed = generationTaskElapsed(task);
-  return res.json(publicGenerationTask(taskId, task));
+  try {
+    const task = await taskResultService().getTask(taskId);
+    if (!task || task.task_type !== "generate_video") return sendApiError(res, 404, "未找到生成任务");
+    const result = task.status === "success" ? await taskResultService().getResultByTask(task.id) : null;
+    return res.json(publicPersistedTask(task, result));
+  } catch (error) {
+    return sendApiError(res, 500, `查询生成任务失败：${error.message}`);
+  }
 });
 
 app.get("/api/download-video", (req, res) => {
@@ -1525,6 +1745,120 @@ app.post("/api/extract-element-preview", upload.single("image"), async (req, res
   }
 });
 
+async function downloadRemoteFile(url, outputPath) {
+  if (!url) return "";
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`下载持久化原视频失败：HTTP ${response.status}`);
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  fs.writeFileSync(outputPath, Buffer.from(await response.arrayBuffer()));
+  return outputPath;
+}
+
+async function recoverVideoToTextTask(task) {
+  const final = await pollRunningHubTask(process.env.RUNNINGHUB_API_KEY, task.external_task_id, async () => {
+    await taskResultService().updateTask(task.id, { status: "analyzing", stage: "polling_after_restart" });
+  });
+  const rawResult = formatRunningHubTextResult(final);
+  const cleanedResult = cleanBreakdownForResponse(rawResult);
+  let result = cleanedResult;
+  const originalVideoUrl = task.input_data?.originalVideoUrl;
+  if (originalVideoUrl) {
+    try {
+      const videoPath = await downloadRemoteFile(
+        originalVideoUrl,
+        path.join("/tmp/openclaw/rh-recovery", `${task.id}-source.mp4`)
+      );
+      result = await generateBreakdownPreviews(cleanedResult, videoPath, task.id);
+    } catch (error) {
+      console.warn("恢复拆解任务预览生成失败，保留文字拆解结果：", error.message);
+    }
+  }
+  await taskResultService().updateTask(task.id, {
+    status: "success", stage: "completed", output_data: { result, rawResult },
+    error_code: null, error_message: null,
+  });
+}
+
+async function recoverGenerationTask(task) {
+  const config = task.input_data?.config || {};
+  const generatedOutputFile = path.join("/tmp/openclaw/rh-output", `${task.id}-video.mp4`);
+  const finalOutputFile = path.join("/tmp/openclaw/rh-output", `${task.id}.mp4`);
+  const args = [
+    "scripts/runninghub.js", "--resume-task-id", task.external_task_id,
+    "--endpoint", VIDEO_ENDPOINT, "--output", generatedOutputFile,
+  ];
+  await taskResultService().updateTask(task.id, { status: "generating", stage: "polling_after_restart" });
+  const stdout = await runRunningHubScript(args, `恢复 RunningHub image-to-video ${task.id}`);
+  const parsed = parseGenerationOutput(stdout);
+  if (!parsed.outputFile) throw new Error("恢复生成任务后未返回输出视频文件");
+  let sourceVideoPath = "";
+  try {
+    sourceVideoPath = await downloadRemoteFile(
+      task.input_data?.sourceVideoUrl,
+      path.join("/tmp/openclaw/rh-recovery", `${task.id}-source.mp4`)
+    );
+  } catch (error) {
+    console.warn("恢复任务原视频下载失败，将保留无音频结果：", error.message);
+  }
+  const outputFile = await mergeOriginalAudio(
+    parsed.outputFile, sourceVideoPath, finalOutputFile,
+    Number(task.input_data?.clipStart) || 0,
+    Number(task.input_data?.clipEnd) || Number(config.duration) || 10
+  );
+  const resultAsset = await projectAssetService().uploadAsset({
+    projectId: task.project_id,
+    assetType: "result_video",
+    file: {
+      originalname: `${task.id}.mp4`, mimetype: "video/mp4",
+      size: fs.statSync(outputFile).size, buffer: fs.readFileSync(outputFile),
+    },
+  });
+  let result;
+  try {
+    result = await taskResultService().createResult({
+      projectId: task.project_id, taskId: task.id, videoUrl: resultAsset.public_url,
+      prompt: task.input_data?.prompt || "", modelName: config.modelLabel || config.model || "",
+      modelParams: config, duration: Number(config.duration) || null, cost: parsed.cost,
+    });
+  } catch (error) {
+    await projectAssetService().deleteAsset(task.project_id, resultAsset.id).catch(() => {});
+    throw error;
+  }
+  await taskResultService().updateTask(task.id, {
+    status: "success", stage: "completed",
+    output_data: {
+      videoUrl: resultAsset.public_url, assetId: resultAsset.id,
+      finalPrompt: task.input_data?.prompt || "", cost: parsed.cost,
+      config, version: result.version,
+    },
+    error_code: null, error_message: null,
+  });
+}
+
+async function recoverIncompleteTasks() {
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY || !process.env.RUNNINGHUB_API_KEY) return;
+  const tasks = await taskResultService().listIncompleteTasks();
+  for (const task of tasks) {
+    if (!task.external_task_id) {
+      await taskResultService().updateTask(task.id, {
+        status: "failed", stage: "restart_recovery_failed",
+        error_code: "MISSING_EXTERNAL_TASK_ID",
+        error_message: "服务重启前第三方任务尚未成功提交，请重新执行。",
+      });
+      continue;
+    }
+    const recover = task.task_type === "video_to_text" ? recoverVideoToTextTask : recoverGenerationTask;
+    recover(task).catch(async (error) => {
+      const timedOut = /超时|timeout/i.test(error.message || "");
+      await taskResultService().updateTask(task.id, {
+        status: timedOut ? "timeout" : "failed", stage: "restart_recovery_failed",
+        error_code: timedOut ? "TASK_TIMEOUT" : "RECOVERY_FAILED",
+        error_message: getErrorMessage(error, "任务恢复失败"),
+      }).catch(() => {});
+    });
+  }
+}
+
 app.use((err, req, res, next) => {
   console.error("后端接口未捕获错误：", err);
   if (res.headersSent) {
@@ -1535,4 +1869,5 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`爆款实验室服务已启动：http://localhost:${PORT}`);
+  recoverIncompleteTasks().catch((error) => console.error("未完成任务恢复扫描失败：", error));
 });
