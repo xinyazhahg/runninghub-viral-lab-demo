@@ -11,6 +11,7 @@ const { createProjectAssetService } = require("./services/projectAssetService");
 const { createTaskResultService } = require("./services/taskResultService");
 const { createRequireAuth } = require("./services/authService");
 const { buildPersistedGenerationConfig } = require("./lib/generationConfig");
+const { normalizeMultipartFilename } = require("./lib/filenameEncoding");
 const FFMPEG_PATH = process.env.FFMPEG_PATH || require("ffmpeg-static");
 const FFPROBE_PATH = process.env.FFPROBE_PATH || require("ffprobe-static").path;
 for (const binaryPath of [FFMPEG_PATH, FFPROBE_PATH]) {
@@ -81,12 +82,19 @@ function applyCorsHeaders(req, res) {
 
 // uploads 目录：优先用环境变量，默认用 backend 目录下的 uploads
 const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(__dirname, "uploads");
-const upload = multer({ dest: UPLOADS_DIR });
+function normalizeUploadedFile(req, file, callback) {
+  file.originalname = normalizeMultipartFilename(file.originalname);
+  callback(null, true);
+}
+
+const upload = multer({ dest: UPLOADS_DIR, fileFilter: normalizeUploadedFile });
 const ORIGINAL_VIDEO_MAX_BYTES = 500 * 1024 * 1024;
 const REPLACEMENT_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
 
 function runSingleUpload(fieldName, maxBytes, allowedMimePrefix) {
-  const middleware = multer({ storage: multer.memoryStorage(), limits: { fileSize: maxBytes } }).single(fieldName);
+  const middleware = multer({
+    storage: multer.memoryStorage(), limits: { fileSize: maxBytes }, fileFilter: normalizeUploadedFile,
+  }).single(fieldName);
   return (req, res, next) => middleware(req, res, (error) => {
     if (error) return sendApiError(res, 400, `文件上传失败：${error.message}`);
     if (!req.file) return sendApiError(res, 400, "没有收到上传文件");

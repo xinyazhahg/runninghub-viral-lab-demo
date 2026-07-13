@@ -1,6 +1,7 @@
 const crypto = require("crypto");
 const path = require("path");
 const { getSupabaseClient, getStorageBucket } = require("../lib/supabase");
+const { normalizeMultipartFilename } = require("../lib/filenameEncoding");
 
 const PROJECT_STATUSES = new Set(["draft", "analyzing", "customizing", "completed", "error"]);
 const REPLACEMENT_TYPES = new Set(["subject", "scene", "element"]);
@@ -29,8 +30,9 @@ function createProjectAssetService({ client = getSupabaseClient(), bucket = getS
 
   async function createProject({ name, userId, status = "draft" }) {
     if (!PROJECT_STATUSES.has(status)) throw new Error("项目状态无效");
+    const normalizedName = normalizeMultipartFilename(name);
     const { data, error } = await client.from("projects")
-      .insert({ name: String(name || "未命名项目").trim() || "未命名项目", user_id: userId, status }).select("*").single();
+      .insert({ name: String(normalizedName || "未命名项目").trim() || "未命名项目", user_id: userId, status }).select("*").single();
     if (error) throw error;
     return data;
   }
@@ -51,7 +53,8 @@ function createProjectAssetService({ client = getSupabaseClient(), bucket = getS
   async function uploadAsset({ projectId, userId, file, assetType, replacementType = null }) {
     if (!file?.buffer?.length) throw new Error("上传文件为空");
     if (assetType === "replacement_image") assertReplacementType(replacementType);
-    const storagePath = `${projectId}/${assetType}/${sanitizeFilename(file.originalname)}`;
+    const originalFilename = normalizeMultipartFilename(file.originalname);
+    const storagePath = `${projectId}/${assetType}/${sanitizeFilename(originalFilename)}`;
     const storage = client.storage.from(bucket);
     const { error: uploadError } = await storage.upload(storagePath, file.buffer, {
       contentType: file.mimetype, upsert: false,
@@ -59,7 +62,7 @@ function createProjectAssetService({ client = getSupabaseClient(), bucket = getS
     if (uploadError) throw uploadError;
     const record = {
       project_id: projectId, user_id: userId, asset_type: assetType, replacement_type: replacementType,
-      original_filename: file.originalname, mime_type: file.mimetype, file_size: file.size,
+      original_filename: originalFilename, mime_type: file.mimetype, file_size: file.size,
       storage_path: storagePath, public_url: null, status: "active",
     };
     const { data, error: insertError } = await client.from("assets").insert(record).select("*").single();
