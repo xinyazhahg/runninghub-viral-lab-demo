@@ -20,12 +20,13 @@ function createRequireAuth({ serviceFactory = () => createAuthService() } = {}) 
     try {
       const token = extractBearerToken(req.headers.authorization);
       const user = await serviceFactory().getUser(token);
-      if (!user) return res.status(401).json({ ok: false, error: "UNAUTHORIZED", message: "登录状态无效或已过期" });
+      if (!token) return res.status(401).json({ ok: false, error: "AUTH_REQUIRED", code: "AUTH_REQUIRED", message: "请先登录后继续操作", requestId: res.locals?.requestId });
+      if (!user) return res.status(401).json({ ok: false, error: "AUTH_INVALID", code: "AUTH_INVALID", message: "登录状态无效或已过期", requestId: res.locals?.requestId });
       req.user = user;
       req.accessToken = token;
       return next();
     } catch (error) {
-      return res.status(401).json({ ok: false, error: "UNAUTHORIZED", message: `身份验证失败：${error.message}` });
+      return res.status(401).json({ ok: false, error: "AUTH_INVALID", code: "AUTH_INVALID", message: "身份验证失败，请重新登录", requestId: res.locals?.requestId });
     }
   };
 }

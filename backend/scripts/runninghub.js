@@ -458,8 +458,10 @@ async function pollTask(apiKey, taskId) {
       consecutiveFailures = 0;
     } catch (_) {
       consecutiveFailures += 1;
-      process.stdout.write("x");
+      process.stdout.write(`\nRETRY_ATTEMPT:${consecutiveFailures}\n`);
       if (consecutiveFailures >= 5) fail("Too many consecutive poll failures");
+      const backoffMs = Math.min(8000, 1000 * (2 ** (consecutiveFailures - 1))) + Math.floor(Math.random() * 250);
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
       continue;
     }
 

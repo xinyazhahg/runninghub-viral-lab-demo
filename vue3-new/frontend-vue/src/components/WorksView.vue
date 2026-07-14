@@ -1,8 +1,12 @@
 <script setup>
 import { ref } from 'vue'
 
-defineProps({ projects: { type: Array, default: () => [] }, loading: Boolean, error: String })
-const emit = defineEmits(['open', 'delete', 'back', 'cover-error'])
+defineProps({
+  projects: { type: Array, default: () => [] }, loading: Boolean, error: String,
+  openingProjectId: { type: String, default: '' },
+  deletingProjectId: { type: String, default: '' },
+})
+const emit = defineEmits(['open', 'history', 'delete', 'back', 'cover-error'])
 
 const failedCovers = ref(new Set())
 
@@ -65,9 +69,15 @@ function markCoverFailed(project) {
           </dl>
         </div>
         <footer class="actions">
-          <button class="open" @click="$emit('open', project)">继续编辑</button>
-          <button @click="$emit('open', project)">历史版本</button>
-          <button class="delete" @click="$emit('delete', project)">删除</button>
+          <button class="open" :disabled="!!openingProjectId || !!deletingProjectId" @click="$emit('open', project)">
+            {{ openingProjectId === project.id ? '正在打开…' : '继续编辑' }}
+          </button>
+          <button :disabled="!!openingProjectId || !!deletingProjectId" @click="$emit('history', project)">
+            {{ openingProjectId === project.id ? '加载中…' : '历史版本' }}
+          </button>
+          <button class="delete" :disabled="!!openingProjectId || !!deletingProjectId" @click="$emit('delete', project)">
+            {{ deletingProjectId === project.id ? '正在删除…' : '删除' }}
+          </button>
         </footer>
       </article>
     </section>
@@ -96,6 +106,7 @@ button { border: 1px solid #343b37; border-radius: 9px; background: #1a1e1c; col
 .body dd { min-width: 0; margin: 0; color: #9aa39e; overflow-wrap: anywhere; }
 .actions { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(64px, .7fr); align-self: end; gap: 8px; padding: 0 18px 18px; }
 .actions button { width: 100%; min-width: 0; height: 38px; padding: 0 8px; white-space: nowrap; }
+.actions button:disabled { cursor: wait; opacity: .58; }
 .actions .open { border-color: #35f59a; background: #35f59a; color: #07110c; font-weight: 800; }
 .delete { color: #ff8585; }
 .state { min-height: 360px; display: grid; place-content: center; gap: 10px; text-align: center; color: #8e9792; }

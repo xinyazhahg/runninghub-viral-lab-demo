@@ -12,13 +12,15 @@ const props = defineProps({
     type: String,
     default: 'idle', // 'idle' | 'analyzing' | 'done' | 'error'
   },
+  uploading: { type: Boolean, default: false },
 })
 
-const emit = defineEmits(['upload', 'view-breakdown'])
+const emit = defineEmits(['upload', 'view-breakdown', 'view-original'])
 
 const videoInput = ref(null)
 
 function triggerUpload() {
+  if (props.uploading) return
   videoInput.value?.click()
 }
 
@@ -50,23 +52,30 @@ function onStatusClick() {
     <input ref="videoInput" type="file" accept="video/*" hidden @change="onFileChange" />
 
     <!-- 空态：上传卡片 -->
-    <div v-if="!video.name" class="upload-empty" @click="triggerUpload">
+    <div v-if="!video.name" class="upload-empty" :class="{ 'is-loading': uploading }" @click="triggerUpload">
       <div class="upload-plus">+</div>
-      <h1>上传你想复刻的视频</h1>
-      <p>点击选择视频文件</p>
+      <h1>{{ uploading ? '正在上传视频…' : '上传你想复刻的视频' }}</h1>
+      <p>{{ uploading ? '请稍候，上传完成后将自动开始拆解' : '点击选择视频文件' }}</p>
     </div>
 
     <!-- 已上传态 -->
     <div v-else class="uploaded-video-node">
-      <div class="uploaded-thumb">
+      <button
+        class="uploaded-thumb"
+        type="button"
+        :disabled="uploading || !video.assetUrl"
+        aria-label="查看并播放原视频"
+        @pointerdown.stop
+        @click="emit('view-original')"
+      >
         <img v-if="video.coverUrl" :src="video.coverUrl" alt="" />
         <video v-else-if="video.assetUrl" :src="video.assetUrl" muted playsinline preload="metadata"></video>
         <div class="play-dot">▶</div>
-      </div>
+      </button>
       <strong>{{ video.name }}</strong>
       <span>{{ video.duration }} · {{ video.ratio }} · {{ video.size }}</span>
-      <button class="source-status" type="button" @click="onStatusClick">
-        {{ statusText }}
+      <button class="source-status" type="button" :disabled="uploading" @click="onStatusClick">
+        {{ uploading ? '正在上传…' : statusText }}
       </button>
     </div>
   </div>
@@ -153,7 +162,10 @@ function onStatusClick() {
   border-radius: 9px;
   background: linear-gradient(155deg, #23382e, #6f7e62 48%, #131514);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+  cursor: pointer;
+  border: 0;
 }
+.uploaded-thumb:disabled { cursor: wait; }
 
 .uploaded-thumb img,
 .uploaded-thumb video {

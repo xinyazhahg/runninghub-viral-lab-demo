@@ -7,9 +7,12 @@ const props = defineProps({
   videoName: { type: String, default: '' },
   coverUrl: { type: String, default: '' },
   videoObjectUrl: { type: String, default: '' },
+  videoSourceKey: { type: Number, default: 0 },
+  videoLoading: { type: Boolean, default: false },
+  videoError: { type: String, default: '' },
 })
 
-const emit = defineEmits(['close'])
+const emit = defineEmits(['close', 'video-error', 'video-ready'])
 
 const overview = computed(() => props.data?.overview || {})
 const shots = computed(() => Array.isArray(props.data?.shots) ? props.data.shots : [])
@@ -39,6 +42,28 @@ function elementsText(shot) {
       <button class="close-modal" @click="emit('close')">×</button>
       <h2>视频拆解</h2>
       <p class="breakdown-subtitle">按镜头整理视频结构，帮助后续替换和生成更贴近参考效果。</p>
+
+      <section class="original-video-section">
+        <div class="original-video-head">
+          <strong>原视频</strong>
+          <span>{{ videoName || '已上传参考视频' }}</span>
+        </div>
+        <div class="original-video-player">
+          <video
+            v-if="videoObjectUrl"
+            :key="videoSourceKey"
+            :src="videoObjectUrl"
+            controls
+            playsinline
+            preload="metadata"
+            @canplay="emit('video-ready')"
+            @error="emit('video-error')"
+          ></video>
+          <div v-else class="original-video-state">原视频地址暂不可用</div>
+          <div v-if="videoLoading" class="original-video-state is-overlay">正在刷新视频播放地址…</div>
+        </div>
+        <p v-if="videoError" class="original-video-error">{{ videoError }}</p>
+      </section>
 
       <!-- 识别概览 -->
       <section v-if="hasData" class="breakdown-overview">
@@ -180,6 +205,29 @@ function elementsText(shot) {
   font-size: 13px;
   line-height: 1.55;
 }
+
+.original-video-section {
+  display: grid;
+  gap: 10px;
+  margin-top: 18px;
+}
+.original-video-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.original-video-head strong { color: #eef5f1; font-size: 14px; }
+.original-video-head span { overflow: hidden; color: #7f8789; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.original-video-player {
+  position: relative;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  min-height: 260px;
+  max-height: 520px;
+  border-radius: 14px;
+  background: #050606;
+}
+.original-video-player video { display: block; width: 100%; max-height: 520px; background: #000; }
+.original-video-state { color: #858e89; font-size: 13px; }
+.original-video-state.is-overlay { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(5, 6, 6, .78); }
+.original-video-error { margin: 0; color: #ff8585; font-size: 12px; }
 
 .close-modal {
   position: absolute;

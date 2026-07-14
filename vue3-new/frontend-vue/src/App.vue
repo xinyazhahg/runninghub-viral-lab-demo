@@ -14,13 +14,16 @@ import ResultCard from './components/ResultCard.vue'
 import ViralLabTestBench from './components/ViralLabTestBench.vue'
 import AuthView from './components/AuthView.vue'
 import WorksView from './components/WorksView.vue'
+import AdminDashboard from './components/AdminDashboard.vue'
 import {
   apiUrl, authFetch, toBackendUrl, deleteProject, deleteProjectAsset, getCurrentUser,
   getProject, getProjects, getProjectResults, getProjectTasks, getTask, persistOriginalVideo, retryTask,
+  getBillingAccount, getBillingTransactions,
 } from './api.js'
 import { getSession, isAuthConfigured, signIn, signOut, signUp, supabase } from './auth.js'
 import { useCanvasNodes } from './composables/useCanvasNodes.js'
 import { cleanBreakdownResult } from './utils/cleanBreakdown.js'
+import { flushAnalytics, track, trackOnce } from './analytics.js'
 
 // ── 状态管理 ──
 const activeView = ref('demo')
@@ -31,7 +34,15 @@ const currentUser = ref(null)
 const projects = ref([])
 const projectsLoading = ref(false)
 const projectsError = ref('')
+const worksButtonLoading = ref(false)
+const openingProjectId = ref('')
+const deletingProjectId = ref('')
+const isUploadingVideo = ref(false)
+const revisingVersionId = ref('')
 let worksRequestSequence = 0
+let restoreRequestSequence = 0
+let worksRequestPromise = null
+let worksLoadedAt = 0
 const coverRetryKeys = new Set()
 const PROJECT_ID_KEY = 'viral-lab-current-project-id'
 const HISTORY_VIDEO_EXPIRED_MESSAGE = '历史视频地址已失效，请重新生成'
@@ -60,6 +71,11 @@ const breakdownData = ref(null)
 const videoToTextResult = ref(null)
 const breakdownVisible = ref(false)
 const videoObjectUrl = ref('')
+const originalVideoLoading = ref(false)
+const originalVideoError = ref('')
+const originalVideoSourceKey = ref(0)
+let originalVideoRefreshPromise = null
+let originalVideoRefreshAttempts = 0
 const customItems = ref(createDefaultCustomItems())
 
 // ── 生成 / 版本管理 ──
@@ -75,6 +91,11 @@ const generationTaskId = ref('')
 const generationStatus = ref('')
 const pendingVersionId = ref('')
 const lastFailedTaskId = ref('')
+const restoredTaskPolls = new Map()
+const activeTaskPollIds = new Set()
+const refreshingResultIds = ref(new Set())
+const resultRefreshAttempts = new Map()
+const resultRefreshPromises = new Map()
 let generationTimer = null
 const resultParams = reactive({
   ratio: '9:16',
@@ -86,17 +107,62 @@ const resultParams = reactive({
   timeEnd: null,
 })
 const generationOptions = ref({ models: [], ratios: [], resolutions: [], durations: [] })
+const generationOptionsStatus = ref('loading')
+const generationOptionsError = ref('')
+const generationOptionsWarning = ref('')
+const activeGenerationOptions = computed(() => {
+  const model = generationOptions.value.models.find((item) => item.id === resultParams.modelId)
+  return {
+    models: generationOptions.value.models,
+    ratios: model?.ratios?.length ? model.ratios : generationOptions.value.ratios,
+    resolutions: model?.resolutions?.length ? model.resolutions : generationOptions.value.resolutions,
+    durations: model?.durations?.length ? model.durations : generationOptions.value.durations,
+  }
+})
 const estimatedPrice = ref(null)
+const estimatedCredits = ref(null)
+const creditBalance = ref(0)
+const creditFrozenBalance = ref(0)
+const creditSufficient = ref(true)
+const billingVisible = ref(false)
+const billingLoading = ref(false)
+const billingTransactions = ref([])
 const priceStatus = ref('loading')
+const priceError = ref('')
 const activeGenerationParams = ref(null)
 const generationConfigText = computed(() =>
   `${resultParams.ratio} / ${resultParams.quality.toUpperCase()} / ${resultParams.duration} / ${resultParams.model}`
 )
 const estimatedPriceText = computed(() =>
-  priceStatus.value === 'ready' && estimatedPrice.value !== null
-    ? `¥${Number(estimatedPrice.value).toFixed(2)}`
-    : priceStatus.value === 'error' ? '费用暂不可用' : '费用计算中'
+  priceStatus.value === 'ready' && estimatedCredits.value !== null
+    ? `${Number(estimatedCredits.value).toFixed(2)}积分（余额 ${Number(creditBalance.value).toFixed(2)}）${creditSufficient.value ? '' : ' · 余额不足'}`
+    : priceStatus.value === 'error' ? (priceError.value || '费用暂不可用') : '费用计算中'
 )
+
+async function loadBillingAccount() {
+  try {
+    const { account } = await getBillingAccount()
+    creditBalance.value = Number(account?.balance || 0)
+    creditFrozenBalance.value = Number(account?.frozen_balance || 0)
+    if (estimatedCredits.value !== null) creditSufficient.value = creditBalance.value >= Number(estimatedCredits.value)
+  } catch (error) {
+    console.warn('积分账户加载失败：', error)
+  }
+}
+
+async function openBillingLedger() {
+  billingVisible.value = true
+  billingLoading.value = true
+  try {
+    const data = await getBillingTransactions()
+    billingTransactions.value = data.transactions || []
+    await loadBillingAccount()
+  } catch (error) {
+    showNotice(`积分流水加载失败：${error.message}`)
+  } finally {
+    billingLoading.value = false
+  }
+}
 
 function createDefaultCustomItems() {
   return [
@@ -170,6 +236,10 @@ function mapReplacementTypeToGroup(type) {
   return { subject: '主体', scene: '场景', element: '元素' }[type] || ''
 }
 
+function assetSignedUrl(asset) {
+  return toBackendUrl(asset?.signed_url || asset?.public_url || '')
+}
+
 function readPersistedGenerationConfig(source) {
   const raw = source?.inputData?.generation_config
     || source?.input_data?.generation_config
@@ -203,17 +273,31 @@ function applyPersistedGenerationConfig(source, { active = false } = {}) {
   return restored
 }
 
-function hydratePersistedResults(results) {
+function hydratePersistedResults(results, tasks = []) {
   const persistedResults = Array.isArray(results) ? results : []
   versions.value = persistedResults.map((result) => {
     const restored = readPersistedGenerationConfig(result) || {}
+    const promptVersion = result.prompt_version || null
+    const task = tasks.find((item) => item.id === result.task_id)
+    const generationSeconds = task?.started_at && task?.finished_at
+      ? Math.max(0, Math.round((new Date(task.finished_at) - new Date(task.started_at)) / 1000))
+      : null
     return {
     id: `V${result.version}`,
     taskId: result.task_id,
     resultId: result.id,
     resultSource: 'database',
     videoUrl: toBackendUrl(result.video_url),
-    prompt: result.prompt || '',
+    prompt: promptVersion?.generated_prompt || result.prompt || '',
+    promptId: promptVersion?.id || result.prompt_id || '',
+    templateName: promptVersion?.template_id || '历史版本',
+    templateType: promptVersion?.template_type || 'legacy',
+    templateVersion: promptVersion?.template_version || null,
+    systemPrompt: promptVersion?.system_prompt || '',
+    userRequirement: promptVersion?.user_requirement || '',
+    replacementSummary: promptVersion?.replacement_summary || [],
+    negativePrompt: promptVersion?.negative_prompt || '',
+    promptDiff: promptVersion?.diff_from_previous || {},
     summary: [],
     params: { ...restored },
     ratio: restored.ratio || '9:16',
@@ -222,6 +306,9 @@ function hydratePersistedResults(results) {
     model: restored.model || result.model_name || '',
     modelId: restored.modelId || '',
     cost: result.cost || '',
+    providerCost: result.provider_cost ?? null,
+    creditCost: result.credit_cost ?? null,
+    generationSeconds,
     status: '已生成',
     createdAt: result.created_at,
     time: result.created_at ? new Date(result.created_at).toLocaleString('zh-CN', { hour12: false }) : '',
@@ -262,9 +349,12 @@ async function handleAuthSubmit(mode, credentials) {
       return
     }
     currentUser.value = (await getCurrentUser()).user
+    track('login_success', { page: 'login' })
+    trackOnce('page-view-workbench', 'page_view', { page: 'workbench' })
     activeView.value = 'demo'
     await restoreProjectState()
     await loadGenerationOptions()
+    await loadBillingAccount()
     await refreshEstimatedPrice()
   } catch (error) {
     authError.value = error.message || '登录失败'
@@ -274,6 +364,8 @@ async function handleAuthSubmit(mode, credentials) {
 }
 
 async function handleLogout() {
+  track('logout', { page: activeView.value })
+  await flushAnalytics()
   await signOut().catch((error) => console.warn('退出登录失败：', error))
   clearDemoState({ preserveLayout: true })
   currentUser.value = null
@@ -282,18 +374,28 @@ async function handleLogout() {
 }
 
 async function loadWorks({ silent = false } = {}) {
-  const requestSequence = ++worksRequestSequence
   activeView.value = 'works'
+  if (!silent) track('open_my_projects', { page: 'works' })
+  if (worksRequestPromise) return worksRequestPromise
+  if (!silent && projects.value.length && Date.now() - worksLoadedAt < 15_000) return
+  const requestSequence = ++worksRequestSequence
   if (!silent) projectsLoading.value = true
+  worksButtonLoading.value = true
   projectsError.value = ''
-  try {
+  worksRequestPromise = (async () => { try {
     const nextProjects = (await getProjects()).projects || []
-    if (requestSequence === worksRequestSequence) projects.value = nextProjects
+    if (requestSequence === worksRequestSequence) {
+      projects.value = nextProjects
+      worksLoadedAt = Date.now()
+    }
   } catch (error) {
     if (requestSequence === worksRequestSequence) projectsError.value = `作品加载失败：${error.message}`
   } finally {
     if (!silent && requestSequence === worksRequestSequence) projectsLoading.value = false
-  }
+    worksButtonLoading.value = false
+    worksRequestPromise = null
+  } })()
+  return worksRequestPromise
 }
 
 async function handleWorkCoverError(project) {
@@ -305,14 +407,35 @@ async function handleWorkCoverError(project) {
 }
 
 async function openHistoricalProject(project) {
+  if (!project?.id || openingProjectId.value) return
+  openingProjectId.value = project.id
+  track('open_project', { projectId: project.id, page: 'works', properties: { continue_edit: true } })
   clearDemoState({ preserveLayout: true })
   localStorage.setItem(PROJECT_ID_KEY, project.id)
   activeView.value = 'demo'
-  await restoreProjectState()
+  try {
+    await restoreProjectState()
+  } finally {
+    openingProjectId.value = ''
+  }
+}
+
+function openHistoryVersions(project) {
+  track('open_history_versions', { projectId: project?.id, page: 'works', properties: { version_count: Number(project?.version_count || 0) } })
+  return openHistoricalProject(project)
+}
+
+function backToWorkbench() {
+  restoreRequestSequence += 1
+  openingProjectId.value = ''
+  isRestoringProject.value = false
+  activeView.value = 'demo'
 }
 
 async function removeHistoricalProject(project) {
+  if (!project?.id || deletingProjectId.value) return
   if (!window.confirm(`确认删除“${project.name}”？该操作不可撤销。`)) return
+  deletingProjectId.value = project.id
   try {
     const outcome = await deleteProject(project.id)
     projects.value = projects.value.filter((item) => item.id !== project.id)
@@ -320,10 +443,18 @@ async function removeHistoricalProject(project) {
     if (outcome.warnings?.length) showNotice('项目已删除，部分存储文件需后台清理')
   } catch (error) {
     projectsError.value = `删除失败：${error.message}`
+    showNotice(projectsError.value)
+  } finally {
+    deletingProjectId.value = ''
   }
 }
 
-async function pollRestoredTask(task) {
+function pollRestoredTask(task) {
+  if (!task?.id) return
+  if (activeTaskPollIds.has(task.id)) return
+  if (restoredTaskPolls.has(task.id)) return restoredTaskPolls.get(task.id)
+  activeTaskPollIds.add(task.id)
+  const pollPromise = (async () => {
   if (task.task_type === 'generate_video') applyPersistedGenerationConfig(task, { active: true })
   const deadline = Date.now() + 20 * 60 * 1000
   while (Date.now() < deadline) {
@@ -359,15 +490,20 @@ async function pollRestoredTask(task) {
     }
     await new Promise((resolve) => setTimeout(resolve, 4000))
   }
+  })().finally(() => {
+    restoredTaskPolls.delete(task.id)
+    activeTaskPollIds.delete(task.id)
+  })
+  restoredTaskPolls.set(task.id, pollPromise)
+  return pollPromise
 }
 
-async function restoreProjectTasksAndResults() {
-  const [tasksData, resultsData] = await Promise.all([
-    getProjectTasks(projectId.value),
-    getProjectResults(projectId.value),
-  ])
-  hydratePersistedResults(resultsData.results)
+async function restoreProjectTasksAndResults(payload = null) {
+  const [tasksData, resultsData] = payload
+    ? [{ tasks: payload.tasks || [] }, { results: payload.results || [] }]
+    : await Promise.all([getProjectTasks(projectId.value), getProjectResults(projectId.value)])
   const tasks = Array.isArray(tasksData.tasks) ? tasksData.tasks : []
+  hydratePersistedResults(resultsData.results, tasks)
   const latestSuccessfulBreakdown = tasks.find((task) =>
     task.task_type === 'video_to_text' && task.status === 'success' && task.output_data?.result
   )
@@ -407,7 +543,9 @@ async function restoreProjectTasksAndResults() {
       flowMode.value = 'analyzing'
       analysisStage.value = task.stage || '正在恢复视频拆解任务'
     }
-    pollRestoredTask(task).finally(() => {
+    const restoredPoll = pollRestoredTask(task)
+    if (!restoredPoll) return
+    restoredPoll.finally(() => {
       if (task.task_type === 'generate_video') {
         isGenerating.value = false
         activeGenerationParams.value = null
@@ -423,39 +561,29 @@ async function restoreProjectState() {
     .forEach((key) => localStorage.removeItem(key))
   const savedProjectId = localStorage.getItem(PROJECT_ID_KEY) || ''
   if (!savedProjectId) return
+  const requestSequence = ++restoreRequestSequence
   isRestoringProject.value = true
   try {
     const data = await getProject(savedProjectId)
+    if (requestSequence !== restoreRequestSequence) return
     const project = data.project
     const assets = Array.isArray(data.assets) ? data.assets : []
     const original = assets.find((asset) => asset.id === project.original_asset_id)
       || assets.find((asset) => asset.asset_type === 'original_video')
-    if (!original?.public_url) throw new Error('Project 缺少有效原视频')
+    const originalSignedUrl = assetSignedUrl(original)
+    if (!originalSignedUrl) throw new Error('Project 缺少有效原视频')
     projectId.value = project.id
     canvas.setStorageKey(`viral-lab-node-layout:${project.id}`)
     Object.assign(uploadedVideo, {
       name: original.original_filename || project.name,
       assetId: original.id,
-      assetUrl: toBackendUrl(original.public_url),
+      assetUrl: originalSignedUrl,
       coverUrl: '', duration: '已持久化', ratio: '',
       size: original.file_size ? formatFileSize(Number(original.file_size)) : '',
     })
-    videoObjectUrl.value = toBackendUrl(original.public_url)
-    try {
-      const sourceResponse = await fetch(videoObjectUrl.value)
-      if (sourceResponse.ok) {
-        const sourceBlob = await sourceResponse.blob()
-        const sourceFile = new File([sourceBlob], original.original_filename || 'source-video.mp4', {
-          type: original.mime_type || sourceBlob.type || 'video/mp4',
-        })
-        const previewInfo = await getVideoPreviewInfo(sourceFile)
-        uploadedVideo.coverUrl = previewInfo.coverUrl
-        uploadedVideo.duration = previewInfo.duration
-        uploadedVideo.ratio = previewInfo.ratio
-      }
-    } catch (error) {
-      console.warn('持久化原视频封面恢复失败：', error)
-    }
+    videoObjectUrl.value = originalSignedUrl
+    originalVideoError.value = ''
+    originalVideoRefreshAttempts = 0
     const restoredItems = createDefaultCustomItems()
     assets.filter((asset) => asset.asset_type === 'replacement_image').forEach((asset) => {
       const group = mapReplacementTypeToGroup(asset.replacement_type)
@@ -463,16 +591,24 @@ async function restoreProjectState() {
       if (!item) return
       Object.assign(item, {
         current: asset.original_filename, replacement: asset.original_filename,
-        previewUrl: toBackendUrl(asset.public_url), assetUrl: toBackendUrl(asset.public_url),
+        previewUrl: assetSignedUrl(asset), assetUrl: assetSignedUrl(asset),
         assetId: asset.id, changed: true,
+        storagePath: asset.storage_path || '',
       })
     })
     customItems.value = restoredItems
     // Task 恢复前先提供安全的最小容器，避免历史任务读取失败时页面黑屏。
     breakdownData.value = getEmptyBreakdownData('已恢复持久化项目')
     flowMode.value = 'customizing'
-    await restoreProjectTasksAndResults()
+    await restoreProjectTasksAndResults(data)
     demoStateRestored = true
+    // 不阻塞工作台恢复；媒体元素在后台读取 metadata，避免先下载完整视频。
+    getRemoteVideoPreviewInfo(videoObjectUrl.value).then((previewInfo) => {
+      if (requestSequence !== restoreRequestSequence || projectId.value !== project.id) return
+      if (previewInfo.coverUrl) uploadedVideo.coverUrl = previewInfo.coverUrl
+      if (previewInfo.duration) uploadedVideo.duration = previewInfo.duration
+      if (previewInfo.ratio) uploadedVideo.ratio = previewInfo.ratio
+    }).catch((error) => console.warn('持久化原视频封面恢复失败：', error))
   } catch (error) {
     console.warn('Project 恢复失败：', error)
     localStorage.removeItem(PROJECT_ID_KEY)
@@ -480,8 +616,10 @@ async function restoreProjectState() {
     flowMode.value = 'idle'
     showNotice('历史项目无法恢复，已进入新项目')
   } finally {
-    isRestoringProject.value = false
-    refreshCanvasConnectors(0, { force: true })
+    if (requestSequence === restoreRequestSequence) {
+      isRestoringProject.value = false
+      refreshCanvasConnectors(0, { force: true })
+    }
   }
 }
 
@@ -494,6 +632,9 @@ function clearDemoState(options = {}) {
     localStorage.removeItem(PROJECT_ID_KEY)
   }
   projectId.value = ''
+  originalVideoError.value = ''
+  originalVideoLoading.value = false
+  originalVideoRefreshAttempts = 0
 
   Object.assign(uploadedVideo, {
     name: '',
@@ -741,20 +882,52 @@ watch(displayVersions, async () => {
 }, { deep: false })
 
 async function loadGenerationOptions() {
+  generationOptionsStatus.value = 'loading'
+  generationOptionsError.value = ''
+  generationOptionsWarning.value = ''
   try {
     const response = await authFetch(apiUrl('/api/generate-config'))
     const { data } = await readApiResponse(response)
-    if (!response.ok || !data?.ok) throw new Error('生成配置加载失败')
-    generationOptions.value = data
+    if (!response.ok || !data?.ok) throw new Error(data?.message || data?.error || '生成配置加载失败')
+    const models = Array.isArray(data.models) ? data.models.filter((item) => item?.id && item?.label) : []
+    if (!models.length) throw new Error('后端未返回可用模型')
+    const firstModel = models[0]
+    generationOptions.value = { ...data, models, ratios: data.ratios || [], resolutions: data.resolutions || [], durations: data.durations || [] }
+    if (!models.some((item) => item.id === resultParams.modelId)) {
+      resultParams.modelId = firstModel.id
+      resultParams.model = firstModel.label
+    }
+    const selected = models.find((item) => item.id === resultParams.modelId) || firstModel
+    const ratios = selected.ratios?.length ? selected.ratios : (data.ratios || [])
+    const resolutions = selected.resolutions?.length ? selected.resolutions : (data.resolutions || [])
+    const durations = selected.durations?.length ? selected.durations : (data.durations || [])
+    if (!ratios.length || !resolutions.length || !durations.length) throw new Error('模型能力配置不完整')
+    if (!ratios.includes(resultParams.ratio)) resultParams.ratio = ratios[0]
+    if (!resolutions.includes(resultParams.quality)) resultParams.quality = resolutions[0]
+    if (!durations.map(String).includes(resultParams.duration.replace(/s$/i, ''))) resultParams.duration = `${durations[0]}s`
+    resultParams.model = selected.label
+    generationOptionsWarning.value = data.warning || ''
+    generationOptionsStatus.value = 'ready'
+    trackOnce(`generation-config:${projectId.value || 'new'}`, 'generation_config_view', { projectId: projectId.value || null, modelId: selected.id, properties: { model_name: selected.label } })
   } catch (error) {
+    generationOptions.value = { models: [], ratios: [], resolutions: [], durations: [] }
+    generationOptionsStatus.value = 'error'
+    generationOptionsError.value = error.message || '模型配置加载失败'
     console.error('生成配置加载失败：', error)
   }
+}
+
+async function retryGenerationConfiguration() {
+  await loadGenerationOptions()
+  if (generationOptionsStatus.value === 'ready') await refreshEstimatedPrice()
 }
 
 async function refreshEstimatedPrice() {
   const sequence = ++priceRequestSequence
   priceStatus.value = 'loading'
+  priceError.value = ''
   estimatedPrice.value = null
+  estimatedCredits.value = null
   try {
     const response = await authFetch(apiUrl('/api/generate-price'), {
       method: 'POST',
@@ -770,10 +943,19 @@ async function refreshEstimatedPrice() {
     if (sequence !== priceRequestSequence) return
     if (!response.ok || !data?.ok) throw new Error(data?.message || data?.error || '费用计算失败')
     estimatedPrice.value = data.estimatedPrice
+    estimatedCredits.value = data.estimatedCredits
+    creditBalance.value = Number(data.balance || 0)
+    creditFrozenBalance.value = Number(data.frozenBalance || 0)
+    creditSufficient.value = data.sufficient !== false
     priceStatus.value = 'ready'
+    trackOnce(`cost:${projectId.value}:${resultParams.modelId}:${resultParams.ratio}:${resultParams.quality}:${resultParams.duration}`, 'cost_estimate_view', {
+      projectId: projectId.value || null, modelId: resultParams.modelId,
+      properties: { duration: resultParams.duration, resolution: resultParams.quality, aspect_ratio: resultParams.ratio, estimated_cost: data.estimatedCredits },
+    })
   } catch (error) {
     if (sequence !== priceRequestSequence) return
     priceStatus.value = 'error'
+    priceError.value = error.message || '费用暂不可用'
     console.error('生成费用计算失败：', error)
   }
 }
@@ -786,8 +968,10 @@ watch(
 onMounted(async () => {
   await initializeAuth()
   if (currentUser.value) {
+    trackOnce('page-view-workbench', 'page_view', { page: 'workbench' })
     await restoreProjectState()
     await loadGenerationOptions()
+    await loadBillingAccount()
     await refreshEstimatedPrice()
   }
   supabase?.auth.onAuthStateChange((_event, session) => {
@@ -864,6 +1048,44 @@ function getVideoPreviewInfo(file) {
     video.onerror = () => {
       finish({ coverUrl: '', duration: '未知时长', ratio: '未知比例' })
     }
+  })
+}
+
+function getRemoteVideoPreviewInfo(url) {
+  return new Promise((resolve) => {
+    const video = document.createElement('video')
+    video.preload = 'metadata'
+    video.muted = true
+    video.playsInline = true
+    video.crossOrigin = 'anonymous'
+    let resolved = false
+    const timeout = setTimeout(() => finish({ coverUrl: '', duration: '', ratio: '' }), 8000)
+    const finish = (info) => {
+      if (resolved) return
+      resolved = true
+      clearTimeout(timeout)
+      video.removeAttribute('src')
+      video.load()
+      resolve(info)
+    }
+    video.onloadedmetadata = () => {
+      const duration = formatDuration(video.duration)
+      const ratio = getVideoRatio(video.videoWidth, video.videoHeight)
+      video.currentTime = Math.min(0.8, Math.max(0, video.duration - 0.1))
+      video.onseeked = () => {
+        try {
+          const canvasEl = document.createElement('canvas')
+          canvasEl.width = video.videoWidth || 320
+          canvasEl.height = video.videoHeight || 180
+          canvasEl.getContext('2d').drawImage(video, 0, 0, canvasEl.width, canvasEl.height)
+          finish({ coverUrl: canvasEl.toDataURL('image/jpeg', 0.82), duration, ratio })
+        } catch {
+          finish({ coverUrl: '', duration, ratio })
+        }
+      }
+    }
+    video.onerror = () => finish({ coverUrl: '', duration: '', ratio: '' })
+    video.src = url
   })
 }
 
@@ -1126,6 +1348,9 @@ function startFakeProgress() {
 
 // ── 上传 + 真实接口调用 ──
 async function handleUploaded(file) {
+  if (!file || isUploadingVideo.value) return
+  track('upload_original_video_start', { projectId: projectId.value || null, properties: { file_size: file.size, mime_type: file.type } })
+  isUploadingVideo.value = true
   uploadedVideo.name = file?.name || '上传的视频.mp4'
   uploadedVideo.size = formatFileSize(file.size)
 
@@ -1134,10 +1359,12 @@ async function handleUploaded(file) {
   const temporaryVideoUrl = URL.createObjectURL(file)
   videoObjectUrl.value = temporaryVideoUrl
 
-  const info = await getVideoPreviewInfo(file)
-  uploadedVideo.coverUrl = info.coverUrl
-  uploadedVideo.duration = info.duration
-  uploadedVideo.ratio = info.ratio
+  getVideoPreviewInfo(file).then((info) => {
+    if (uploadedVideo.name !== file.name) return
+    uploadedVideo.coverUrl = info.coverUrl
+    uploadedVideo.duration = info.duration
+    uploadedVideo.ratio = info.ratio
+  })
 
   try {
     const persisted = await persistOriginalVideo(file, projectId.value)
@@ -1145,10 +1372,14 @@ async function handleUploaded(file) {
     canvas.setStorageKey(`viral-lab-node-layout:${projectId.value}`)
     if (typeof localStorage !== 'undefined') localStorage.setItem(PROJECT_ID_KEY, projectId.value)
     uploadedVideo.assetId = persisted.asset.id
-    uploadedVideo.assetUrl = toBackendUrl(persisted.asset.public_url)
+    uploadedVideo.assetUrl = assetSignedUrl(persisted.asset)
     if (videoObjectUrl.value === temporaryVideoUrl) URL.revokeObjectURL(temporaryVideoUrl)
     videoObjectUrl.value = uploadedVideo.assetUrl
+    originalVideoSourceKey.value += 1
+    originalVideoError.value = ''
+    originalVideoRefreshAttempts = 0
   } catch (error) {
+    track('upload_original_video_failed', { projectId: projectId.value || null, properties: { error_message: error.message, file_size: file.size, mime_type: file.type } })
     URL.revokeObjectURL(temporaryVideoUrl)
     Object.assign(uploadedVideo, {
       name: '', assetId: '', assetUrl: '', coverUrl: '', duration: '', ratio: '', size: '',
@@ -1156,8 +1387,11 @@ async function handleUploaded(file) {
     videoObjectUrl.value = ''
     errorMsg.value = `原视频上传失败：${error.message}`
     flowMode.value = 'error'
+    isUploadingVideo.value = false
     return
   }
+
+  isUploadingVideo.value = false
 
   errorMsg.value = ''
   flowMode.value = 'analyzing'
@@ -1171,6 +1405,7 @@ async function handleUploaded(file) {
     formData.append('projectId', projectId.value)
     formData.append('originalAssetId', uploadedVideo.assetId)
     formData.append('originalVideoUrl', uploadedVideo.assetUrl)
+    formData.append('idempotencyKey', crypto.randomUUID())
 
     const response = await authFetch(apiUrl('/api/video-to-text'), {
       method: 'POST',
@@ -1254,11 +1489,123 @@ stopFakeProgress()
 function handleReplace(itemId) {
   // item 状态已在 ReplaceRail 内更新，这里可做额外逻辑
   console.log('✅ 替换完成：', itemId)
+  const item = customItems.value.find((entry) => entry.id === itemId)
+  track('confirm_replacement', { projectId: projectId.value, properties: { replacement_type: item?.replacementType || item?.group || '', asset_id: item?.assetId || '' } })
   pulsingNodeKey.value = ''
 }
 
 function openBreakdown() {
+  originalVideoError.value = ''
+  originalVideoRefreshAttempts = 0
   breakdownVisible.value = true
+}
+
+async function refreshOriginalVideoSignedUrl() {
+  if (!projectId.value) {
+    originalVideoError.value = '缺少有效项目，无法刷新原视频播放地址'
+    return false
+  }
+  if (originalVideoRefreshPromise) return originalVideoRefreshPromise
+  originalVideoLoading.value = true
+  originalVideoError.value = ''
+  const targetProjectId = projectId.value
+  originalVideoRefreshPromise = (async () => {
+    try {
+      const data = await getProject(targetProjectId)
+      if (projectId.value !== targetProjectId) return false
+      const assets = Array.isArray(data.assets) ? data.assets : []
+      const original = assets.find((asset) => asset.id === data.project?.original_asset_id)
+        || assets.find((asset) => asset.asset_type === 'original_video')
+      const nextUrl = assetSignedUrl(original)
+      if (!nextUrl) throw new Error('后端未返回有效 signed URL')
+      uploadedVideo.assetUrl = nextUrl
+      videoObjectUrl.value = nextUrl
+      originalVideoSourceKey.value += 1
+      return true
+    } catch (error) {
+      originalVideoError.value = `原视频加载失败：${error.message || '请稍后重试'}`
+      return false
+    } finally {
+      originalVideoLoading.value = false
+      originalVideoRefreshPromise = null
+    }
+  })()
+  return originalVideoRefreshPromise
+}
+
+async function handleOriginalVideoPlaybackError() {
+  if (originalVideoLoading.value) return
+  if (originalVideoRefreshAttempts >= 1) {
+    originalVideoError.value = '原视频仍无法播放，请关闭后重新进入项目再试'
+    return
+  }
+  originalVideoRefreshAttempts += 1
+  await refreshOriginalVideoSignedUrl()
+}
+
+function handleOriginalVideoReady() {
+  originalVideoError.value = ''
+  originalVideoRefreshAttempts = 0
+}
+
+async function refreshResultVideo(version, { manual = false } = {}) {
+  const versionId = version?.id || ''
+  const resultKey = version?.resultId || versionId
+  if (!versionId || !resultKey || !projectId.value) return false
+  if (resultRefreshPromises.has(resultKey)) return resultRefreshPromises.get(resultKey)
+
+  const refreshPromise = (async () => {
+    refreshingResultIds.value = new Set([...refreshingResultIds.value, versionId])
+    const target = getVersionById(versionId)
+    if (target) target.videoError = ''
+    try {
+      const data = await getProjectResults(projectId.value)
+      const versionNumber = Number(String(versionId).replace(/^V/i, ''))
+      const persisted = (data.results || []).find((item) => item.id === version?.resultId)
+        || (data.results || []).find((item) => Number(item.version) === versionNumber)
+      if (!persisted?.video_url) throw new Error('历史版本缺少有效视频地址')
+      if (target) target.videoUrl = toBackendUrl(persisted.video_url)
+      return true
+    } catch (error) {
+      const message = `视频地址刷新失败：${error.message || '请稍后重试'}`
+      if (target) target.videoError = message
+      if (manual) showNotice(`${versionId} ${message}`)
+      return false
+    } finally {
+      const next = new Set(refreshingResultIds.value)
+      next.delete(versionId)
+      refreshingResultIds.value = next
+      resultRefreshPromises.delete(resultKey)
+    }
+  })()
+  resultRefreshPromises.set(resultKey, refreshPromise)
+  return refreshPromise
+}
+
+async function handleResultVideoError(version) {
+  const versionId = version?.id || ''
+  if (!versionId || refreshingResultIds.value.has(versionId)) return
+  const attempts = Number(resultRefreshAttempts.get(versionId) || 0)
+  if (attempts >= 1) {
+    const target = getVersionById(versionId)
+    if (target) target.videoError = '视频加载失败，请重新加载视频'
+    return
+  }
+  resultRefreshAttempts.set(versionId, attempts + 1)
+  await refreshResultVideo(version)
+}
+
+async function retryResultVideo(version) {
+  if (!version?.id) return
+  resultRefreshAttempts.set(version.id, 0)
+  await refreshResultVideo(version, { manual: true })
+}
+
+function handleResultVideoReady(version) {
+  if (!version?.id) return
+  resultRefreshAttempts.set(version.id, 0)
+  const target = getVersionById(version.id)
+  if (target) target.videoError = ''
 }
 
 function closeBreakdown() {
@@ -1499,6 +1846,8 @@ function selectVersion(versionId) {
   if (!versionId || versionId === 'generating') return
   if (!getVersionById(versionId)) return
   currentVersionId.value = versionId
+  const version = getVersionById(versionId)
+  track('view_result', { projectId: projectId.value, taskId: version?.taskId, resultId: version?.resultId, properties: { version: versionId } })
 }
 
 // 生成中占位版本
@@ -1507,17 +1856,35 @@ function updateGenerationConfig(nextConfig) {
   estimatedPrice.value = null
   Object.assign(resultParams, nextConfig)
   const selectedModel = generationOptions.value.models.find((item) => item.id === resultParams.modelId)
-  if (selectedModel) resultParams.model = selectedModel.label
+  if (selectedModel) {
+    resultParams.model = selectedModel.label
+    if (selectedModel.ratios?.length && !selectedModel.ratios.includes(resultParams.ratio)) resultParams.ratio = selectedModel.ratios[0]
+    if (selectedModel.resolutions?.length && !selectedModel.resolutions.includes(resultParams.quality)) resultParams.quality = selectedModel.resolutions[0]
+    const duration = resultParams.duration.replace(/s$/i, '')
+    if (selectedModel.durations?.length && !selectedModel.durations.map(String).includes(duration)) {
+      resultParams.duration = `${selectedModel.durations[0]}s`
+    }
+  }
 }
 
 async function startGeneration(isRevise = false) {
   generateError.value = ''
+  if (generationOptionsStatus.value !== 'ready' || !activeGenerationOptions.value.models.length
+    || !activeGenerationOptions.value.ratios.length || !activeGenerationOptions.value.resolutions.length
+    || !activeGenerationOptions.value.durations.length) {
+    generateError.value = '模型配置尚未加载完成，请重试'
+    return
+  }
   if (!breakdownData.value || flowMode.value !== 'customizing') {
     generateError.value = '请先上传视频并完成拆解'
     return
   }
   if (priceStatus.value !== 'ready' || estimatedPrice.value === null) {
     generateError.value = '暂时无法计算本次生成费用，请稍后重试。'
+    return
+  }
+  if (!creditSufficient.value) {
+    generateError.value = '积分余额不足，无法提交生成任务'
     return
   }
   const versionCount = versions.value.length
@@ -1576,6 +1943,7 @@ async function executeGenerate() {
     : ['其他内容：保持原视频']
 
   const nextVersionId = pendingVersionId.value
+  let submittedTaskId = ''
 
   try {
     const replacedSubject = customItems.value.find((item) =>
@@ -1631,9 +1999,13 @@ async function executeGenerate() {
       group: item.group,
       original: item.title || item.original,
       replacement: item.current || item.replacement,
+      asset_id: item.assetId || null,
+      storage_path: item.storagePath || null,
+      original_filename: item.replacement || item.current || '',
     }))))
     formData.append('extraPrompt', adjText)
     formData.append('sourceVideoTaskId', videoToTextResult.value?.taskId || '')
+    formData.append('idempotencyKey', crypto.randomUUID())
     const clipStart = Math.max(0, Number(submittedParams.timeStart) || 0)
     const configuredDuration = Number(submittedParams.duration.replace(/s$/i, '')) || 0
     const configuredEnd = Number(submittedParams.timeEnd)
@@ -1665,7 +2037,11 @@ async function executeGenerate() {
 
     const taskId = data.taskId
     if (!taskId) throw new Error('后端未返回生成任务 taskId')
+    if (data.balance !== undefined) creditBalance.value = Number(data.balance)
+    if (data.frozenBalance !== undefined) creditFrozenBalance.value = Number(data.frozenBalance)
     generationTaskId.value = taskId
+    submittedTaskId = taskId
+    activeTaskPollIds.add(taskId)
 
     while (Date.now() < generationDeadline) {
       await new Promise((resolve) => setTimeout(resolve, 4000))
@@ -1679,7 +2055,11 @@ async function executeGenerate() {
         throw new Error(data?.message || data?.error || rawText || '查询生成任务失败')
       }
       if (data.status === 'success') break
-      if (data.status === 'failed') throw new Error(data.error || '视频生成失败')
+      if (['failed', 'timeout', 'cancelled'].includes(data.status)) {
+        const terminalError = new Error(data.error || (data.status === 'cancelled' ? '任务已取消' : '视频生成失败'))
+        terminalError.name = data.status === 'timeout' ? 'GenerationTimeoutError' : 'GenerationTerminalError'
+        throw terminalError
+      }
     }
 
     if (data.status !== 'success') {
@@ -1698,6 +2078,7 @@ async function executeGenerate() {
       throw new Error('生成成功但未返回视频地址，请检查后端返回字段')
     }
     const finalPrompt = data.finalPrompt || description
+    const promptVersion = data.promptVersion || null
     currentGeneratingPrompt.value = finalPrompt
     generationStatus.value = 'success'
 
@@ -1708,6 +2089,15 @@ async function executeGenerate() {
       ...submittedParams,
       summary,
       prompt: finalPrompt,
+      promptId: promptVersion?.id || '',
+      templateName: promptVersion?.template_id || '',
+      templateType: promptVersion?.template_type || '',
+      templateVersion: promptVersion?.template_version || null,
+      systemPrompt: promptVersion?.system_prompt || '',
+      userRequirement: promptVersion?.user_requirement || adjText,
+      replacementSummary: promptVersion?.replacement_summary || [],
+      negativePrompt: promptVersion?.negative_prompt || '',
+      promptDiff: promptVersion?.diff_from_previous || {},
       adjustmentText: adjText,
       generatedVideoResult,
       videoUrl,
@@ -1715,6 +2105,8 @@ async function executeGenerate() {
       createdAt: new Date().toISOString(),
       time: new Date().toLocaleString('zh-CN', { hour12: false }),
       cost: data.cost || '',
+      providerCost: data.providerCost ?? null,
+      creditCost: data.creditCost ?? null,
       status: '已生成',
       saved: false,
     }
@@ -1734,6 +2126,8 @@ async function executeGenerate() {
       ? '生成超时，请稍后查看任务状态或重新生成'
       : error.message || '视频生成失败'
   } finally {
+    if (submittedTaskId) activeTaskPollIds.delete(submittedTaskId)
+    await loadBillingAccount()
     stopGenerationTimer()
     isGenerating.value = false
     activeGenerationParams.value = null
@@ -1786,6 +2180,7 @@ async function handleExport(version) {
     setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000)
 
     showNotice('视频已导出')
+    track('export_video', { projectId: projectId.value, taskId: targetVersion.taskId, resultId: targetVersion.resultId, properties: { version: targetVersion.id } })
   } catch (error) {
     console.error('视频导出失败：', error)
     showNotice('视频导出失败，请重试')
@@ -1808,10 +2203,25 @@ function handleSaveAsset(version) {
     }
     targetVersion.saved = true
     showNotice('已保存至资产库')
+    track('save_to_asset_library', { projectId: projectId.value, taskId: targetVersion.taskId, resultId: targetVersion.resultId, properties: { version: targetVersion.id } })
   } catch (error) {
     console.error('视频保存失败：', error)
     showNotice('保存失败，请稍后重试')
   }
+}
+
+function handleResultPlay(version) {
+  track('play_result', {
+    projectId: projectId.value, taskId: version?.taskId, resultId: version?.resultId,
+    properties: { version: version?.id || '' },
+  })
+}
+
+function handleViewPrompt(version) {
+  track('view_prompt', {
+    projectId: projectId.value, taskId: version?.taskId, resultId: version?.resultId,
+    properties: { version: version?.id || '', prompt_id: version?.promptId || '', prompt_length: String(version?.prompt || '').length, template_type: version?.templateType || '' },
+  })
 }
 
 // ── 重新改造 ──
@@ -1821,7 +2231,10 @@ const replaceRailComp = ref(null)
 const railFocusHighlight = ref(false)
 
 function handleRevise(version) {
+  if (revisingVersionId.value) return
   const targetVersion = getCurrentVersion(getVersionById(version?.id) || version)
+  revisingVersionId.value = targetVersion?.id || 'current'
+  track('regenerate', { projectId: projectId.value, taskId: targetVersion?.taskId, resultId: targetVersion?.resultId, properties: { version: targetVersion?.id || '' } })
   if (targetVersion?.id) currentVersionId.value = targetVersion.id
   customItems.value.forEach((item) => {
     if (typeof item.previewUrl === 'string' && item.previewUrl.startsWith('blob:')) {
@@ -1837,6 +2250,8 @@ function handleRevise(version) {
   flowMode.value = 'customizing'
   railFocusHighlight.value = true
   focusFlowNode('replaceRail', { pulse: true })
+  showNotice('正在进入重新改造')
+  setTimeout(() => { revisingVersionId.value = '' }, 300)
 }
 
 // 重新改造后点击生成：重置 revising，走正常生成流程
@@ -1897,27 +2312,22 @@ function retry() {
     :projects="projects"
     :loading="projectsLoading"
     :error="projectsError"
+    :opening-project-id="openingProjectId"
+    :deleting-project-id="deletingProjectId"
     @open="openHistoricalProject"
+    @history="openHistoryVersions"
     @delete="removeHistoricalProject"
     @cover-error="handleWorkCoverError"
+    @back="backToWorkbench"
+  />
+  <AdminDashboard
+    v-else-if="activeView === 'admin' && currentUser?.isAdmin"
     @back="activeView = 'demo'"
   />
   <div v-else class="app-shell">
-    <button
-      class="test-bench-entry"
-      type="button"
-      @click="activeView = activeView === 'testBench' ? 'demo' : 'testBench'"
-    >
-      {{ activeView === 'testBench' ? '返回 Demo' : '测试台' }}
-    </button>
-    <button
-      v-if="activeView === 'demo'"
-      class="clear-state-entry"
-      type="button"
-      @click="clearDemoState"
-    >
-      清空当前状态
-    </button>
+    <div v-if="activeView === 'testBench'" class="standalone-top-actions">
+      <button class="test-bench-entry" type="button" @click="activeView = 'demo'">返回 Demo</button>
+    </div>
 
     <ViralLabTestBench v-if="activeView === 'testBench'" />
 
@@ -1925,7 +2335,15 @@ function retry() {
       <TopBar
         :project-name="uploadedVideo.name || 'Untitled'"
         :user-email="currentUser?.email || ''"
+        :works-loading="worksButtonLoading"
+        :credit-balance="creditBalance"
+        :frozen-balance="creditFrozenBalance"
+        :is-admin="currentUser?.isAdmin || false"
         @works="loadWorks"
+        @billing="openBillingLedger"
+        @clear="clearDemoState"
+        @test-bench="activeView = 'testBench'"
+        @admin="activeView = 'admin'"
         @logout="handleLogout"
       />
       <LabHead />
@@ -1950,9 +2368,11 @@ function retry() {
             >
               <UploadCard
                 :video="uploadedVideo"
+                :uploading="isUploadingVideo"
                 :status="flowMode === 'analyzing' ? 'analyzing' : flowMode === 'customizing' ? 'done' : flowMode === 'error' ? 'error' : 'idle'"
                 @upload="handleUploaded"
                 @view-breakdown="openBreakdown"
+                @view-original="openBreakdown"
               />
             </div>
             <InspirationGrid v-if="showInspiration" />
@@ -2014,9 +2434,13 @@ function retry() {
                   :generate-btn-text="generateBtnText"
                   :generation-config-text="generationConfigText"
                   :generation-config="resultParams"
-                  :generation-options="generationOptions"
+                  :generation-options="activeGenerationOptions"
                   :estimated-price-text="estimatedPriceText"
                   :price-status="priceStatus"
+                  :price-error="priceError"
+                  :config-status="generationOptionsStatus"
+                  :config-error="generationOptionsError"
+                  :config-warning="generationOptionsWarning"
                   @update:generation-config="updateGenerationConfig"
                   :is-generating="isGenerating"
                   :revise-visible="reviseVisible"
@@ -2025,6 +2449,7 @@ function retry() {
                   @replace="handleReplace"
                   @restore="handleRestore"
                   @generate="revising ? handleGenerateFromRevise() : handleGenerate()"
+                  @retry-config="retryGenerationConfiguration"
                 />
               </div>
             </section>
@@ -2046,9 +2471,17 @@ function retry() {
                   :version="version"
                   :index="index"
                   :is-exporting="exportingVersionId === version.id"
+                  :is-revising="revisingVersionId === version.id"
+                  :is-refreshing-video="refreshingResultIds.has(version.id)"
+                  :video-error="version.videoError || ''"
                   @export="handleExport(version)"
                   @save="handleSaveAsset(version)"
                   @revise="handleRevise(version)"
+                  @video-error="handleResultVideoError"
+                  @video-ready="handleResultVideoReady"
+                  @retry-video="retryResultVideo"
+                  @play="handleResultPlay"
+                  @view-prompt="handleViewPrompt"
                 />
               </div>
             </section>
@@ -2057,6 +2490,11 @@ function retry() {
       </section>
 
       <BottomControls />
+      <div v-if="isRestoringProject" class="project-restore-overlay" role="status">
+        <span class="restore-spinner"></span>
+        <strong>正在打开项目…</strong>
+        <small>项目页面已打开，正在恢复素材与历史版本</small>
+      </div>
     </main>
 
     <!-- 视频拆解弹窗 -->
@@ -2066,7 +2504,12 @@ function retry() {
       :video-name="uploadedVideo.name"
       :cover-url="uploadedVideo.coverUrl"
       :video-object-url="videoObjectUrl"
+      :video-source-key="originalVideoSourceKey"
+      :video-loading="originalVideoLoading"
+      :video-error="originalVideoError"
       @close="closeBreakdown"
+      @video-error="handleOriginalVideoPlaybackError"
+      @video-ready="handleOriginalVideoReady"
     />
 
     <!-- 生成错误提示 -->
@@ -2077,6 +2520,21 @@ function retry() {
     <!-- 轻提示 -->
     <div v-if="noticeVisible" class="notice-toast">
       {{ noticeText }}
+    </div>
+    <div v-if="billingVisible" class="billing-modal" @click.self="billingVisible = false">
+      <section class="billing-card">
+        <button class="billing-close" @click="billingVisible = false">×</button>
+        <h2>积分流水</h2>
+        <p>可用 {{ creditBalance.toFixed(2) }} · 冻结 {{ creditFrozenBalance.toFixed(2) }}</p>
+        <div v-if="billingLoading" class="billing-state">正在加载…</div>
+        <div v-else-if="!billingTransactions.length" class="billing-state">暂无积分流水</div>
+        <ul v-else>
+          <li v-for="item in billingTransactions" :key="item.transaction_id">
+            <span><strong>{{ item.reason }}</strong><small>{{ new Date(item.created_at).toLocaleString('zh-CN', { hour12: false }) }}</small></span>
+            <b :class="Number(item.amount) >= 0 ? 'positive' : 'negative'">{{ Number(item.amount) >= 0 ? '+' : '' }}{{ Number(item.amount).toFixed(2) }}</b>
+          </li>
+        </ul>
+      </section>
     </div>
   </div>
 </template>
@@ -2144,11 +2602,17 @@ button {
   background-size: 18px 18px, 100% 100%, 100% 100%;
 }
 
-.test-bench-entry {
+.standalone-top-actions {
   position: fixed;
   top: 18px;
   right: 22px;
   z-index: 100;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.test-bench-entry {
   min-width: 82px;
   height: 36px;
   padding: 0 14px;
@@ -2156,23 +2620,6 @@ button {
   border-radius: 8px;
   color: #06110a;
   background: var(--green);
-  font-size: 13px;
-  font-weight: 800;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
-}
-
-.clear-state-entry {
-  position: fixed;
-  top: 18px;
-  right: 116px;
-  z-index: 100;
-  min-width: 112px;
-  height: 36px;
-  padding: 0 14px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 8px;
-  color: #e7eaee;
-  background: rgba(18, 19, 20, 0.92);
   font-size: 13px;
   font-weight: 800;
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
@@ -2365,6 +2812,39 @@ button {
 
 /* customizing 模式下如果有结果，扩展网格 */
 .canvas.is-restoring-project .lab-page { visibility: hidden; }
+.project-restore-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  color: #eef7f2;
+  background: rgba(2, 3, 3, .86);
+}
+.project-restore-overlay small { color: #8f9993; }
+.restore-spinner {
+  width: 28px;
+  height: 28px;
+  border: 2px solid rgba(53, 245, 154, .22);
+  border-top-color: var(--green);
+  border-radius: 50%;
+  animation: restore-spin .8s linear infinite;
+}
+@keyframes restore-spin { to { transform: rotate(360deg); } }
+.billing-modal { position: fixed; inset: 0; z-index: 120; display: grid; place-items: center; padding: 24px; background: rgba(0,0,0,.68); }
+.billing-card { position: relative; width: min(560px, 100%); max-height: 72vh; overflow: auto; padding: 24px; border: 1px solid rgba(255,255,255,.12); border-radius: 16px; background: #141716; }
+.billing-card h2 { margin: 0 0 8px; }
+.billing-card > p { color: #8f9993; }
+.billing-close { position: absolute; top: 12px; right: 12px; width: 32px; height: 32px; border-radius: 50%; color: #fff; background: rgba(255,255,255,.08); }
+.billing-card ul { display: grid; gap: 8px; margin-top: 18px; list-style: none; }
+.billing-card li { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px; border-radius: 10px; background: rgba(255,255,255,.04); }
+.billing-card li span { display: grid; gap: 4px; }
+.billing-card li small { color: #69736d; }
+.billing-card b.positive { color: var(--green); }
+.billing-card b.negative { color: #ff8585; }
+.billing-state { padding: 42px; text-align: center; color: #7f8983; }
 
 /* 生成错误提示 */
 .generate-error-toast {

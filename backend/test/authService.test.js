@@ -27,7 +27,7 @@ test("auth middleware returns 401 without a valid user", async () => {
   let nextCalled = false;
   await middleware(req, res, () => { nextCalled = true; });
   assert.equal(response.status, 401);
-  assert.equal(response.payload.error, "UNAUTHORIZED");
+  assert.equal(response.payload.error, "AUTH_REQUIRED");
   assert.equal(nextCalled, false);
 });
 

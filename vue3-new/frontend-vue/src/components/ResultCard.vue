@@ -5,16 +5,15 @@ const props = defineProps({
   version: { type: Object, required: true },
   index: { type: Number, default: 0 },
   isExporting: { type: Boolean, default: false },
+  isRevising: { type: Boolean, default: false },
+  isRefreshingVideo: { type: Boolean, default: false },
+  videoError: { type: String, default: '' },
 })
 
-const emit = defineEmits(['export', 'save', 'revise'])
+const emit = defineEmits(['export', 'save', 'revise', 'video-error', 'video-ready', 'retry-video', 'play', 'view-prompt'])
 
 const isGenerating = computed(() => props.version.isGenerating)
 const isSaved = computed(() => !!props.version.saved)
-const versionLabel = computed(() => {
-  if (isGenerating.value) return `${props.version.id} 正在生成`
-  return props.version.id
-})
 
 const summaryLines = computed(() => {
   return [
@@ -30,11 +29,12 @@ const specsText = computed(() => {
     (p.quality || '720P').toUpperCase(),
     p.duration || '10s',
     p.model || '可灵 v3.0 Pro',
-    p.cost || '',
+    p.creditCost !== null && p.creditCost !== undefined ? `${p.creditCost}积分` : (p.cost || ''),
   ].filter(Boolean).join(' / ')
 })
 
 const videoUrl = computed(() => props.version.videoUrl || '')
+const promptChanges = computed(() => props.version.promptDiff?.changed_fields || [])
 </script>
 
 <template>
@@ -63,13 +63,25 @@ const videoUrl = computed(() => props.version.videoUrl || '')
         controls
         playsinline
         preload="metadata"
+        @pointerdown.stop
+        @click.stop
+        @canplay="emit('video-ready', version)"
+        @play="emit('play', version)"
+        @error="emit('video-error', version)"
       ></video>
+
+      <div v-if="isRefreshingVideo" class="result-video-refresh">正在刷新视频地址…</div>
+
+      <div v-else-if="videoError" class="result-video-refresh result-video-error" role="alert">
+        <span>{{ videoError }}</span>
+        <button type="button" @click.stop="emit('retry-video', version)">重新加载视频</button>
+      </div>
 
       <!-- 无视频（兜底封面） -->
       <img
-        v-else
+        v-if="!isGenerating && !videoUrl"
         :src="version.coverUrl || ''"
-        :alt="`${version.id} 生成结果`"
+        alt=""
         loading="lazy"
       />
 
@@ -79,12 +91,6 @@ const videoUrl = computed(() => props.version.videoUrl || '')
 
     <!-- 结果信息 -->
     <div class="result-info">
-      <!-- 版本 -->
-      <div class="result-info-head">
-        <span class="node-caption">版本</span>
-        <strong>{{ versionLabel }}</strong>
-      </div>
-
       <!-- 参数信息 -->
       <div class="result-meta">
         <span class="result-param-pill">
@@ -111,6 +117,21 @@ const videoUrl = computed(() => props.version.videoUrl || '')
         readonly
         :value="version.prompt || ''"
       ></textarea>
+      <details class="prompt-trace" @toggle="$event.target.open && emit('view-prompt', version)">
+        <summary>查看Prompt版本与差异</summary>
+        <dl>
+          <div><dt>Prompt ID</dt><dd>{{ version.promptId || '历史版本未记录' }}</dd></div>
+          <div><dt>模板</dt><dd>{{ version.templateName || '历史模板' }}{{ version.templateVersion ? ` v${version.templateVersion}` : '' }}</dd></div>
+          <div><dt>用户要求</dt><dd>{{ version.userRequirement || '无' }}</dd></div>
+          <div><dt>生成耗时</dt><dd>{{ version.generationSeconds === null || version.generationSeconds === undefined ? '历史版本未记录' : `${version.generationSeconds}秒` }}</dd></div>
+          <div><dt>实际积分</dt><dd>{{ version.creditCost === null || version.creditCost === undefined ? '未记录' : `${version.creditCost}积分` }}</dd></div>
+          <div><dt>模型成本</dt><dd>{{ version.providerCost ?? version.cost ?? '未记录' }}</dd></div>
+          <div><dt>创建时间</dt><dd>{{ version.time || version.createdAt || '未记录' }}</dd></div>
+          <div><dt>相对上一版</dt><dd>{{ promptChanges.length ? promptChanges.join('、') : '无可用差异记录' }}</dd></div>
+          <div><dt>系统Prompt</dt><dd>{{ version.systemPrompt || '历史版本未单独记录' }}</dd></div>
+          <div><dt>负向Prompt</dt><dd>{{ version.negativePrompt || '历史版本未单独记录' }}</dd></div>
+        </dl>
+      </details>
 
       <!-- 操作按钮 -->
       <div v-if="!isGenerating" class="result-actions">
@@ -124,7 +145,9 @@ const videoUrl = computed(() => props.version.videoUrl || '')
         >
           {{ isSaved ? '已保存' : '保存至资产库' }}
         </button>
-       <button class="ghost-button revise-button" @click="$emit('revise', version)">重新改造</button>
+       <button class="ghost-button revise-button" :disabled="isRevising" @click="$emit('revise', version)">
+         {{ isRevising ? '正在打开…' : '重新改造' }}
+       </button>
       </div>
     </div>
   </article>
@@ -184,6 +207,30 @@ const videoUrl = computed(() => props.version.videoUrl || '')
   border-radius: inherit;
   display: block;
   background: #000;
+}
+.result-video-refresh {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  color: #dfe9e4;
+  background: rgba(5, 6, 6, .76);
+  font-size: 13px;
+}
+.result-video-error {
+  gap: 12px;
+  padding: 24px;
+  text-align: center;
+}
+.result-video-error button {
+  min-height: 34px;
+  padding: 7px 14px;
+  border: 1px solid rgba(53, 245, 154, .42);
+  border-radius: 9px;
+  color: #dfffea;
+  background: rgba(20, 52, 38, .88);
+  cursor: pointer;
 }
 
 .result-badge {
@@ -374,6 +421,12 @@ const videoUrl = computed(() => props.version.videoUrl || '')
 .result-prompt:focus {
   border-color: rgba(53, 245, 154, 0.42);
 }
+.prompt-trace { color: #929b96; font-size: 12px; }
+.prompt-trace summary { cursor: pointer; color: #b8c2bd; font-weight: 700; }
+.prompt-trace dl { display: grid; gap: 7px; margin: 10px 0 0; }
+.prompt-trace dl div { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 8px; }
+.prompt-trace dt { color: #68716c; }
+.prompt-trace dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 
 /* ── 参数 ── */
 .result-meta {

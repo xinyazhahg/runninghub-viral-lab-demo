@@ -11,6 +11,8 @@ function buildPersistedGenerationConfig(config, input = {}) {
     resolution: config.resolution,
     model_name: config.model.label,
     model_id: config.model.id,
+    model_provider: config.model.provider || '',
+    model_endpoint: config.model.endpoint || '',
     generate_audio: false,
     real_person_mode: true,
     clip_start: clipStart,
@@ -22,4 +24,35 @@ function buildPersistedGenerationConfig(config, input = {}) {
   };
 }
 
-module.exports = { buildPersistedGenerationConfig };
+function buildGenerationTaskInput({
+  prompt = '', breakdown = null, replacements = [], extraPrompt = '', sourceVideoTaskId = '',
+  sourceVideoUrl = '', sourceVideoStoragePath = '', generationConfig = {}, clipStart = 0, clipEnd = null,
+  promptSnapshot = null,
+  billingQuote = null,
+} = {}) {
+  const replacementAssets = Array.isArray(replacements) ? replacements : [];
+  return {
+    prompt,
+    prompt_snapshot: promptSnapshot,
+    billing_quote: billingQuote,
+    breakdown,
+    replacements: replacementAssets,
+    replacement_assets: replacementAssets,
+    extra_prompt: extraPrompt,
+    extraPrompt,
+    sourceVideoTaskId,
+    sourceVideoUrl,
+    sourceVideoStoragePath,
+    generation_config: generationConfig,
+    config: generationConfig,
+    duration: generationConfig.duration,
+    aspect_ratio: generationConfig.aspect_ratio,
+    resolution: generationConfig.resolution,
+    model_name: generationConfig.model_name,
+    model_params: generationConfig,
+    clipStart,
+    clipEnd,
+  };
+}
+
+module.exports = { buildPersistedGenerationConfig, buildGenerationTaskInput };
