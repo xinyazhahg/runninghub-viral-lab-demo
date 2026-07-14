@@ -1,5 +1,6 @@
 <script setup>
 import { ref, computed } from 'vue'
+import { deleteProjectAsset, persistReplacementImage, toBackendUrl } from '../api.js'
 const reviseMuted = ref(false)
 let reviseMutedTimer = null
 function scheduleReviseMute() {
@@ -46,6 +47,7 @@ function isEmptyCopyGroup(group) {
 }
 
 const props = defineProps({
+  projectId: { type: String, default: '' },
   items: {
     type: Array,
     default: () => [],
@@ -70,6 +72,10 @@ const props = defineProps({
   generationOptions: { type: Object, default: () => ({ models: [], ratios: [], resolutions: [], durations: [] }) },
   estimatedPriceText: { type: String, default: '费用计算中' },
   priceStatus: { type: String, default: 'loading' },
+  priceError: { type: String, default: '' },
+  configStatus: { type: String, default: 'loading' },
+  configError: { type: String, default: '' },
+  configWarning: { type: String, default: '' },
   isGenerating: {
     type: Boolean,
     default: false,
@@ -84,7 +90,15 @@ const props = defineProps({
   },
 })
 
-const emit = defineEmits(['replace', 'restore', 'update:modelValue', 'update:generationConfig', 'generate'])
+const emit = defineEmits(['replace', 'restore', 'update:modelValue', 'update:generationConfig', 'generate', 'retry-config'])
+
+const generationDisabled = computed(() => props.isGenerating
+  || props.configStatus !== 'ready'
+  || props.priceStatus !== 'ready'
+  || !props.generationOptions.models?.length
+  || !props.generationOptions.ratios?.length
+  || !props.generationOptions.resolutions?.length
+  || !props.generationOptions.durations?.length)
 
 function updateGenerationConfig(key, value) {
   emit('update:generationConfig', { ...props.generationConfig, [key]: value })
@@ -171,6 +185,8 @@ const currentAssetChoices = computed(() => {
 
 // ── 隐藏文件 input ──
 const hiddenFileInput = ref(null)
+const assetUploadError = ref('')
+const isAssetUploading = ref(false)
 
 function openUploadModal(itemId) {
   const item = props.items.find((i) => i.id === itemId)
@@ -202,38 +218,54 @@ function openLibraryModal(itemId) {
 }
 
 function closeAssetModal() {
+  if (isAssetUploading.value) return
   assetModalVisible.value = false
   activeItemId.value = null
 }
 
 function triggerFilePick() {
+  if (isAssetUploading.value) return
   hiddenFileInput.value?.click()
 }
 
-function onFileChange(e) {
+async function onFileChange(e) {
+  if (isAssetUploading.value) return
   const file = e.target.files?.[0]
   if (!file) return
   if (!file.type.startsWith('image/')) {
   alert('元素替换仅支持上传图片格式，请选择 JPG、PNG、WEBP 等图片文件。')
   return
 }
-  applyReplacement(file.name, file)
+  await applyReplacement(file.name, file)
   // 重置 input 以便重复选择同一文件
   e.target.value = ''
 }
 
 function applyAssetFromLibrary(asset) {
+  if (isAssetUploading.value) return
   applyReplacement(asset.name, null, asset.previewUrl)
 }
 
-function applyReplacement(fileName, file, previewUrl = '') {
+async function applyReplacement(fileName, file, previewUrl = '') {
   const item = props.items.find((i) => i.id === activeItemId.value)
   if (!item) return
 
-  // 如果有 file 对象，生成本地预览
+  if (file && !props.projectId) {
+    assetUploadError.value = '请先上传原视频并创建项目。'
+    alert(assetUploadError.value)
+    return
+  }
+
+  const previous = { ...item }
+  let temporaryPreviewUrl = ''
+  assetUploadError.value = ''
+  isAssetUploading.value = Boolean(file)
+
+  // Blob URL 只作为上传中的临时预览，不写入持久化状态。
   if (file && !previewUrl) {
     if (file.type.startsWith('image/')) {
-      previewUrl = URL.createObjectURL(file)
+      temporaryPreviewUrl = URL.createObjectURL(file)
+      item.previewUrl = temporaryPreviewUrl
     } else if (file.type.startsWith('video/')) {
       // 视频截帧作为预览
       const videoUrl = URL.createObjectURL(file)
@@ -258,16 +290,43 @@ function applyReplacement(fileName, file, previewUrl = '') {
     }
   }
 
-  if (previewUrl) {
-    item.previewUrl = previewUrl
+  try {
+    if (file) {
+      const replacementType = { '主体': 'subject', '场景': 'scene', '元素': 'element' }[item.group]
+      const data = await persistReplacementImage(props.projectId, file, replacementType)
+      previewUrl = toBackendUrl(data.asset.public_url)
+      const previousAssetId = previous.assetId
+      Object.assign(item, {
+        assetId: data.asset.id,
+        storagePath: data.asset.storage_path || '',
+        assetUrl: previewUrl,
+        previewUrl,
+      })
+      if (previousAssetId && previousAssetId !== data.asset.id) {
+        deleteProjectAsset(props.projectId, previousAssetId).catch((error) => {
+          console.warn('旧替换素材清理失败：', error)
+        })
+      }
+    }
+
+    if (previewUrl) item.previewUrl = previewUrl
+
+    item.current = fileName
+    item.replacement = fileName
+    item.changed = true
+
+    closeAssetModal()
+    emit('replace', item.id)
+  } catch (error) {
+    Object.keys(item).forEach((key) => delete item[key])
+    Object.assign(item, previous)
+    assetUploadError.value = `素材上传失败：${error.message}`
+    assetModalSubtitle.value = assetUploadError.value
+    alert(assetUploadError.value)
+  } finally {
+    isAssetUploading.value = false
+    if (temporaryPreviewUrl) URL.revokeObjectURL(temporaryPreviewUrl)
   }
-
-  item.current = fileName
-  item.replacement = fileName
-  item.changed = true
-
-  closeAssetModal()
-  emit('replace', item.id)
 }
 
 const groupedItems = computed(() => {
@@ -642,7 +701,17 @@ class="custom-group-grid"
         </div>
         <div class="generation-config-panel">
           <strong>生成配置</strong>
-          <div class="generation-config-grid">
+          <p v-if="configStatus === 'loading'" class="config-state">模型配置加载中…</p>
+          <p v-else-if="configStatus === 'error'" class="config-state error">
+            {{ configError || '模型配置加载失败' }}
+            <button type="button" @click="emit('retry-config')">重试</button>
+          </p>
+          <p v-else-if="configWarning" class="config-state warning">{{ configWarning }}</p>
+          <p v-if="configStatus === 'ready' && priceStatus === 'error'" class="config-state error">
+            {{ priceError || '计费配置加载失败' }}
+            <button type="button" @click="emit('retry-config')">重试</button>
+          </p>
+          <div v-if="configStatus === 'ready'" class="generation-config-grid">
             <label>视频比例
               <select :value="generationConfig.ratio" :disabled="isGenerating" @change="updateGenerationConfig('ratio', $event.target.value)">
                 <option v-for="value in generationOptions.ratios" :key="value" :value="value">{{ value }}</option>
@@ -671,10 +740,10 @@ class="custom-group-grid"
             id="customDirectGenerateBtn"
             class="primary-button branch-generate"
             type="button"
-            :disabled="isGenerating"
+            :disabled="generationDisabled"
             @click="emit('generate')"
           >
-            {{ isGenerating ? '生成中...' : generateBtnText }}
+            {{ isGenerating ? '生成中...' : configStatus === 'loading' ? '配置加载中...' : configStatus === 'error' ? '配置加载失败' : priceStatus !== 'ready' ? '费用不可用' : generateBtnText }}
           </button>
         </div>
       </div>
@@ -687,16 +756,16 @@ class="custom-group-grid"
       @click.self="closeAssetModal"
     >
       <div class="modal-card asset-card">
-        <button class="close-modal" @click="closeAssetModal">×</button>
+        <button class="close-modal" :disabled="isAssetUploading" @click="closeAssetModal">×</button>
         <h2>{{ assetModalTitle }}</h2>
         <p class="breakdown-subtitle">{{ assetModalSubtitle }}</p>
 
         <!-- 上传模式 -->
         <div v-if="assetModalSource === 'upload'" class="asset-choices upload-choices">
-          <button class="upload-dropzone" @click="triggerFilePick">
-            <span>＋</span>
-            <strong>点击上传或拖拽文件到这里</strong>
-            <small>支持图片或视频</small>
+          <button class="upload-dropzone" :disabled="isAssetUploading" @click="triggerFilePick">
+            <span>{{ isAssetUploading ? '…' : '＋' }}</span>
+            <strong>{{ isAssetUploading ? '正在上传素材…' : '点击上传或拖拽文件到这里' }}</strong>
+            <small>{{ isAssetUploading ? '上传完成前请勿重复操作' : '支持图片或视频' }}</small>
           </button>
         </div>
 
@@ -707,6 +776,7 @@ class="custom-group-grid"
             :key="index"
             class="asset-choice-card"
             tabindex="0"
+            :aria-disabled="isAssetUploading"
             @click="applyAssetFromLibrary(asset)"
           >
             <img v-if="asset.previewUrl" :src="asset.previewUrl" :alt="asset.name" loading="lazy" />
@@ -1368,6 +1438,10 @@ class="custom-group-grid"
 .generation-config-panel {
   margin-top: 14px;
 }
+.config-state { display: flex; align-items: center; gap: 10px; margin: 8px 0 0; color: rgba(255,255,255,.58); font-size: 12px; }
+.config-state.error { color: #ff8585; }
+.config-state.warning { color: #d5ad63; }
+.config-state button { padding: 5px 9px; border-radius: 7px; color: #07110c; background: var(--green); font-size: 11px; font-weight: 800; }
 
 .generation-config-grid {
   display: grid;

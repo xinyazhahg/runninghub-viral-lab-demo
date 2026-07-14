@@ -7,6 +7,24 @@ const os = require("os");
 const fs = require("fs");
 const https = require("https");
 const crypto = require("crypto");
+const { createProjectAssetService } = require("./services/projectAssetService");
+const { createTaskResultService } = require("./services/taskResultService");
+const { createPromptModelService } = require("./services/promptModelService");
+const { createBillingService } = require("./services/billingService");
+const { createAnalyticsService } = require("./services/analyticsService");
+const { createAdminService, createRequireAdmin } = require("./services/adminService");
+const { createRequireAuth } = require("./services/authService");
+const { buildPersistedGenerationConfig, buildGenerationTaskInput } = require("./lib/generationConfig");
+const { normalizeMultipartFilename } = require("./lib/filenameEncoding");
+const { evaluateGenerationFinalization } = require("./lib/resultFinalization");
+const { selectTemplateType, buildPromptSnapshot } = require("./lib/promptBuilder");
+const { validateModelSelection } = require("./lib/modelConfig");
+const { calculateCreditCost, failureChargeRatio, numeric } = require("./lib/billingRules");
+const { ERROR_DEFINITIONS, appError, normalizeError } = require("./lib/errorCodes");
+const { createLogger } = require("./lib/logger");
+const { createStabilityService } = require("./services/stabilityService");
+const { createCoreSkillService } = require("./services/coreSkillService");
+const { deliverGeneratedResult } = require("./lib/resultDelivery");
 const FFMPEG_PATH = process.env.FFMPEG_PATH || require("ffmpeg-static");
 const FFPROBE_PATH = process.env.FFPROBE_PATH || require("ffprobe-static").path;
 for (const binaryPath of [FFMPEG_PATH, FFPROBE_PATH]) {
@@ -19,6 +37,9 @@ for (const binaryPath of [FFMPEG_PATH, FFPROBE_PATH]) {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const logger = createLogger();
+const SERVER_STARTED_AT = Date.now();
+const RECOVERY_WORKER_ID = `${os.hostname()}:${process.pid}:${crypto.randomUUID()}`;
 
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err);
@@ -55,8 +76,8 @@ const corsOptions = {
   origin(origin, callback) {
     callback(null, isOriginAllowed(origin));
   },
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  methods: ["GET", "POST", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Request-ID", "X-Idempotency-Key"],
   optionsSuccessStatus: 204,
 };
 
@@ -67,17 +88,94 @@ function applyCorsHeaders(req, res) {
 
   res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    req.headers["access-control-request-headers"] || "Content-Type,Authorization"
+    req.headers["access-control-request-headers"] || "Content-Type,Authorization,X-Request-ID,X-Idempotency-Key"
   );
   return true;
 }
 
 // uploads 目录：优先用环境变量，默认用 backend 目录下的 uploads
 const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(__dirname, "uploads");
-const upload = multer({ dest: UPLOADS_DIR });
+function normalizeUploadedFile(req, file, callback) {
+  file.originalname = normalizeMultipartFilename(file.originalname);
+  callback(null, true);
+}
+
+const upload = multer({ dest: UPLOADS_DIR, fileFilter: normalizeUploadedFile });
+const ORIGINAL_VIDEO_MAX_BYTES = 500 * 1024 * 1024;
+const REPLACEMENT_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
+
+function runSingleUpload(fieldName, maxBytes, allowedMimePrefix) {
+  const middleware = multer({
+    storage: multer.memoryStorage(), limits: { fileSize: maxBytes }, fileFilter: normalizeUploadedFile,
+  }).single(fieldName);
+  return (req, res, next) => middleware(req, res, (error) => {
+    if (error?.code === 'LIMIT_FILE_SIZE') return sendApiError(res, 413, 'FILE_TOO_LARGE', `文件大小不能超过 ${Math.floor(maxBytes / 1024 / 1024)}MB`);
+    if (error) return sendApiError(res, 500, 'ASSET_UPLOAD_FAILED', `文件上传失败：${error.message}`);
+    if (!req.file) return sendApiError(res, 400, "没有收到上传文件");
+    if (!req.file.mimetype?.startsWith(allowedMimePrefix)) {
+      return sendApiError(res, 415, 'FILE_TYPE_NOT_SUPPORTED', allowedMimePrefix === "video/" ? "仅支持视频文件" : "仅支持图片文件");
+    }
+    if (!req.file.size || req.file.size > maxBytes) {
+      return sendApiError(res, 413, 'FILE_TOO_LARGE', `文件大小不能超过 ${Math.floor(maxBytes / 1024 / 1024)}MB`);
+    }
+    return next();
+  });
+}
+
+function projectAssetService() {
+  return createProjectAssetService();
+}
+
+function taskResultService() {
+  return createTaskResultService();
+}
+
+function promptModelService() {
+  return createPromptModelService();
+}
+
+function billingService() {
+  return createBillingService();
+}
+
+function analyticsService() {
+  return createAnalyticsService();
+}
+
+function coreSkillService() {
+  return createCoreSkillService({ logger });
+}
+
+function recordAnalytics(event) {
+  analyticsService().record(event).catch((error) => console.warn("埋点写入失败：", event.eventName, error.message));
+}
+
+function storagePathFromSignedUrl(value) {
+  if (!/^https?:\/\//i.test(value || '')) return value || '';
+  try {
+    const url = new URL(value);
+    const marker = '/storage/v1/object/sign/';
+    const markerIndex = url.pathname.indexOf(marker);
+    if (markerIndex < 0) return '';
+    const bucketAndPath = url.pathname.slice(markerIndex + marker.length).split('/');
+    if (bucketAndPath.length < 2) return '';
+    return bucketAndPath.slice(1).map(decodeURIComponent).join('/');
+  } catch {
+    return '';
+  }
+}
+
+async function materializeResult(result) {
+  if (!result?.video_url) return result;
+  const storagePath = storagePathFromSignedUrl(result.video_url);
+  // 外部历史地址保持兼容；Supabase 私有签名地址必须按稳定路径重新签发。
+  if (!storagePath && /^https?:\/\//i.test(result.video_url)) return result;
+  const asset = await projectAssetService().signedAsset({ storage_path: storagePath });
+  return { ...result, storage_path: storagePath, signed_url: asset.signed_url, video_url: asset.signed_url };
+}
 
 // 旧版前端静态托管：指向同级 react-old 目录
 const LEGACY_FRONTEND_DIR = process.env.LEGACY_FRONTEND_DIR || path.join(__dirname, "..", "react-old");
@@ -111,17 +209,286 @@ app.use((err, req, res, next) => {
   return sendApiError(res, 500, "CORS 配置异常");
 });
 app.use(express.json());
+app.use((req, res, next) => {
+  const supplied = String(req.headers['x-request-id'] || '').trim();
+  const requestId = /^[A-Za-z0-9_.:-]{8,128}$/.test(supplied) ? supplied : crypto.randomUUID();
+  res.locals.requestId = requestId;
+  req.requestId = requestId;
+  res.setHeader('X-Request-ID', requestId);
+  const started = Date.now();
+  res.on('finish', () => logger.info({
+    requestId, userId: req.user?.id, action: `${req.method} ${req.path}`,
+    durationMs: Date.now() - started, status: String(res.statusCode), metadata: {},
+  }));
+  next();
+});
 app.use(express.static(LEGACY_FRONTEND_DIR));
 app.use("/uploads", express.static(UPLOADS_DIR));
 app.use("/generated", express.static("/tmp/openclaw/rh-output"));
 app.use("/assets", express.static(path.join(LEGACY_FRONTEND_DIR, "assets")));
 
-app.get("/api/health", (req, res) => {
+app.get("/api/live", (req, res) => res.json({ ok: true, status: 'live', uptimeSeconds: Math.floor((Date.now() - SERVER_STARTED_AT) / 1000), requestId: req.requestId }));
+
+app.get("/api/ready", async (req, res) => {
+  const stability = createStabilityService();
+  const [database, storage, worker] = await Promise.all([stability.checkDatabase(), stability.checkStorage(), stability.workerState()]);
+  const ok = database.ok && storage.ok && worker.ok;
+  res.status(ok ? 200 : 503).json({ ok, status: ok ? 'ready' : 'not_ready', checks: { database, storage, recoveryWorker: worker, modelService: { ok: !!process.env.RUNNINGHUB_API_KEY, configured: !!process.env.RUNNINGHUB_API_KEY } }, requestId: req.requestId });
+});
+
+app.get("/api/health", async (req, res) => {
+  const stability = createStabilityService();
+  const [database, storage, worker] = await Promise.all([stability.checkDatabase(), stability.checkStorage(), stability.workerState()]);
   res.json({
     ok: true,
     service: "viral-lab-backend",
     time: new Date().toISOString(),
+    requestId: req.requestId,
+    checks: { process: { ok: true }, database, storage, recoveryWorker: worker, modelService: { ok: !!process.env.RUNNINGHUB_API_KEY } },
   });
+});
+
+app.use("/api", createRequireAuth());
+
+const rateWindows = new Map();
+app.use('/api', (req, res, next) => {
+  const now = Date.now();
+  const key = `${req.user.id}:${req.path.startsWith('/projects/original-video') || req.path.includes('/assets/replacement') ? 'upload' : 'general'}`;
+  const limit = key.endsWith(':upload') ? 20 : 180;
+  const current = rateWindows.get(key);
+  if (!current || current.resetAt <= now) rateWindows.set(key, { count: 1, resetAt: now + 60000 });
+  else if (++current.count > limit) return sendApiError(res, 429, 'MODEL_RATE_LIMITED', '请求过于频繁，请稍后重试');
+  return next();
+});
+
+app.get("/api/me", async (req, res) => {
+  const admin = await createAdminService().getAdmin(req.user.id).catch(() => null);
+  res.json({ ok: true, user: { id: req.user.id, email: req.user.email || "", createdAt: req.user.created_at, isAdmin: !!admin, adminRole: admin?.role || null } });
+});
+
+app.post("/api/analytics/events", async (req, res) => {
+  try {
+    const outcome = await analyticsService().recordBatch(req.user.id, req.body?.events);
+    return res.status(202).json({ ok: true, ...outcome });
+  } catch (error) {
+    return sendApiError(res, 500, `埋点写入失败：${error.message}`);
+  }
+});
+
+const requireAdmin = createRequireAdmin();
+app.get("/api/admin/analytics/overview", requireAdmin, async (req, res) => {
+  try {
+    const to = req.query.to ? new Date(req.query.to) : new Date();
+    const from = req.query.from ? new Date(req.query.from) : new Date(to.getTime() - 30 * 86400000);
+    if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime()) || from >= to) return sendApiError(res, 400, "时间范围无效");
+    const filters = { from: from.toISOString(), to: to.toISOString(), modelId: String(req.query.modelId || ''), taskStatus: String(req.query.taskStatus || '') };
+    const data = await analyticsService().overview(filters);
+    return res.json({ ok: true, data, filters });
+  } catch (error) {
+    return sendApiError(res, 500, `读取运营指标失败：${error.message}`);
+  }
+});
+
+app.get("/api/admin/analytics/tasks", requireAdmin, async (req, res) => {
+  try {
+    const to = req.query.to ? new Date(req.query.to) : new Date();
+    const from = req.query.from ? new Date(req.query.from) : new Date(to.getTime() - 30 * 86400000);
+    const data = await analyticsService().listTasks({
+      from: from.toISOString(), to: to.toISOString(), modelId: String(req.query.modelId || ''),
+      taskStatus: String(req.query.taskStatus || ''), page: req.query.page, pageSize: req.query.pageSize,
+    });
+    return res.json({ ok: true, ...data });
+  } catch (error) {
+    return sendApiError(res, 500, `读取任务明细失败：${error.message}`);
+  }
+});
+
+app.get('/api/admin/stability/status', requireAdmin, async (req, res) => {
+  try {
+    const stability = createStabilityService();
+    const [data, database, storage, worker] = await Promise.all([stability.recentStatus(), stability.checkDatabase(), stability.checkStorage(), stability.workerState()]);
+    return res.json({ ok: true, data: { ...data, health: { process: { ok: true }, database, storage, recoveryWorker: worker, modelService: { ok: !!process.env.RUNNINGHUB_API_KEY } } } });
+  }
+  catch (error) { return sendApiError(res, 500, 'DATABASE_ERROR', `读取稳定性状态失败：${error.message}`); }
+});
+
+app.post('/api/admin/stability/storage-scan', requireAdmin, async (req, res) => {
+  try {
+    const outcome = await createStabilityService().scanStorage();
+    logger.info({ requestId: req.requestId, userId: req.user.id, action: 'storage.audit.scan', status: 'success', metadata: outcome });
+    return res.json({ ok: true, outcome });
+  } catch (error) {
+    logger.error({ requestId: req.requestId, userId: req.user.id, action: 'storage.audit.scan', status: 'failed', errorCode: 'STORAGE_ERROR', errorMessage: error.message });
+    return sendApiError(res, 503, 'STORAGE_ERROR', `Storage巡检失败：${error.message}`);
+  }
+});
+
+app.post('/api/admin/stability/storage-audits/:auditId/resolve', requireAdmin, async (req, res) => {
+  try {
+    const action = String(req.body?.action || '');
+    const audit = await createStabilityService().resolveStorageAudit(req.params.auditId, action);
+    if (!audit) return sendApiError(res, 404, 'ASSET_NOT_FOUND', 'Storage异常记录不存在或已处理');
+    logger.info({ requestId: req.requestId, userId: req.user.id, action: 'storage.audit.resolve', status: 'success', metadata: { auditId: audit.id, resolution: action, storagePath: audit.storage_path } });
+    return res.json({ ok: true, audit });
+  } catch (error) {
+    logger.error({ requestId: req.requestId, userId: req.user.id, action: 'storage.audit.resolve', status: 'failed', errorCode: 'STORAGE_ERROR', errorMessage: error.message, metadata: { auditId: req.params.auditId } });
+    return sendApiError(res, 503, 'STORAGE_ERROR', `Storage异常处理失败：${error.message}`);
+  }
+});
+
+app.get("/api/projects", async (req, res) => {
+  try {
+    const projects = await projectAssetService().listProjects(req.user.id);
+    return res.json({ ok: true, projects });
+  } catch (error) {
+    return sendApiError(res, 500, `读取我的作品失败：${error.message}`);
+  }
+});
+
+app.post("/api/projects", async (req, res) => {
+  try {
+    const project = await projectAssetService().createProject({ name: req.body?.name, userId: req.user.id });
+    recordAnalytics({ eventName: "create_project", userId: req.user.id, projectId: project.id, properties: {} });
+    return res.status(201).json({ ok: true, project });
+  } catch (error) {
+    return sendApiError(res, error.statusCode || 500, `创建 Project 失败：${error.message}`);
+  }
+});
+
+app.get("/api/projects/:projectId", async (req, res) => {
+  try {
+    const project = await projectAssetService().getProject(req.params.projectId, req.user.id);
+    if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
+    const [tasks, rawResults, prompts] = await Promise.all([
+      taskResultService().listProjectTasks(project.id, req.user.id),
+      taskResultService().listProjectResults(project.id, req.user.id),
+      promptModelService().listProjectPrompts(project.id, req.user.id),
+    ]);
+    const promptsByResult = new Map(prompts.map((item) => [item.result_id, item]));
+    const results = await Promise.all(rawResults.map(async (result) => ({
+      ...await materializeResult(result), prompt_version: promptsByResult.get(result.id) || null,
+    })));
+    return res.json({ ok: true, project, assets: project.assets || [], tasks, results, prompts });
+  } catch (error) {
+    return sendApiError(res, 500, `读取 Project 失败：${error.message}`);
+  }
+});
+
+app.delete("/api/projects/:projectId", async (req, res) => {
+  try {
+    const outcome = await projectAssetService().deleteProject(req.params.projectId, req.user.id);
+    if (!outcome.deleted) return res.json({ ok: true, deleted: true, idempotent: true, warnings: [] });
+    recordAnalytics({ eventName: "delete_project", userId: req.user.id, properties: { deleted_project_id: req.params.projectId } });
+    return res.json({ ok: true, deleted: true, warnings: outcome.warnings });
+  } catch (error) {
+    return sendApiError(res, 500, `删除 Project 失败：${error.message}`);
+  }
+});
+
+app.post("/api/projects/original-video", runSingleUpload("video", ORIGINAL_VIDEO_MAX_BYTES, "video/"), async (req, res) => {
+  const service = projectAssetService();
+  let project;
+  let createdProject = false;
+  try {
+    const requestedProjectId = String(req.body?.projectId || "").trim();
+    if (requestedProjectId) {
+      project = await service.getProject(requestedProjectId, req.user.id);
+      if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
+    } else {
+      project = await service.createProject({ name: req.body?.name || req.file.originalname, userId: req.user.id });
+      createdProject = true;
+    }
+    const asset = await service.uploadAsset({ projectId: project.id, userId: req.user.id, file: req.file, assetType: "original_video" });
+    project = await service.setOriginalAsset(project.id, asset.id, req.user.id);
+    if (createdProject) recordAnalytics({ eventName: "create_project", userId: req.user.id, projectId: project.id, properties: { source: "original_video_upload" } });
+    recordAnalytics({ eventName: "upload_original_video_success", userId: req.user.id, projectId: project.id, properties: { file_size: req.file.size, mime_type: req.file.mimetype } });
+    return res.status(201).json({ ok: true, project, asset });
+  } catch (error) {
+    if (createdProject && project?.id) await service.deleteProject(project.id, req.user.id).catch(() => {});
+    return sendApiError(res, error.statusCode || 500, `原视频持久化失败：${error.message}`);
+  }
+});
+
+app.post("/api/projects/:projectId/assets/replacement", runSingleUpload("image", REPLACEMENT_IMAGE_MAX_BYTES, "image/"), async (req, res) => {
+  try {
+    const service = projectAssetService();
+    const project = await service.getProject(req.params.projectId, req.user.id);
+    if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
+    const asset = await service.uploadAsset({
+      projectId: project.id, userId: req.user.id, file: req.file, assetType: "replacement_image",
+      replacementType: String(req.body?.replacementType || "").trim(),
+    });
+    recordAnalytics({ eventName: "upload_replacement_asset", userId: req.user.id, projectId: project.id, properties: { replacement_type: asset.replacement_type, file_size: req.file.size } });
+    return res.status(201).json({ ok: true, asset });
+  } catch (error) {
+    return sendApiError(res, error.statusCode || 500, `替换素材持久化失败：${error.message}`);
+  }
+});
+
+app.delete("/api/projects/:projectId/assets/:assetId", async (req, res) => {
+  try {
+    const deleted = await projectAssetService().deleteAsset(req.params.projectId, req.params.assetId, req.user.id);
+    if (!deleted) return sendApiError(res, 404, "Asset 不存在");
+    recordAnalytics({ eventName: "remove_replacement_asset", userId: req.user.id, projectId: req.params.projectId, properties: { asset_id: req.params.assetId } });
+    return res.json({ ok: true, deleted: true });
+  } catch (error) {
+    return sendApiError(res, error.statusCode || 500, `删除 Asset 失败：${error.message}`);
+  }
+});
+
+app.get("/api/projects/:projectId/tasks", async (req, res) => {
+  try {
+    const project = await projectAssetService().getProject(req.params.projectId, req.user.id);
+    if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
+    const tasks = await taskResultService().listProjectTasks(project.id, req.user.id);
+    return res.json({ ok: true, tasks });
+  } catch (error) {
+    return sendApiError(res, 500, `读取项目任务失败：${error.message}`);
+  }
+});
+
+app.get("/api/tasks/:taskId", async (req, res) => {
+  try {
+    const task = await taskResultService().getTask(req.params.taskId, req.user.id);
+    if (!task) return sendApiError(res, 404, "Task 不存在");
+    const result = task.status === "success" && task.task_type === "generate_video"
+      ? await taskResultService().getResultByTask(task.id, req.user.id) : null;
+    const safeResult = result ? await materializeResult(result) : null;
+    if (safeResult) safeResult.prompt_version = await promptModelService().getPromptByResult(result.id, req.user.id);
+    return res.json(publicPersistedTask(task, safeResult));
+  } catch (error) {
+    return sendApiError(res, 500, `读取 Task 失败：${error.message}`);
+  }
+});
+
+app.get("/api/projects/:projectId/results", async (req, res) => {
+  try {
+    const project = await projectAssetService().getProject(req.params.projectId, req.user.id);
+    if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
+    const [results, prompts] = await Promise.all([
+      taskResultService().listProjectResults(project.id, req.user.id),
+      promptModelService().listProjectPrompts(project.id, req.user.id),
+    ]);
+    const promptsByResult = new Map(prompts.map((item) => [item.result_id, item]));
+    return res.json({ ok: true, results: await Promise.all(results.map(async (result) => ({
+      ...await materializeResult(result), prompt_version: promptsByResult.get(result.id) || null,
+    }))) });
+  } catch (error) {
+    return sendApiError(res, 500, `读取项目结果失败：${error.message}`);
+  }
+});
+
+app.post("/api/tasks/:taskId/retry", async (req, res) => {
+  try {
+    const task = await taskResultService().getTask(req.params.taskId, req.user.id);
+    if (!task) return sendApiError(res, 404, "Task 不存在");
+    if (task.task_type !== "generate_video") return sendApiError(res, 409, "仅视频生成任务支持重新生成");
+    if (!["failed", "timeout"].includes(task.status)) return sendApiError(res, 409, "只有失败或超时任务可以重新生成");
+    const updated = await taskResultService().updateTask(task.id, { retry_count: Number(task.retry_count || 0) + 1 });
+    return res.json({ ok: true, retry: true, projectId: task.project_id, task: updated, inputData: task.input_data });
+  } catch (error) {
+    return sendApiError(res, 500, `准备重新生成失败：${error.message}`);
+  }
 });
 
 const RUNNINGHUB_SKILL_DIR =
@@ -134,11 +501,7 @@ const RH_UPLOAD_ENDPOINT = "/media/upload/binary";
 const RH_VIDEO_TO_TEXT_ENDPOINT = "rhart-text-g-25-flash/video-to-text";
 const RH_MAX_POLL_SECONDS = 1200;
 const RH_POLL_INTERVAL_MS = 5000;
-const VIDEO_ENDPOINT = "bytedance/seedance-2.0-global-fast/multimodal-video";
-const VIDEO_MODELS = [{ id: "kling-v3-pro", label: "可灵 v3.0 Pro", endpoint: VIDEO_ENDPOINT }];
-const VIDEO_RATIOS = ["9:16", "16:9", "4:3", "1:1", "3:4", "21:9"];
-const VIDEO_RESOLUTIONS = ["480p", "720p", "1080p", "2k", "4k"];
-const VIDEO_DURATIONS = Array.from({ length: 12 }, (_, index) => String(index + 4));
+const LEGACY_VIDEO_ENDPOINT = "bytedance/seedance-2.0-global-fast/multimodal-video";
 const generationTasks = new Map();
 const videoToTextTasks = new Map();
 
@@ -192,6 +555,88 @@ function publicGenerationTask(taskId, task) {
   return base;
 }
 
+function publicPersistedTask(task, result) {
+  const startedAt = task.started_at ? new Date(task.started_at).getTime() : Date.now();
+  const finishedAt = task.finished_at ? new Date(task.finished_at).getTime() : Date.now();
+  const base = {
+    ok: true,
+    taskId: task.id,
+    externalTaskId: task.external_task_id,
+    projectId: task.project_id,
+    taskType: task.task_type,
+    status: task.status,
+    stage: task.stage,
+    startedAt,
+    elapsed: Math.max(0, Math.floor((finishedAt - startedAt) / 1000)),
+    inputData: task.input_data || {},
+    config: task.input_data?.generation_config || task.input_data?.config || result?.model_params || {},
+    modelParams: result?.model_params || null,
+  };
+  if (task.status === "success") {
+    const videoToTextResult = task.task_type === "video_to_text" ? task.output_data?.result : task.output_data;
+    return {
+      ...base,
+      result: videoToTextResult,
+      rawResult: task.task_type === "video_to_text" ? task.output_data?.rawResult : task.output_data,
+      videoUrl: result?.video_url || task.output_data?.videoUrl || "",
+      finalPrompt: result?.prompt || task.output_data?.finalPrompt || "",
+      cost: result?.cost || task.output_data?.cost || "",
+      providerCost: result?.provider_cost ?? task.output_data?.providerCost ?? null,
+      creditCost: result?.credit_cost ?? task.output_data?.creditCost ?? null,
+      config: result?.model_params || task.input_data?.generation_config || task.output_data?.config || {},
+      version: result?.version || null,
+      promptVersion: result?.prompt_version || null,
+    };
+  }
+  if (["failed", "timeout", "cancelled"].includes(task.status)) {
+    return { ...base, error: task.error_message || "任务失败", errorCode: task.error_code || "TASK_FAILED" };
+  }
+  return base;
+}
+
+function cancelledTaskError() {
+  const error = new Error("任务已取消，不创建生成结果");
+  error.code = "TASK_CANCELLED";
+  return error;
+}
+
+async function checkGenerationFinalization(taskId, userId) {
+  const persistedTask = await taskResultService().getTask(taskId, userId);
+  const existingResult = persistedTask
+    ? await taskResultService().getResultByTask(taskId, userId)
+    : null;
+  const decision = evaluateGenerationFinalization(persistedTask, existingResult);
+  if (decision.action === "missing") {
+    const error = new Error("生成任务不存在或无权访问");
+    error.code = "TASK_NOT_FOUND";
+    throw error;
+  }
+  if (decision.action === "cancelled") throw cancelledTaskError();
+  if (decision.action === "timeout") throw appError('TASK_TIMEOUT', '任务已超时，忽略迟到的第三方成功结果');
+  return { persistedTask, existingResult };
+}
+
+async function releaseFailedTaskBilling(taskId, userId, providerCost = 0, { forceFullRefund = false } = {}) {
+  const persistedTask = await taskResultService().getTask(taskId, userId);
+  if (!persistedTask || persistedTask.billing_status === 'not_required') return null;
+  const quote = persistedTask.input_data?.billing_quote || {};
+  const settings = await billingService().getSettings().catch(() => ({ default_failure_charge_ratio: 0.2 }));
+  const ratio = forceFullRefund ? 0 : failureChargeRatio({
+    externalTaskId: persistedTask.external_task_id,
+    costRule: quote.costRule || {},
+    defaultRatio: settings.default_failure_charge_ratio,
+  });
+  const outcome = await billingService().releaseTask({ taskId, userId, chargeRatio: ratio, providerCost: numeric(providerCost) });
+  if (Number(outcome?.refund || 0) > 0) {
+    recordAnalytics({
+      eventName: "points_refunded", userId, projectId: persistedTask.project_id, taskId,
+      modelId: persistedTask.input_data?.config?.model_id || null,
+      properties: { refunded_cost: Number(outcome.refund), actual_cost: Number(outcome.actual_credit_cost || 0) },
+    });
+  }
+  return outcome;
+}
+
 function parseJsonFormField(value, fallback) {
   if (!value) return fallback;
   if (typeof value === "object") return value;
@@ -202,96 +647,9 @@ function parseJsonFormField(value, fallback) {
   }
 }
 
-function promptList(value) {
-  if (Array.isArray(value)) return value.map(String).map((item) => item.trim()).filter(Boolean);
-  if (typeof value === "string" && value.trim()) {
-    return value.split(/[、,，/]/).map((item) => item.trim()).filter(Boolean);
-  }
-  return [];
-}
-
-function uniquePromptList(values) {
-  return [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))];
-}
-
-function samePromptConcept(left, right) {
-  const normalize = (value) => String(value || "")
-    .toLowerCase()
-    .replace(/小狗|泰迪犬|宠物犬|犬只/g, "狗")
-    .replace(/小猫|猫咪/g, "猫")
-    .replace(/小径|道路|路面|石板路|石砖路|铺设路面|石砖地|地面/g, "小路")
-    .replace(/[\s的、]/g, "");
-  const a = normalize(left);
-  const b = normalize(right);
-  return Boolean(a && b && (a === b || a.includes(b) || b.includes(a)));
-}
-
-function buildFinalGenerationPrompt(breakdown, replacements, extraPrompt, fallbackPrompt) {
-  if (!breakdown || typeof breakdown !== "object" || !Array.isArray(replacements)) {
-    return fallbackPrompt || "根据参考图生成一段动态视频，保持真实镜头质感。";
-  }
-
-  const overview = breakdown.overview || {};
-  const shots = Array.isArray(breakdown.shots) ? breakdown.shots : [];
-  const changed = replacements.filter((item) => item && item.group && item.original && item.replacement);
-  const changedGroups = new Set(changed.map((item) => item.group));
-  const changedOriginals = changed.map((item) => String(item.original).trim());
-  const remaining = (values) => promptList(values).filter((item) =>
-    !changedOriginals.some((original) => samePromptConcept(item, original))
-  );
-  const subjects = remaining(overview.replaceableSubjects || breakdown.replaceableSubjects);
-  const scenes = remaining(overview.replaceableScenes || breakdown.replaceableScenes);
-  const elements = remaining(overview.replaceableElements || breakdown.replaceableElements);
-  const actions = uniquePromptList(shots.map((shot) => shot?.action));
-  const perspectives = uniquePromptList(shots.map((shot) =>
-    shot?.cameraPerspective || shot?.perspective || shot?.cameraAngle
-  ));
-  const cameraMovements = uniquePromptList(shots.map((shot) =>
-    shot?.cameraMovement || shot?.movement || shot?.camera
-  ));
-  const compositions = uniquePromptList(shots.map((shot) =>
-    shot?.composition || shot?.framing || shot?.description
-  ));
-
-  const replacementText = changed.length
-    ? changed.map((item) => `${item.group}“${item.original}”替换为“${item.replacement}”`).join("；")
-    : "不替换任何未明确选择的内容，仅按用户要求进行必要调整";
-  const describe = (label, values, fallback) =>
-    `${label}：${values.length ? values.join("、") : fallback}`;
-  const preserveLines = [
-    describe("未替换主体", subjects, changedGroups.has("主体") ? "除已选主体外的其他主体与主体关系" : "原视频全部主体"),
-    describe("未替换场景", scenes, changedGroups.has("场景") ? "除已选场景外的空间和环境" : "原视频全部场景"),
-    describe("动作与运动节奏", actions, "严格沿用原视频动作方向、速度和节奏"),
-    describe("镜头视角", perspectives, "严格沿用原视频镜头角度和观察视角"),
-    describe("镜头运动", cameraMovements, "严格沿用原视频运镜方式、镜头顺序和推进节奏"),
-    describe("画面构图", compositions, "严格沿用原视频主体位置、景别和空间关系"),
-    describe("未替换关键元素", elements, changedGroups.has("元素") ? "除已选元素外的其他原有物体" : "原视频全部关键元素"),
-  ];
-
-  const userText = String(extraPrompt || "").trim();
-  return [
-    "【本次替换】",
-    `仅执行以下替换：${replacementText}。`,
-    "",
-    "【必须保持的原视频内容】",
-    ...preserveLines,
-    "",
-    "【生成约束】",
-    "只修改用户明确选择的内容，所有未选择内容保持原视频不变。不要重新设计未被替换的主体、场景或元素。不要改变动作方向、运动节奏、镜头角度、镜头运动、画面构图、景别和空间关系。不要新增无关人物、动物、物体、文字、字幕、水印或标志，不要删除未选择替换的内容。保持画面真实自然、前后镜头一致。",
-    ...(userText ? ["", "【用户额外要求】", userText] : []),
-  ].join("\n");
-}
-
-function validateVideoConfig(input = {}) {
-  const model = VIDEO_MODELS.find((item) => item.id === (input.model || "kling-v3-pro"));
-  const ratio = String(input.aspectRatio || "9:16");
-  const resolution = String(input.resolution || "720p").toLowerCase();
-  const duration = String(input.duration || "10");
-  if (!model) throw new Error("所选生成模型暂不支持，请重新选择");
-  if (!VIDEO_RATIOS.includes(ratio)) throw new Error("所选视频比例暂不支持，请重新选择");
-  if (!VIDEO_RESOLUTIONS.includes(resolution)) throw new Error("所选清晰度暂不支持，请重新选择");
-  if (!VIDEO_DURATIONS.includes(duration)) throw new Error("所选视频时长暂不支持，请重新选择");
-  return { model, ratio, resolution, duration };
+async function validateVideoConfig(input = {}) {
+  const modelRecord = await promptModelService().getActiveModel(input.model || "kling-v3-pro");
+  return validateModelSelection(modelRecord, input);
 }
 
 function videoPricePayload(config) {
@@ -305,19 +663,81 @@ function videoPricePayload(config) {
   };
 }
 
+async function quoteGeneration(config) {
+  if (!process.env.RUNNINGHUB_API_KEY) throw new Error("后端未配置 RunningHub API Key");
+  if (config.model.costRule?.enabled !== true) {
+    const error = new Error("计费配置未初始化，请执行004和005 migration");
+    error.code = "BILLING_CONFIG_NOT_READY";
+    throw error;
+  }
+  const price = await postRunningHubJson(
+    process.env.RUNNINGHUB_API_KEY,
+    `${RH_BASE}/price-preview/${config.model.endpoint}`,
+    videoPricePayload(config),
+    30000
+  );
+  if (price.errorCode || !Number.isFinite(Number(price.estimatedPrice))) {
+    throw new Error(price.errorMessage || "RunningHub 未返回有效预估费用");
+  }
+  const providerCost = Number(price.estimatedPrice);
+  const creditCost = calculateCreditCost({
+    costRule: config.model.costRule, providerCost, duration: config.duration,
+    resolution: config.resolution, aspectRatio: config.ratio,
+  });
+  return { providerCost, creditCost, currency: price.currency || "CNY", costRule: config.model.costRule };
+}
+
 function getErrorMessage(err, fallback) {
   if (!err) return fallback;
   if (typeof err === "string") return err;
   return err.message || fallback;
 }
 
-function sendApiError(res, status, error, details) {
+function inferErrorCode(status, message = '') {
+  if (status === 401) return 'AUTH_INVALID';
+  if (status === 403) return 'PERMISSION_DENIED';
+  if (status === 404 && /project/i.test(message)) return 'PROJECT_NOT_FOUND';
+  if (status === 404 && /task|任务/i.test(message)) return 'TASK_NOT_FOUND';
+  if (status === 413 || /大小|too large/i.test(message)) return 'FILE_TOO_LARGE';
+  if (status === 415 || /文件类型|仅支持/i.test(message)) return 'FILE_TYPE_NOT_SUPPORTED';
+  if (status === 429) return 'MODEL_RATE_LIMITED';
+  if (status === 402 || /余额不足|积分不足/i.test(message)) return 'BALANCE_INSUFFICIENT';
+  if (status === 409 && /取消/i.test(message)) return 'TASK_CANCELLED';
+  if (status === 409) return 'TASK_STATE_INVALID';
+  if (/signed|签名|播放地址/i.test(message)) return 'SIGNED_URL_FAILED';
+  if (/storage|bucket|对象存储/i.test(message)) return 'STORAGE_ERROR';
+  if (/database|数据库/i.test(message)) return 'DATABASE_ERROR';
+  return status >= 500 ? 'INTERNAL_ERROR' : 'TASK_STATE_INVALID';
+}
+
+function classifyModelError(error) {
+  if (error?.code && ERROR_DEFINITIONS[error.code]) return error.code;
+  const message = String(error?.message || error || '');
+  if (/rate.?limit|too many|HTTP 429|频繁|限流/i.test(message)) return 'MODEL_RATE_LIMITED';
+  if (/content|safety|moderation|审核|违规|敏感/i.test(message)) return 'MODEL_CONTENT_REJECTED';
+  if (/未返回|结果无效|invalid result|output.*missing/i.test(message)) return 'MODEL_RESULT_INVALID';
+  if (/超时|timeout/i.test(message)) return 'TASK_TIMEOUT';
+  return 'MODEL_REQUEST_FAILED';
+}
+
+function sendApiError(res, status, errorOrCode, messageOrDetails, maybeDetails) {
   if (res.headersSent) return;
-  const message = error || "后端服务异常";
+  const explicitCode = typeof errorOrCode === 'string' && ERROR_DEFINITIONS[errorOrCode] ? errorOrCode : null;
+  const message = explicitCode
+    ? (typeof messageOrDetails === 'string' ? messageOrDetails : ERROR_DEFINITIONS[explicitCode][1])
+    : (errorOrCode || '后端服务异常');
+  const details = explicitCode ? maybeDetails : messageOrDetails;
+  const code = explicitCode || inferErrorCode(status, message);
+  logger.error({ requestId: res.locals.requestId, action: 'api.error', status: String(status), errorCode: code, errorMessage: message, metadata: details || {} });
+  const publicMessage = /column\s+[^\s]+\s+does not exist|relation\s+[^\s]+\s+does not exist|schema cache/i.test(String(message))
+    ? '素材信息加载失败，请稍后重试'
+    : message;
   res.status(status).json({
     ok: false,
-    error: message,
-    message,
+    error: code,
+    code,
+    message: publicMessage,
+    requestId: res.locals.requestId,
     ...(details ? { details } : {}),
   });
 }
@@ -423,7 +843,7 @@ async function uploadFileToRunningHub(apiKey, filePath) {
   throw new Error(`视频上传失败：${JSON.stringify(json)}`);
 }
 
-async function pollRunningHubTask(apiKey, taskId) {
+async function pollRunningHubTask(apiKey, taskId, onPoll, onRetry) {
   const url = `${RH_BASE}${RH_POLL_ENDPOINT}`;
   let elapsed = 0;
   let consecutiveFailures = 0;
@@ -435,6 +855,7 @@ async function pollRunningHubTask(apiKey, taskId) {
     try {
       const json = await postRunningHubJson(apiKey, url, { taskId }, 30000);
       consecutiveFailures = 0;
+      if (onPoll) await onPoll(json);
 
       if (json.status === "SUCCESS") {
         return json;
@@ -449,9 +870,11 @@ async function pollRunningHubTask(apiKey, taskId) {
         throw err;
       }
       consecutiveFailures += 1;
+      if (onRetry) await onRetry(err, consecutiveFailures);
       if (consecutiveFailures >= 5) {
         throw err;
       }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(8000, 1000 * (2 ** (consecutiveFailures - 1))) + Math.floor(Math.random() * 250)));
     }
   }
 
@@ -475,7 +898,7 @@ function formatRunningHubTextResult(finalResult) {
   return lines.join("\n");
 }
 
-async function runVideoToTextDirect(apiKey, videoPath, prompt) {
+async function runVideoToTextDirect(apiKey, videoPath, prompt, onSubmitted, onPoll, onRetry) {
   const videoUrl = await uploadFileToRunningHub(apiKey, videoPath);
   const submitResult = await postRunningHubJson(
     apiKey,
@@ -491,11 +914,12 @@ async function runVideoToTextDirect(apiKey, videoPath, prompt) {
   if (!taskId) {
     throw new Error(`未获取到 video-to-text taskId：${JSON.stringify(submitResult)}`);
   }
+  if (onSubmitted) await onSubmitted(taskId, submitResult);
 
   const finalResult =
     submitResult.status === "SUCCESS" && submitResult.results
       ? submitResult
-      : await pollRunningHubTask(apiKey, taskId);
+      : await pollRunningHubTask(apiKey, taskId, onPoll, onRetry);
 
   return formatRunningHubTextResult(finalResult);
 }
@@ -522,7 +946,7 @@ function getRunningHubRunner() {
   );
 }
 
-function runRunningHubScript(args, label) {
+function runRunningHubScript(args, label, onStdout) {
   return new Promise((resolve, reject) => {
     let child;
     let stdout = "";
@@ -541,7 +965,9 @@ function runRunningHubScript(args, label) {
     }
 
     child.stdout?.on("data", (data) => {
-      stdout += data.toString();
+      const text = data.toString();
+      stdout += text;
+      if (onStdout) onStdout(text);
     });
 
     child.stderr?.on("data", (data) => {
@@ -920,11 +1346,11 @@ const DEFAULT_PROMPT = `
 5. 不要编造视频中不存在的内容。
 `;
 
-app.post("/api/video-to-text", upload.single("video"), (req, res) => {
+app.post("/api/video-to-text", upload.single("video"), async (req, res) => {
   try {
     console.log("收到视频拆解请求：", req.file?.originalname, req.file?.size);
     if (!process.env.RUNNINGHUB_API_KEY) {
-      return sendApiError(res, 500, "后端未配置 RunningHub API Key");
+      return sendApiError(res, 503, 'MODEL_UNAVAILABLE', "模型服务尚未配置");
     }
 
     if (!req.file) {
@@ -932,12 +1358,35 @@ app.post("/api/video-to-text", upload.single("video"), (req, res) => {
     }
 
     const prompt = req.body.prompt || DEFAULT_PROMPT;
+    const projectId = String(req.body.projectId || "").trim();
+    if (!projectId) return sendApiError(res, 400, "缺少 projectId");
+    const ownedProject = await projectAssetService().getProject(projectId, req.user.id);
+    if (!ownedProject) return sendApiError(res, 404, "Project 不存在或无权访问");
     const videoPath = path.resolve(req.file.path);
     if (!fs.existsSync(videoPath)) {
       return sendApiError(res, 500, `上传视频文件不存在：${videoPath}`);
     }
 
-    const taskId = crypto.randomUUID();
+    const persistedTask = await taskResultService().createTask({
+      projectId,
+      userId: req.user.id,
+      taskType: "video_to_text",
+      status: "analyzing",
+      stage: "uploading_to_runninghub",
+      inputData: {
+        prompt,
+        originalAssetId: String(req.body.originalAssetId || "").trim(),
+        originalVideoUrl: String(req.body.originalVideoUrl || "").trim(),
+        originalVideoPath: ownedProject.assets?.find((asset) => asset.id === ownedProject.original_asset_id)?.storage_path || "",
+      },
+      idempotencyKey: String(req.body.idempotencyKey || req.headers['x-idempotency-key'] || '').trim() || null,
+    });
+    const taskId = persistedTask.id;
+    if (persistedTask.idempotent) {
+      logger.info({ requestId: req.requestId, userId: req.user.id, projectId, taskId, action: 'task.video_analysis.duplicate', status: persistedTask.status, errorCode: 'TASK_DUPLICATE' });
+      return res.status(200).json({ ok: true, status: persistedTask.status, taskId, idempotent: true });
+    }
+    recordAnalytics({ eventName: "video_analysis_start", userId: req.user.id, projectId, taskId, properties: {} });
     const task = {
       taskId,
       status: "running",
@@ -954,7 +1403,27 @@ app.post("/api/video-to-text", upload.single("video"), (req, res) => {
     console.log("开始后台执行 RunningHub video-to-text，本地 taskId:", taskId);
     res.status(202).json({ ok: true, status: "running", taskId });
 
-    runVideoToTextDirect(process.env.RUNNINGHUB_API_KEY, videoPath, prompt)
+    coreSkillService().execute('video_understanding', {
+      project_id: projectId, task_id: taskId, video_path: videoPath, prompt,
+      original_asset_id: String(req.body.originalAssetId || '').trim() || null,
+    }, {
+      requestId: req.requestId, userId: req.user.id, projectId, taskId,
+      skillName: 'video_understanding', modelName: RH_VIDEO_TO_TEXT_ENDPOINT,
+    }, () => runVideoToTextDirect(
+      process.env.RUNNINGHUB_API_KEY,
+      videoPath,
+      prompt,
+      async (externalTaskId) => taskResultService().updateTask(taskId, {
+        external_task_id: externalTaskId,
+        status: "analyzing",
+        stage: "analyzing",
+      }),
+      async () => taskResultService().updateTask(taskId, { status: "analyzing", stage: "polling" }),
+      async (retryError, attempt) => {
+        await taskResultService().updateTask(taskId, { retry_count: attempt, stage: 'polling_retry' });
+        logger.warn({ requestId: req.requestId, userId: req.user.id, projectId, taskId, action: 'model.poll.retry', status: 'retrying', errorCode: 'MODEL_REQUEST_FAILED', errorMessage: retryError.message, metadata: { attempt } });
+      }
+    ))
       .then(async (result) => {
         task.rawResult = result;
         const cleanedResult = cleanBreakdownForResponse(result);
@@ -968,67 +1437,115 @@ app.post("/api/video-to-text", upload.single("video"), (req, res) => {
         task.finishedAt = Date.now();
         task.elapsed = videoToTextTaskElapsed(task);
         task.result = enrichedResult;
+        await taskResultService().updateTask(taskId, {
+          status: "success",
+          stage: "completed",
+          output_data: { result: enrichedResult, rawResult: result },
+          error_code: null,
+          error_message: null,
+        });
+        recordAnalytics({ eventName: "video_analysis_success", userId: req.user.id, projectId, taskId, properties: { generation_time: task.elapsed } });
         console.log("video-to-text 后台任务成功：", taskId);
       })
-      .catch((err) => {
+      .catch(async (err) => {
         task.status = "failed";
         task.finishedAt = Date.now();
         task.elapsed = videoToTextTaskElapsed(task);
         task.error = `RunningHub video-to-text 调用失败：${getErrorMessage(err, "未知错误")}`;
+        await taskResultService().updateTask(taskId, {
+          status: /超时|timeout/i.test(task.error) ? "timeout" : "failed",
+          stage: "failed",
+          error_code: classifyModelError(task.error),
+          error_message: task.error,
+        }).catch((persistError) => console.error("video-to-text 失败状态持久化失败：", persistError));
+        recordAnalytics({ eventName: "video_analysis_failed", userId: req.user.id, projectId, taskId, properties: { error_code: classifyModelError(task.error), error_message: task.error } });
         console.error("video-to-text 后台任务失败：", taskId, err);
       });
   } catch (err) {
     console.error("video-to-text 失败：", err);
-    return sendApiError(res, 500, `RunningHub video-to-text 调用失败：${getErrorMessage(err, "未知错误")}`);
+    const code = classifyModelError(err);
+    return sendApiError(res, ERROR_DEFINITIONS[code][0], code, `视频拆解失败：${getErrorMessage(err, "未知错误")}`);
   }
 });
 
-app.get("/api/video-to-text-status", (req, res) => {
+app.get("/api/video-to-text-status", async (req, res) => {
   const taskId = typeof req.query.taskId === "string" ? req.query.taskId.trim() : "";
   if (!taskId) return sendApiError(res, 400, "缺少 taskId");
-  const task = videoToTextTasks.get(taskId);
-  if (!task) return sendApiError(res, 404, "未找到视频拆解任务");
-  task.elapsed = videoToTextTaskElapsed(task);
-  return res.json(publicVideoToTextTask(task));
+  try {
+    const task = await taskResultService().getTask(taskId, req.user.id);
+    if (!task || task.task_type !== "video_to_text") return sendApiError(res, 404, "未找到视频拆解任务");
+    const payload = publicPersistedTask(task);
+    if (task.status === "success") payload.result = task.output_data?.result;
+    return res.json(payload);
+  } catch (error) {
+    return sendApiError(res, 500, `查询视频拆解任务失败：${error.message}`);
+  }
 });
 
-app.get("/api/generate-config", (req, res) => {
-  res.json({
-    ok: true,
-    models: VIDEO_MODELS.map(({ id, label }) => ({ id, label })),
-    ratios: VIDEO_RATIOS,
-    resolutions: VIDEO_RESOLUTIONS,
-    durations: VIDEO_DURATIONS,
-  });
+app.get("/api/generate-config", async (req, res) => {
+  try {
+    const models = await promptModelService().listActiveModels();
+    if (!models.length) return sendApiError(res, 503, "没有启用中的模型配置，请在model_configs中启用至少一个模型");
+    const compatibilityFallback = models.some((item) => item._source === 'compatibility_fallback');
+    return res.json({
+      ok: true,
+      models: models.map((item) => ({
+        id: item.model_id, label: item.model_name, provider: item.provider,
+        durations: item.supported_durations, ratios: item.supported_ratios,
+        resolutions: item.supported_resolutions, capability: item.capability,
+      })),
+      ratios: [...new Set(models.flatMap((item) => item.supported_ratios || []))],
+      resolutions: [...new Set(models.flatMap((item) => item.supported_resolutions || []))],
+      durations: [...new Set(models.flatMap((item) => item.supported_durations || []))],
+      source: compatibilityFallback ? 'compatibility_fallback' : 'database',
+      warning: compatibilityFallback ? '数据库尚未执行004 migration；当前仅展示兼容模型，生成与计费保持禁用。' : '',
+    });
+  } catch (error) {
+    return sendApiError(res, 500, `读取模型配置失败：${error.message}`);
+  }
+});
+
+app.get("/api/billing/account", async (req, res) => {
+  try {
+    const account = await billingService().getAccount(req.user.id);
+    if (!account) return sendApiError(res, 404, "积分账户不存在，请联系管理员初始化");
+    return res.json({ ok: true, account });
+  } catch (error) {
+    return sendApiError(res, 500, `读取积分账户失败：${error.message}`);
+  }
+});
+
+app.get("/api/billing/transactions", async (req, res) => {
+  try {
+    const transactions = await billingService().listTransactions(req.user.id, req.query.limit);
+    return res.json({ ok: true, transactions });
+  } catch (error) {
+    return sendApiError(res, 500, `读取积分流水失败：${error.message}`);
+  }
 });
 
 app.post("/api/generate-price", async (req, res) => {
   try {
-    if (!process.env.RUNNINGHUB_API_KEY) return sendApiError(res, 500, "后端未配置 RunningHub API Key");
-    const config = validateVideoConfig(req.body);
-    const price = await postRunningHubJson(
-      process.env.RUNNINGHUB_API_KEY,
-      `${RH_BASE}/price-preview/${config.model.endpoint}`,
-      videoPricePayload(config),
-      30000
-    );
-    if (price.errorCode || !Number.isFinite(Number(price.estimatedPrice))) {
-      throw new Error(price.errorMessage || "RunningHub 未返回有效预估费用");
-    }
+    const config = await validateVideoConfig(req.body);
+    const [quote, account] = await Promise.all([quoteGeneration(config), billingService().getAccount(req.user.id)]);
     res.json({
       ok: true,
-      estimatedPrice: Number(price.estimatedPrice),
-      currency: price.currency || "CNY",
+      estimatedPrice: quote.providerCost,
+      estimatedCredits: quote.creditCost,
+      currency: quote.currency,
+      balance: Number(account?.balance || 0),
+      frozenBalance: Number(account?.frozen_balance || 0),
+      sufficient: Number(account?.balance || 0) >= quote.creditCost,
     });
   } catch (err) {
     return sendApiError(res, 400, `暂时无法计算本次生成费用：${getErrorMessage(err, "请稍后重试")}`);
   }
 });
 
-app.post("/api/generate-video", upload.single("image"), (req, res) => {
+app.post("/api/generate-video", upload.single("image"), async (req, res) => {
   try {
   if (!process.env.RUNNINGHUB_API_KEY) {
-    return sendApiError(res, 500, "后端未配置 RunningHub API Key");
+    return sendApiError(res, 503, 'MODEL_UNAVAILABLE', "模型服务尚未配置");
   }
 
   if (!req.file) {
@@ -1037,28 +1554,99 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
 
   const breakdown = parseJsonFormField(req.body.breakdown, null);
   const replacements = parseJsonFormField(req.body.replacements, null);
-  const prompt = buildFinalGenerationPrompt(
-    breakdown,
-    replacements,
-    req.body.extraPrompt,
-    req.body.prompt
-  );
-  const config = validateVideoConfig(req.body);
+  const config = await validateVideoConfig(req.body);
+  const projectId = String(req.body.projectId || "").trim();
+  if (!projectId) return sendApiError(res, 400, "缺少 projectId");
+  const project = await projectAssetService().getProject(projectId, req.user.id);
+  if (!project) return sendApiError(res, 404, "Project 不存在或已失效");
+  const templateType = selectTemplateType(Array.isArray(replacements) ? replacements : []);
+  const [template, previousPrompt] = await Promise.all([
+    promptModelService().getActiveTemplate(templateType),
+    promptModelService().getLatestProjectPrompt(projectId, req.user.id),
+  ]);
+  const promptSkillInput = {
+    project_id: projectId, task_id: null, template, breakdown,
+    replacements: Array.isArray(replacements) ? replacements : [],
+    user_requirement: req.body.extraPrompt || '', model_id: config.model.id,
+    model_params: buildPersistedGenerationConfig(config), previous: previousPrompt,
+  };
+  const promptSnapshot = await coreSkillService().execute('prompt_generation', promptSkillInput, {
+    requestId: req.requestId, userId: req.user.id, projectId,
+    skillName: 'prompt_generation', modelName: 'template_renderer_v1',
+  }, (input) => buildPromptSnapshot({
+    template: input.template, breakdown: input.breakdown, replacements: input.replacements,
+    userRequirement: input.user_requirement, modelId: input.model_id,
+    modelParams: input.model_params, previous: input.previous,
+  }));
+  const prompt = promptSnapshot.generated_prompt;
+  if (!prompt.trim()) return sendApiError(res, 400, "生成Prompt不能为空");
+  const billingQuote = await quoteGeneration(config);
   const imagePath = path.resolve(req.file.path);
   if (!fs.existsSync(imagePath)) {
     return sendApiError(res, 500, `上传图片文件不存在：${imagePath}`);
   }
-
-  const taskId = crypto.randomUUID();
-  const generatedOutputFile = path.join("/tmp/openclaw/rh-output", `${taskId}-video.mp4`);
-  const finalOutputFile = path.join("/tmp/openclaw/rh-output", `${taskId}.mp4`);
-  const sourceVideoTaskId = String(req.body.sourceVideoTaskId || "").trim();
-  const sourceVideoPath = videoToTextTasks.get(sourceVideoTaskId)?.videoPath || "";
   const clipStart = Math.max(0, Number(req.body.clipStart) || 0);
   const requestedClipEnd = Number(req.body.clipEnd);
   const clipEnd = Number.isFinite(requestedClipEnd) && requestedClipEnd > clipStart
     ? requestedClipEnd
     : clipStart + Number(config.duration);
+  const persistedGenerationConfig = buildPersistedGenerationConfig(config, { clipStart, clipEnd });
+
+  const persistedTask = await taskResultService().createTask({
+    projectId,
+    userId: req.user.id,
+    taskType: "generate_video",
+    status: "created",
+    stage: "billing_pending",
+    inputData: buildGenerationTaskInput({
+      prompt, breakdown, replacements, extraPrompt: req.body.extraPrompt || "",
+      sourceVideoTaskId: String(req.body.sourceVideoTaskId || "").trim(),
+      sourceVideoUrl: project.assets?.find((asset) => asset.id === project.original_asset_id)?.public_url || "",
+      sourceVideoStoragePath: project.assets?.find((asset) => asset.id === project.original_asset_id)?.storage_path || "",
+      generationConfig: persistedGenerationConfig, clipStart, clipEnd, promptSnapshot, billingQuote,
+    }),
+    idempotencyKey: String(req.body.idempotencyKey || req.headers['x-idempotency-key'] || '').trim() || null,
+  });
+  const taskId = persistedTask.id;
+  if (persistedTask.idempotent) {
+    const existingResult = await taskResultService().getResultByTask(taskId, req.user.id).catch(() => null);
+    logger.info({ requestId: req.requestId, userId: req.user.id, projectId, taskId, action: 'task.generation.duplicate', status: persistedTask.status, errorCode: 'TASK_DUPLICATE' });
+    return res.status(200).json({ ok: true, status: persistedTask.status, taskId, idempotent: true, result: existingResult ? await materializeResult(existingResult) : null });
+  }
+  recordAnalytics({ eventName: "generation_submit", userId: req.user.id, projectId, taskId, modelId: config.model.id, properties: { duration: config.duration, resolution: config.resolution, aspect_ratio: config.ratio, model_name: config.model.model_name, prompt_length: prompt.length, template_type: templateType, estimated_cost: billingQuote.creditCost } });
+  let freezeOutcome;
+  try {
+    freezeOutcome = await billingService().freezeTask({
+      taskId, userId: req.user.id, creditCost: billingQuote.creditCost, providerCost: billingQuote.providerCost,
+    });
+  } catch (billingError) {
+    const insufficient = /INSUFFICIENT_CREDITS/i.test(billingError.message || "");
+    await taskResultService().updateTask(taskId, {
+      status: "cancelled", stage: "billing_rejected",
+      error_code: insufficient ? "BALANCE_INSUFFICIENT" : "POINTS_FREEZE_FAILED",
+      error_message: insufficient ? "积分余额不足" : `积分冻结失败：${billingError.message}`,
+    }).catch(() => {});
+    recordAnalytics({ eventName: insufficient ? "insufficient_balance" : "generation_cancelled", userId: req.user.id, projectId, taskId, modelId: config.model.id, properties: { error_code: insufficient ? "BALANCE_INSUFFICIENT" : "POINTS_FREEZE_FAILED" } });
+    return sendApiError(res, insufficient ? 402 : 500, insufficient ? 'BALANCE_INSUFFICIENT' : 'POINTS_FREEZE_FAILED', insufficient ? "积分余额不足，无法提交生成任务" : `积分冻结失败：${billingError.message}`);
+  }
+  await taskResultService().updateTask(taskId, { status: "queued", stage: "queued" });
+  recordAnalytics({ eventName: "points_frozen", userId: req.user.id, projectId, taskId, modelId: config.model.id, properties: { estimated_cost: billingQuote.creditCost } });
+  recordAnalytics({ eventName: "generation_queued", userId: req.user.id, projectId, taskId, modelId: config.model.id, properties: {} });
+  const generatedOutputFile = path.join("/tmp/openclaw/rh-output", `${taskId}-video.mp4`);
+  const finalOutputFile = path.join("/tmp/openclaw/rh-output", `${taskId}.mp4`);
+  const sourceVideoTaskId = String(req.body.sourceVideoTaskId || "").trim();
+  let sourceVideoPath = videoToTextTasks.get(sourceVideoTaskId)?.videoPath || "";
+  const sourceVideoUrl = project.assets?.find((asset) => asset.id === project.original_asset_id)?.public_url || "";
+  if (!sourceVideoPath && sourceVideoUrl) {
+    try {
+      sourceVideoPath = await downloadRemoteFile(
+        sourceVideoUrl,
+        path.join("/tmp/openclaw/rh-source", `${taskId}-source.mp4`)
+      );
+    } catch (error) {
+      console.warn("持久化原视频下载失败，将生成无音频版本：", error.message);
+    }
+  }
   const args = [
   "scripts/runninghub.js",
   "--endpoint",
@@ -1098,22 +1686,53 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
     clipStart,
     clipEnd,
     generatedDuration: Number(config.duration),
-    config: {
-      model: config.model.id,
-      modelLabel: config.model.label,
-      ratio: config.ratio,
-      resolution: config.resolution,
-      duration: config.duration,
-    },
+    config: persistedGenerationConfig,
+    billingQuote,
   };
   generationTasks.set(taskId, task);
 
   console.log("收到视频生成请求：", req.file?.originalname, req.file?.size, "本地 taskId:", taskId);
   console.log("[generate-video] final prompt:", prompt);
-  res.status(202).json({ ok: true, status: "running", taskId });
-
-  runRunningHubScript(args, `RunningHub image-to-video ${taskId}`)
+  let externalTaskBuffer = "";
+  let externalTaskUpdate = Promise.resolve();
+  let lastPersistedRetryAttempt = 0;
+  await taskResultService().updateTask(taskId, { status: "generating", stage: "submitting" });
+  recordAnalytics({ eventName: "generation_started", userId: req.user.id, projectId, taskId, modelId: config.model.id, properties: {} });
+  res.status(202).json({
+    ok: true, status: "running", taskId,
+    estimatedCredits: billingQuote.creditCost,
+    balance: freezeOutcome?.balance,
+    frozenBalance: freezeOutcome?.frozen_balance,
+  });
+  coreSkillService().execute('video_generation', {
+    project_id: projectId, task_id: taskId, image_path: imagePath, prompt,
+    model_id: config.model.id, model_endpoint: config.model.endpoint,
+    duration: Number(config.duration), aspect_ratio: config.ratio, resolution: config.resolution,
+    source_video_storage_path: persistedTask.input_data?.sourceVideoStoragePath || null,
+  }, {
+    requestId: req.requestId, userId: req.user.id, projectId, taskId,
+    skillName: 'video_generation', modelName: persistedGenerationConfig.model_name,
+  }, () => runRunningHubScript(args, `RunningHub image-to-video ${taskId}`, (text) => {
+    externalTaskBuffer += text;
+    const externalTaskId = externalTaskBuffer.match(/TASK_ID:([^\s]+)/)?.[1];
+    if (externalTaskId) {
+      externalTaskUpdate = taskResultService().updateTask(taskId, {
+        external_task_id: externalTaskId,
+        status: "generating",
+        stage: "polling",
+      }).catch((error) => console.error("生成任务 external_task_id 持久化失败：", error));
+    }
+    const retryMatches = [...externalTaskBuffer.matchAll(/RETRY_ATTEMPT:(\d+)/g)];
+    const retryAttempt = Number(retryMatches.at(-1)?.[1] || 0);
+    if (retryAttempt > lastPersistedRetryAttempt) {
+      lastPersistedRetryAttempt = retryAttempt;
+      externalTaskUpdate = externalTaskUpdate.then(() => taskResultService().updateTask(taskId, {
+        retry_count: retryAttempt, stage: 'polling_retry',
+      })).then(() => logger.warn({ requestId: req.requestId, userId: req.user.id, projectId, taskId, externalTaskId, modelName: persistedGenerationConfig.model_name, action: 'model.poll.retry', status: 'retrying', errorCode: 'MODEL_REQUEST_FAILED', metadata: { attempt: retryAttempt } })).catch((error) => console.error("生成任务重试次数持久化失败：", error));
+    }
+  }))
     .then(async (stdout) => {
+      await externalTaskUpdate;
       const parsed = parseGenerationOutput(stdout);
       if (!parsed.outputFile || !parsed.videoUrl) {
         throw new Error("RunningHub 生成完成但未返回输出视频文件");
@@ -1137,48 +1756,132 @@ app.post("/api/generate-video", upload.single("image"), (req, res) => {
       task.outputFile = outputFile;
       task.cost = parsed.cost;
       task.result = finalResult;
+      const actualProviderCost = numeric(parsed.cost, billingQuote.providerCost);
+      const actualCreditCost = calculateCreditCost({
+        costRule: billingQuote.costRule, providerCost: actualProviderCost,
+        duration: persistedGenerationConfig.duration, resolution: persistedGenerationConfig.resolution,
+        aspectRatio: persistedGenerationConfig.aspect_ratio,
+      });
+      const beforeUpload = await checkGenerationFinalization(taskId, req.user.id);
+      if (beforeUpload.existingResult) {
+        await billingService().settleTask({
+          taskId, userId: req.user.id, creditCost: actualCreditCost, providerCost: actualProviderCost,
+        });
+        await taskResultService().updateTask(taskId, { status: "success", stage: "completed", error_code: null, error_message: null });
+        task.videoUrl = beforeUpload.existingResult.video_url;
+        console.log("[generate-video] Result 已存在，跳过重复收口：", taskId);
+        return;
+      }
+      const { asset: resultAsset, result: persistedResult } = await deliverGeneratedResult({
+        uploadAsset: () => projectAssetService().uploadAsset({
+          projectId, userId: req.user.id, assetType: "result_video", sourceTaskId: taskId,
+          file: {
+            originalname: `${taskId}.mp4`, mimetype: "video/mp4",
+            size: fs.statSync(outputFile).size, buffer: fs.readFileSync(outputFile),
+          },
+        }),
+        createResult: (asset) => taskResultService().createResult({
+          projectId, userId: req.user.id, taskId, videoUrl: asset.storage_path, prompt,
+          modelName: persistedGenerationConfig.model_name, modelParams: persistedGenerationConfig,
+          duration: persistedGenerationConfig.duration, cost: parsed.cost, promptSnapshot,
+          providerCost: actualProviderCost, creditCost: actualCreditCost,
+        }),
+        settleBilling: async () => {
+          try {
+            await billingService().settleTask({
+              taskId, userId: req.user.id, creditCost: actualCreditCost, providerCost: actualProviderCost,
+            });
+          } catch (billingError) {
+            throw appError('POINTS_CHARGE_FAILED', `积分结算失败：${billingError.message}`);
+          }
+        },
+        markSuccess: ({ asset, result }) => taskResultService().updateTask(taskId, {
+          status: "success", stage: "completed",
+          output_data: {
+            videoUrl: asset.storage_path, assetId: asset.id, finalPrompt: prompt, cost: parsed.cost,
+            providerCost: actualProviderCost, creditCost: actualCreditCost,
+            config: task.config, version: result.version,
+          },
+          error_code: null, error_message: null,
+        }),
+        deleteResult: () => taskResultService().deleteResultByTask(taskId, req.user.id),
+        deleteAsset: (asset) => projectAssetService().deleteAsset(projectId, asset.id, req.user.id),
+      });
+      recordAnalytics({ eventName: "points_charged", userId: req.user.id, projectId, taskId, modelId: config.model.id, properties: { actual_cost: actualCreditCost, provider_cost: actualProviderCost } });
+      recordAnalytics({ eventName: "generation_success", userId: req.user.id, projectId, taskId, resultId: persistedResult.id, modelId: config.model.id, properties: { duration: persistedGenerationConfig.duration, resolution: persistedGenerationConfig.resolution, aspect_ratio: persistedGenerationConfig.aspect_ratio, model_name: persistedGenerationConfig.model_name, generation_time: task.elapsed, actual_cost: actualCreditCost, version: persistedResult.version } });
+      task.videoUrl = resultAsset.public_url;
       console.log("generate-video 后台任务成功：", taskId, outputFile);
     })
-    .catch((err) => {
+    .catch(async (err) => {
+      const currentTask = await taskResultService().getTask(taskId, req.user.id).catch(() => null);
+      if (currentTask?.status === "cancelled" || err.code === "TASK_CANCELLED") {
+        await releaseFailedTaskBilling(taskId, req.user.id, task.cost).catch((error) => {
+          console.error("cancelled Task 积分处理失败：", taskId, error.message);
+        });
+        task.status = "cancelled";
+        task.error = "任务已取消";
+        console.log("generate-video 完成回调已忽略 cancelled Task：", taskId);
+        return;
+      }
       task.status = "failed";
       task.finishedAt = Date.now();
       task.elapsed = generationTaskElapsed(task);
       task.error = getErrorMessage(err, "RunningHub 视频生成失败");
+      const timedOut = /超时|timeout/i.test(task.error);
+      await releaseFailedTaskBilling(taskId, req.user.id, task.cost, {
+        forceFullRefund: ['storage_upload', 'result_create', 'billing_settle', 'task_complete'].includes(err.deliveryStage),
+      }).catch((error) => {
+        console.error("失败 Task 积分退款失败：", taskId, error.message);
+      });
+      await taskResultService().updateTask(taskId, {
+        status: timedOut ? "timeout" : "failed",
+        stage: "failed",
+        error_code: timedOut ? "TASK_TIMEOUT" : classifyModelError(err),
+        error_message: task.error,
+      }).catch((persistError) => console.error("generate-video 失败状态持久化失败：", persistError));
+      recordAnalytics({ eventName: timedOut ? "generation_timeout" : "generation_failed", userId: req.user.id, projectId, taskId, modelId: config.model.id, properties: { error_code: timedOut ? "TASK_TIMEOUT" : classifyModelError(err), error_message: task.error, generation_time: task.elapsed } });
       console.error("generate-video 后台任务失败：", taskId, err);
     });
   } catch (err) {
     console.error("generate-video 失败：", err);
     const message = getErrorMessage(err, "RunningHub 视频生成失败");
-    return sendApiError(res, message.includes("所选") ? 400 : 500, message);
+    const code = message.includes('所选') ? 'TASK_STATE_INVALID' : classifyModelError(err);
+    return sendApiError(res, message.includes("所选") ? 400 : ERROR_DEFINITIONS[code][0], code, message);
   }
 });
 
-app.get("/api/generate-status", (req, res) => {
+app.get("/api/generate-status", async (req, res) => {
   const taskId = typeof req.query.taskId === "string" ? req.query.taskId.trim() : "";
   if (!taskId) return sendApiError(res, 400, "缺少 taskId");
-  const task = generationTasks.get(taskId);
-  if (!task) return sendApiError(res, 404, "未找到生成任务");
-  task.elapsed = generationTaskElapsed(task);
-  return res.json(publicGenerationTask(taskId, task));
+  try {
+    const task = await taskResultService().getTask(taskId, req.user.id);
+    if (!task || task.task_type !== "generate_video") return sendApiError(res, 404, "未找到生成任务");
+    const result = task.status === "success" ? await taskResultService().getResultByTask(task.id, req.user.id) : null;
+    const safeResult = result ? await materializeResult(result) : null;
+    if (safeResult) safeResult.prompt_version = await promptModelService().getPromptByResult(result.id, req.user.id);
+    return res.json(publicPersistedTask(task, safeResult));
+  } catch (error) {
+    return sendApiError(res, 500, `查询生成任务失败：${error.message}`);
+  }
 });
 
-app.get("/api/download-video", (req, res) => {
+app.get("/api/download-video", async (req, res) => {
   try {
-    const rawVideoUrl = typeof req.query.videoUrl === "string" ? req.query.videoUrl : "";
+    const projectId = typeof req.query.projectId === "string" ? req.query.projectId.trim() : "";
     const version = typeof req.query.version === "string" ? req.query.version.trim() : "";
-    if (!rawVideoUrl) return sendApiError(res, 400, "缺少视频地址");
+    if (!projectId) return sendApiError(res, 400, "缺少 projectId");
     if (!/^V\d+$/.test(version)) return sendApiError(res, 400, "版本号无效");
-    const parsedUrl = new URL(rawVideoUrl, "http://localhost");
-    if (!parsedUrl.pathname.startsWith("/generated/")) {
-      return sendApiError(res, 400, "仅支持导出真实生成视频");
-    }
-    const filename = path.basename(decodeURIComponent(parsedUrl.pathname));
-    if (!/^[a-zA-Z0-9._-]+\.mp4$/i.test(filename)) {
-      return sendApiError(res, 400, "视频文件名无效");
-    }
-    const filePath = path.join("/tmp/openclaw/rh-output", filename);
-    if (!fs.existsSync(filePath)) return sendApiError(res, 404, "视频文件不存在或已过期");
-    return res.download(filePath, `爆款实验室_${version}.mp4`);
+    const project = await projectAssetService().getProject(projectId, req.user.id);
+    if (!project) return sendApiError(res, 404, "Project 不存在或无权访问");
+    const results = await taskResultService().listProjectResults(projectId, req.user.id);
+    const result = results.find((item) => Number(item.version) === Number(version.slice(1)));
+    if (!result) return sendApiError(res, 404, "生成版本不存在");
+    const safeResult = await materializeResult(result);
+    const response = await fetch(safeResult.video_url);
+    if (!response.ok) return sendApiError(res, 502, `读取生成视频失败：HTTP ${response.status}`);
+    res.setHeader("Content-Type", response.headers.get("content-type") || "video/mp4");
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(`爆款实验室_${version}.mp4`)}`);
+    return res.send(Buffer.from(await response.arrayBuffer()));
   } catch (err) {
     return sendApiError(res, 500, getErrorMessage(err, "视频导出失败"));
   }
@@ -1437,6 +2140,224 @@ app.post("/api/extract-element-preview", upload.single("image"), async (req, res
   }
 });
 
+async function downloadRemoteFile(url, outputPath) {
+  if (!url) return "";
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`下载持久化原视频失败：HTTP ${response.status}`);
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  fs.writeFileSync(outputPath, Buffer.from(await response.arrayBuffer()));
+  return outputPath;
+}
+
+async function recoverVideoToTextTask(task) {
+  const skillResult = await coreSkillService().execute('video_understanding', {
+    project_id: task.project_id, task_id: task.id,
+    video_path: task.input_data?.originalVideoPath || task.input_data?.originalVideoUrl || 'recovery-source',
+    prompt: task.input_data?.prompt || DEFAULT_PROMPT, original_asset_id: task.input_data?.originalAssetId || null,
+  }, {
+    userId: task.user_id, projectId: task.project_id, taskId: task.id,
+    externalTaskId: task.external_task_id, skillName: 'video_understanding', modelName: RH_VIDEO_TO_TEXT_ENDPOINT,
+  }, async () => {
+  const final = await pollRunningHubTask(process.env.RUNNINGHUB_API_KEY, task.external_task_id, async () => {
+    await taskResultService().updateTask(task.id, { status: "analyzing", stage: "polling_after_restart" });
+  }, async (retryError, attempt) => {
+    await taskResultService().updateTask(task.id, { retry_count: Number(task.retry_count || 0) + attempt, stage: 'recovery_polling_retry' });
+    logger.warn({ taskId: task.id, userId: task.user_id, projectId: task.project_id, externalTaskId: task.external_task_id, action: 'task.recovery.poll_retry', status: 'retrying', errorCode: 'MODEL_REQUEST_FAILED', errorMessage: retryError.message, metadata: { attempt } });
+  });
+  const rawResult = formatRunningHubTextResult(final);
+  return rawResult;
+  });
+  const rawResult = skillResult;
+  const cleanedResult = cleanBreakdownForResponse(rawResult);
+  let result = cleanedResult;
+  let originalVideoUrl = task.input_data?.originalVideoUrl;
+  if (task.input_data?.originalVideoPath) {
+    originalVideoUrl = (await projectAssetService().signedAsset({ storage_path: task.input_data.originalVideoPath })).signed_url;
+  }
+  if (originalVideoUrl) {
+    try {
+      const videoPath = await downloadRemoteFile(
+        originalVideoUrl,
+        path.join("/tmp/openclaw/rh-recovery", `${task.id}-source.mp4`)
+      );
+      result = await generateBreakdownPreviews(cleanedResult, videoPath, task.id);
+    } catch (error) {
+      console.warn("恢复拆解任务预览生成失败，保留文字拆解结果：", error.message);
+    }
+  }
+  await taskResultService().updateTask(task.id, {
+    status: "success", stage: "completed", output_data: { result, rawResult },
+    error_code: null, error_message: null,
+  });
+}
+
+async function recoverGenerationTask(task) {
+  const initialCheck = await checkGenerationFinalization(task.id, task.user_id);
+  if (initialCheck.existingResult) {
+    await taskResultService().updateTask(task.id, {
+      status: "success", stage: "completed", error_code: null, error_message: null,
+    });
+    return;
+  }
+  const config = task.input_data?.config || {};
+  const generatedOutputFile = path.join("/tmp/openclaw/rh-output", `${task.id}-video.mp4`);
+  const finalOutputFile = path.join("/tmp/openclaw/rh-output", `${task.id}.mp4`);
+  const args = [
+    "scripts/runninghub.js", "--resume-task-id", task.external_task_id,
+    "--endpoint", config.model_endpoint || LEGACY_VIDEO_ENDPOINT, "--output", generatedOutputFile,
+  ];
+  await taskResultService().updateTask(task.id, { status: "generating", stage: "polling_after_restart" });
+  let recoveryOutput = '';
+  let recoveryRetryUpdate = Promise.resolve();
+  const recoveryRetryBase = Number(task.retry_count || 0);
+  let recoveryRetryAttempt = recoveryRetryBase;
+  const stdout = await coreSkillService().execute('video_generation', {
+    project_id: task.project_id, task_id: task.id, image_path: null,
+    prompt: task.input_data?.prompt || '', model_id: config.model_id || config.model || 'legacy',
+    model_endpoint: config.model_endpoint || LEGACY_VIDEO_ENDPOINT, duration: Number(config.duration) || 10,
+    aspect_ratio: config.aspect_ratio || config.ratio || '9:16', resolution: config.resolution || '720p',
+    source_video_storage_path: task.input_data?.sourceVideoStoragePath || null,
+    resume_external_task_id: task.external_task_id,
+  }, {
+    userId: task.user_id, projectId: task.project_id, taskId: task.id,
+    externalTaskId: task.external_task_id, skillName: 'video_generation', modelName: config.model_name || config.modelLabel || config.model || 'legacy',
+  }, () => runRunningHubScript(args, `恢复 RunningHub image-to-video ${task.id}`, (text) => {
+    recoveryOutput += text;
+    const matches = [...recoveryOutput.matchAll(/RETRY_ATTEMPT:(\d+)/g)];
+    const attempt = recoveryRetryBase + Number(matches.at(-1)?.[1] || 0);
+    if (attempt > recoveryRetryAttempt) {
+      recoveryRetryAttempt = attempt;
+      recoveryRetryUpdate = recoveryRetryUpdate.then(() => taskResultService().updateTask(task.id, { retry_count: attempt, stage: 'recovery_polling_retry' })).then(() => logger.warn({ taskId: task.id, userId: task.user_id, projectId: task.project_id, externalTaskId: task.external_task_id, action: 'task.recovery.poll_retry', status: 'retrying', errorCode: 'MODEL_REQUEST_FAILED', metadata: { attempt } })).catch(() => {});
+    }
+  }));
+  await recoveryRetryUpdate;
+  const parsed = parseGenerationOutput(stdout);
+  if (!parsed.outputFile) throw new Error("恢复生成任务后未返回输出视频文件");
+  const billingQuote = task.input_data?.billing_quote || {};
+  const actualProviderCost = numeric(parsed.cost, billingQuote.providerCost || 0);
+  const actualCreditCost = task.billing_status === 'frozen' ? calculateCreditCost({
+    costRule: billingQuote.costRule || {}, providerCost: actualProviderCost,
+    duration: config.duration, resolution: config.resolution,
+    aspectRatio: config.aspect_ratio || config.ratio,
+  }) : 0;
+  let sourceVideoPath = "";
+  try {
+    let sourceVideoUrl = task.input_data?.sourceVideoUrl;
+    if (task.input_data?.sourceVideoStoragePath) {
+      sourceVideoUrl = (await projectAssetService().signedAsset({ storage_path: task.input_data.sourceVideoStoragePath })).signed_url;
+    }
+    sourceVideoPath = await downloadRemoteFile(
+      sourceVideoUrl,
+      path.join("/tmp/openclaw/rh-recovery", `${task.id}-source.mp4`)
+    );
+  } catch (error) {
+    console.warn("恢复任务原视频下载失败，将保留无音频结果：", error.message);
+  }
+  const outputFile = await mergeOriginalAudio(
+    parsed.outputFile, sourceVideoPath, finalOutputFile,
+    Number(task.input_data?.clipStart) || 0,
+    Number(task.input_data?.clipEnd) || Number(config.duration) || 10
+  );
+  await checkGenerationFinalization(task.id, task.user_id);
+  const beforeDelivery = await checkGenerationFinalization(task.id, task.user_id);
+  if (beforeDelivery.existingResult) {
+    if (task.billing_status === 'frozen') {
+      await billingService().settleTask({
+        taskId: task.id, userId: task.user_id, creditCost: actualCreditCost, providerCost: actualProviderCost,
+      });
+    }
+    await taskResultService().updateTask(task.id, { status: "success", stage: "completed", error_code: null, error_message: null });
+    return;
+  }
+  await deliverGeneratedResult({
+    uploadAsset: () => projectAssetService().uploadAsset({
+      projectId: task.project_id, userId: task.user_id, assetType: "result_video", sourceTaskId: task.id,
+      file: {
+        originalname: `${task.id}.mp4`, mimetype: "video/mp4",
+        size: fs.statSync(outputFile).size, buffer: fs.readFileSync(outputFile),
+      },
+    }),
+    createResult: (asset) => taskResultService().createResult({
+      projectId: task.project_id, userId: task.user_id, taskId: task.id, videoUrl: asset.storage_path,
+      prompt: task.input_data?.prompt || "", modelName: config.model_name || config.modelLabel || config.model || "",
+      modelParams: config, duration: Number(config.duration) || null, cost: parsed.cost,
+      promptSnapshot: task.input_data?.prompt_snapshot || null,
+      providerCost: actualProviderCost, creditCost: actualCreditCost,
+    }),
+    settleBilling: () => task.billing_status === 'frozen'
+      ? billingService().settleTask({ taskId: task.id, userId: task.user_id, creditCost: actualCreditCost, providerCost: actualProviderCost })
+      : Promise.resolve(),
+    markSuccess: ({ asset, result }) => taskResultService().updateTask(task.id, {
+      status: "success", stage: "completed",
+      output_data: {
+        videoUrl: asset.storage_path, assetId: asset.id, finalPrompt: task.input_data?.prompt || "",
+        cost: parsed.cost, providerCost: actualProviderCost, creditCost: actualCreditCost,
+        config, version: result.version,
+      },
+      error_code: null, error_message: null,
+    }),
+    deleteResult: () => taskResultService().deleteResultByTask(task.id, task.user_id),
+    deleteAsset: (asset) => projectAssetService().deleteAsset(task.project_id, asset.id, task.user_id),
+  });
+}
+
+async function recoverIncompleteTasks() {
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY || !process.env.RUNNINGHUB_API_KEY) return;
+  const stability = createStabilityService();
+  let recoveredCount = 0;
+  let failedCount = 0;
+  await stability.setWorkerState({ worker_id: RECOVERY_WORKER_ID, status: 'scanning', last_started_at: new Date().toISOString(), last_heartbeat_at: new Date().toISOString(), metadata: {} }).catch(() => {});
+  const tasks = await taskResultService().listIncompleteTasks();
+  for (const task of tasks) {
+    const claimed = await taskResultService().claimRecovery(task.id, RECOVERY_WORKER_ID).catch((error) => {
+      logger.error({ taskId: task.id, userId: task.user_id, projectId: task.project_id, action: 'task.recovery.claim', status: 'failed', errorCode: 'DATABASE_ERROR', errorMessage: error.message });
+      return false;
+    });
+    if (!claimed) {
+      logger.info({ taskId: task.id, userId: task.user_id, projectId: task.project_id, action: 'task.recovery.skip_locked', status: 'skipped' });
+      continue;
+    }
+    if (!task.external_task_id) {
+      await releaseFailedTaskBilling(task.id, task.user_id, 0, { forceFullRefund: true }).catch(() => {});
+      await taskResultService().updateTask(task.id, {
+        status: "failed", stage: "restart_recovery_failed",
+        error_code: "MISSING_EXTERNAL_TASK_ID",
+        error_message: "服务重启前第三方任务尚未成功提交，请重新执行。",
+      });
+      failedCount += 1;
+      logger.warn({ taskId: task.id, userId: task.user_id, projectId: task.project_id, action: 'task.recovery.missing_external_id', status: 'failed', errorCode: 'TASK_STATE_INVALID' });
+      continue;
+    }
+    const recover = task.task_type === "video_to_text" ? recoverVideoToTextTask : recoverGenerationTask;
+    logger.info({ taskId: task.id, userId: task.user_id, projectId: task.project_id, externalTaskId: task.external_task_id, action: 'task.recovery.start', status: 'running' });
+    await recover(task).then(() => {
+      recoveredCount += 1;
+      logger.info({ taskId: task.id, userId: task.user_id, projectId: task.project_id, externalTaskId: task.external_task_id, action: 'task.recovery.complete', status: 'success' });
+    }).catch(async (error) => {
+      failedCount += 1;
+      const currentTask = await taskResultService().getTask(task.id, task.user_id).catch(() => null);
+      if (currentTask?.status === "cancelled" || error.code === "TASK_CANCELLED") {
+        await releaseFailedTaskBilling(task.id, task.user_id).catch(() => {});
+        console.log("重启恢复已忽略 cancelled Task：", task.id);
+        return;
+      }
+      const timedOut = /超时|timeout/i.test(error.message || "");
+      await releaseFailedTaskBilling(task.id, task.user_id, 0, {
+        forceFullRefund: ['storage_upload', 'result_create', 'billing_settle', 'task_complete'].includes(error.deliveryStage),
+      }).catch((billingError) => {
+        console.error("恢复失败 Task 积分退款失败：", task.id, billingError.message);
+      });
+      await taskResultService().updateTask(task.id, {
+        status: timedOut ? "timeout" : "failed", stage: "restart_recovery_failed",
+        error_code: timedOut ? "TASK_TIMEOUT" : error.code || "RECOVERY_FAILED",
+        error_message: getErrorMessage(error, "任务恢复失败"),
+      }).catch(() => {});
+      logger.error({ taskId: task.id, userId: task.user_id, projectId: task.project_id, externalTaskId: task.external_task_id, action: 'task.recovery.complete', status: 'failed', errorCode: timedOut ? 'TASK_TIMEOUT' : error.code || 'MODEL_REQUEST_FAILED', errorMessage: error.message });
+    });
+  }
+  await stability.setWorkerState({ worker_id: RECOVERY_WORKER_ID, status: 'idle', last_completed_at: new Date().toISOString(), last_heartbeat_at: new Date().toISOString(), recovered_count: recoveredCount, failed_count: failedCount, metadata: { scanned: tasks.length } }).catch(() => {});
+}
+
 app.use((err, req, res, next) => {
   console.error("后端接口未捕获错误：", err);
   if (res.headersSent) {
@@ -1447,4 +2368,5 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`爆款实验室服务已启动：http://localhost:${PORT}`);
+  recoverIncompleteTasks().catch((error) => console.error("未完成任务恢复扫描失败：", error));
 });

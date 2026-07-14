@@ -1,0 +1,36 @@
+{
+  "name": "prompt_generation",
+  "description": "依据Prompt模板、视频拆解、替换素材和用户补充要求生成可追踪Prompt快照。",
+  "input_schema": {
+    "type": "object",
+    "required": ["project_id", "template", "breakdown", "replacements", "model_id", "model_params"],
+    "properties": {
+      "project_id": { "type": "string" },
+      "task_id": { "type": ["string", "null"], "description": "Prompt生成先于Task创建时为空，Task创建后通过prompt_snapshot关联。" },
+      "template": { "type": "object" },
+      "breakdown": { "type": ["object", "null"] },
+      "replacements": { "type": "array" },
+      "user_requirement": { "type": "string" },
+      "model_id": { "type": "string" },
+      "model_params": { "type": "object" },
+      "previous": { "type": ["object", "null"] }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "required": ["template_id", "template_type", "template_version", "generated_prompt", "model_id", "model_params"],
+    "properties": {
+      "generated_prompt": { "type": "string", "minLength": 1 },
+      "replacement_summary": { "type": "array" },
+      "diff_from_previous": { "type": "object" }
+    }
+  },
+  "provider": "local",
+  "model": "template_renderer_v1",
+  "timeout": { "milliseconds": 1000, "source": "synchronous local execution" },
+  "retry_policy": { "max_retries": 0, "strategy": "none", "retryable": [], "non_retryable": ["invalid_template", "empty_prompt", "invalid_input"] },
+  "error_codes": ["TASK_STATE_INVALID", "MODEL_RESULT_INVALID", "INTERNAL_ERROR"],
+  "cost_rule": { "type": "fixed", "provider_cost": 0, "user_points": 0 },
+  "implementation_files": ["backend/lib/promptBuilder.js", "backend/services/promptModelService.js", "backend/server.js#generate-video"],
+  "standalone_test": "node --test --test-name-pattern='prompt generation skill' test/coreSkills.test.js"
+}

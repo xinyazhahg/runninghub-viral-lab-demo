@@ -458,8 +458,10 @@ async function pollTask(apiKey, taskId) {
       consecutiveFailures = 0;
     } catch (_) {
       consecutiveFailures += 1;
-      process.stdout.write("x");
+      process.stdout.write(`\nRETRY_ATTEMPT:${consecutiveFailures}\n`);
       if (consecutiveFailures >= 5) fail("Too many consecutive poll failures");
+      const backoffMs = Math.min(8000, 1000 * (2 ** (consecutiveFailures - 1))) + Math.floor(Math.random() * 250);
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
       continue;
     }
 
@@ -533,8 +535,13 @@ async function cmdExecute(args) {
   });
   const taskId = resp.taskId;
   if (!taskId) fail(`no taskId in response: ${JSON.stringify(resp)}`);
+  console.log(`TASK_ID:${taskId}`);
 
   const final = resp.status === "SUCCESS" && resp.results ? resp : await pollTask(apiKey, taskId);
+  return writeFinalResult(final, endpointDef, args);
+}
+
+async function writeFinalResult(final, endpointDef, args) {
   const results = final.results || [];
   if (!results.length) fail("no results in final response");
 
@@ -567,6 +574,15 @@ async function cmdExecute(args) {
   if (taskCostTime && String(taskCostTime) !== "0") console.log(`DURATION:${taskCostTime}s`);
 }
 
+async function cmdResume(args) {
+  const apiKey = requireApiKey(args.apiKey);
+  const endpointDef = findEndpoint(args.endpoint);
+  if (!endpointDef) fail(`endpoint '${args.endpoint}' not found`);
+  console.log(`TASK_ID:${args.resumeTaskId}`);
+  const final = await pollTask(apiKey, args.resumeTaskId);
+  return writeFinalResult(final, endpointDef, args);
+}
+
 function parseArgs(argv) {
   const args = { image: [], param: [] };
   for (let i = 0; i < argv.length; i += 1) {
@@ -588,6 +604,7 @@ function parseArgs(argv) {
     else if (arg === "--param") args.param.push(next());
     else if (arg === "--output" || arg === "-o") args.output = next();
     else if (arg === "--api-key" || arg === "-k") args.apiKey = next();
+    else if (arg === "--resume-task-id") args.resumeTaskId = next();
     else if (arg === "--type") args.typeFilter = next();
     else if (arg === "--help" || arg === "-h") args.help = true;
     else fail(`unknown argument: ${arg}`);
@@ -619,6 +636,7 @@ async function main() {
   if (args.check) return cmdCheck(args.apiKey);
   if (args.list) return cmdList(args.typeFilter, args.task);
   if (args.info) return cmdInfo(args.info);
+  if (args.resumeTaskId && args.endpoint) return cmdResume(args);
   if (args.endpoint || args.task) return cmdExecute(args);
   printHelp();
   process.exit(1);

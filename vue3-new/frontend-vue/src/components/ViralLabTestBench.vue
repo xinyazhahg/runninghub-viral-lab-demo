@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { apiUrl, toBackendUrl } from '../api.js'
+import { apiUrl, authFetch, toBackendUrl } from '../api.js'
 import { cleanBreakdownResult } from '../utils/cleanBreakdown.js'
 
 const TEST_BENCH_STATE_KEY = 'viral-lab-test-bench-state:v1'
@@ -183,12 +183,7 @@ function getTestBenchSnapshot() {
 }
 
 function persistTestBenchState() {
-  if (suppressTestBenchPersist || typeof localStorage === 'undefined') return
-  try {
-    localStorage.setItem(TEST_BENCH_STATE_KEY, JSON.stringify(getTestBenchSnapshot()))
-  } catch (error) {
-    console.warn('测试台状态保存失败：', error)
-  }
+  // 阶段6第一轮不再把测试台业务数据写入 localStorage。
 }
 
 function restoreTestBenchState() {
@@ -252,9 +247,6 @@ function restoreTestBenchState() {
 
 function clearTestBenchState() {
   suppressTestBenchPersist = true
-  if (typeof localStorage !== 'undefined') {
-    localStorage.removeItem(TEST_BENCH_STATE_KEY)
-  }
   if (videoPreviewUrl.value) URL.revokeObjectURL(videoPreviewUrl.value)
 
   videoFile.value = null
@@ -444,7 +436,7 @@ async function testVideoToText() {
     const formData = new FormData()
     formData.append('video', videoFile.value)
 
-    const response = await fetch(apiUrl('/api/video-to-text'), {
+    const response = await authFetch(apiUrl('/api/video-to-text'), {
       method: 'POST',
       body: formData,
     })
@@ -459,7 +451,7 @@ async function testVideoToText() {
 
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 4000))
-      const statusResponse = await fetch(
+      const statusResponse = await authFetch(
         apiUrl(`/api/video-to-text-status?taskId=${encodeURIComponent(taskId)}`)
       )
       data = await readResponse(statusResponse)
@@ -696,7 +688,7 @@ async function testGenerateVideo() {
     formData.append('duration', '10')
     formData.append('aspectRatio', '9:16')
 
-    const response = await fetch(apiUrl('/api/generate-video'), {
+    const response = await authFetch(apiUrl('/api/generate-video'), {
       method: 'POST',
       body: formData,
     })
@@ -721,7 +713,7 @@ async function testGenerateVideo() {
 
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 4000))
-      const statusResponse = await fetch(
+      const statusResponse = await authFetch(
         apiUrl(`/api/generate-status?taskId=${encodeURIComponent(taskId)}`)
       )
       data = await readResponse(statusResponse)
@@ -786,20 +778,6 @@ async function testGenerateVideo() {
     isTestingGenerateVideo.value = false
   }
 }
-
-restoreTestBenchState()
-
-watch([
-  selectedVideoInfo,
-  videoToTextRaw,
-  parsedBreakdown,
-  extraPromptRequirement,
-  generatedPrompt,
-  generateResult,
-  generationRun,
-  logs,
-  benchMessage,
-], persistTestBenchState, { deep: true })
 
 onMounted(() => {
   verifyRestoredTestBenchVideoUrl()
