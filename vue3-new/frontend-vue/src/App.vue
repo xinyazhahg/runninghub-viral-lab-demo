@@ -110,6 +110,14 @@ const generationOptions = ref({ models: [], ratios: [], resolutions: [], duratio
 const generationOptionsStatus = ref('loading')
 const generationOptionsError = ref('')
 const generationOptionsWarning = ref('')
+
+function userFacingWorkspaceError(message, fallback = '操作失败，请稍后重试') {
+  const text = String(message || '')
+  if (/column\s+[^\s]+\s+does not exist|relation\s+[^\s]+\s+does not exist|schema cache|assets\.source_task_id/i.test(text)) {
+    return '素材信息加载失败，请稍后重试'
+  }
+  return text || fallback
+}
 const activeGenerationOptions = computed(() => {
   const model = generationOptions.value.models.find((item) => item.id === resultParams.modelId)
   return {
@@ -477,7 +485,7 @@ function pollRestoredTask(task) {
       return
     }
     if (['failed', 'timeout', 'cancelled'].includes(data.status)) {
-      const message = data.error || '任务失败'
+      const message = userFacingWorkspaceError(data.error, '任务失败，请稍后重试')
       if (data.taskType === 'generate_video') {
         generationStatus.value = data.status
         generateError.value = message
@@ -524,7 +532,7 @@ async function restoreProjectTasksAndResults(payload = null) {
   if (failedGeneration) {
     applyPersistedGenerationConfig(failedGeneration)
     lastFailedTaskId.value = failedGeneration.id
-    generateError.value = failedGeneration.error_message || '上一次生成失败，可重新生成。'
+    generateError.value = userFacingWorkspaceError(failedGeneration.error_message, '上一次生成失败，可重新生成。')
   }
   const incomplete = tasks.filter((task) => ['created', 'queued', 'analyzing', 'generating'].includes(task.status))
   const activeGenerationTask = incomplete.find((task) => task.task_type === 'generate_video')
@@ -621,6 +629,13 @@ async function restoreProjectState() {
       refreshCanvasConnectors(0, { force: true })
     }
   }
+}
+
+async function retryWorkspaceRestore() {
+  if (isRestoringProject.value || !projectId.value) return
+  generateError.value = ''
+  localStorage.setItem(PROJECT_ID_KEY, projectId.value)
+  await restoreProjectState()
 }
 
 function clearDemoState(options = {}) {
@@ -2514,7 +2529,10 @@ function retry() {
 
     <!-- 生成错误提示 -->
     <div v-if="generateError" class="generate-error-toast">
-      {{ generateError }}
+      <span>{{ generateError }}</span>
+      <button type="button" :disabled="isRestoringProject" @click="retryWorkspaceRestore">
+        {{ isRestoringProject ? '重试中…' : '重试' }}
+      </button>
     </div>
 
     <!-- 轻提示 -->
@@ -2861,6 +2879,15 @@ button {
   font-size: 13px;
   font-weight: 700;
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+}
+.generate-error-toast button {
+  margin-left: 10px;
+  padding: 3px 9px;
+  border: 1px solid rgba(255, 136, 136, .42);
+  border-radius: 999px;
+  color: #ffd0d0;
+  background: rgba(255, 255, 255, .06);
+  cursor: pointer;
 }
 
 .notice-toast {

@@ -1,6 +1,6 @@
 <script setup>
 import { onMounted, reactive, ref } from 'vue'
-import { getAdminOverview, getAdminTasks, getStabilityStatus, scanStorage, resolveStorageAudit } from '../api.js'
+import { getAdminOverview, getAdminTasks, getGenerationConfig, getStabilityStatus, scanStorage, resolveStorageAudit } from '../api.js'
 
 const emit = defineEmits(['back'])
 const loading = ref(true)
@@ -10,15 +10,44 @@ const tasks = ref([])
 const stability = ref({ logs: [], storageAudits: [], tasks: [] })
 const storageScanning = ref(false)
 const storageScanResult = ref(null)
+const models = ref([])
+const modelsLoading = ref(true)
+const modelsError = ref('')
 const pagination = reactive({ page: 1, pageSize: 20, total: 0 })
 const now = new Date()
 const filters = reactive({
   from: new Date(now.getTime() - 30 * 86400000).toISOString().slice(0, 10),
   to: now.toISOString().slice(0, 10), modelId: '', taskStatus: '',
 })
+const taskStatusOptions = [
+  { value: 'created', label: '已创建' },
+  { value: 'queued', label: '排队中' },
+  { value: 'analyzing', label: '分析中' },
+  { value: 'generating', label: '生成中' },
+  { value: 'success', label: '已成功' },
+  { value: 'failed', label: '已失败' },
+  { value: 'timeout', label: '已超时' },
+  { value: 'cancelled', label: '已取消' },
+]
 
 const percent = (value) => `${(Number(value || 0) * 100).toFixed(1)}%`
 const number = (value) => Number(value || 0).toFixed(Number(value || 0) % 1 ? 2 : 0)
+
+async function loadModels() {
+  modelsLoading.value = true
+  modelsError.value = ''
+  try {
+    const response = await getGenerationConfig()
+    models.value = Array.isArray(response.models)
+      ? response.models.filter((model) => model?.id).map((model) => ({ id: model.id, label: model.label || model.id }))
+      : []
+  } catch (modelError) {
+    models.value = []
+    modelsError.value = modelError.message || '模型配置加载失败'
+  } finally {
+    modelsLoading.value = false
+  }
+}
 
 async function load() {
   loading.value = true
@@ -67,7 +96,10 @@ function changePage(delta) {
   void load()
 }
 
-onMounted(load)
+onMounted(() => {
+  void loadModels()
+  void load()
+})
 </script>
 
 <template>
@@ -76,8 +108,8 @@ onMounted(load)
     <section class="filters">
       <label>开始日期<input v-model="filters.from" type="date"></label>
       <label>结束日期<input v-model="filters.to" type="date"></label>
-      <label>模型<input v-model.trim="filters.modelId" placeholder="全部模型"></label>
-      <label>任务状态<select v-model="filters.taskStatus"><option value="">全部状态</option><option v-for="status in ['created','queued','analyzing','generating','success','failed','timeout','cancelled']" :key="status">{{ status }}</option></select></label>
+      <label>模型<select v-model="filters.modelId" :disabled="modelsLoading"><option value="">全部模型</option><option v-for="model in models" :key="model.id" :value="model.id">{{ model.label }}（{{ model.id }}）</option></select><small v-if="modelsLoading">模型加载中…</small><small v-else-if="modelsError" class="filter-error">{{ modelsError }} <button type="button" @click="loadModels">重试</button></small></label>
+      <label>任务状态<select v-model="filters.taskStatus"><option value="">全部状态</option><option v-for="status in taskStatusOptions" :key="status.value" :value="status.value">{{ status.label }}</option></select></label>
       <button :disabled="loading" @click="pagination.page = 1; load()">{{ loading ? '加载中…' : '查询' }}</button>
     </section>
     <div v-if="error" class="state error">{{ error }} <button @click="load">重试</button></div>
@@ -108,4 +140,5 @@ onMounted(load)
 
 <style scoped>
 .admin-dashboard{min-height:100vh;padding:32px;color:#edf5f1;background:#090b0a;font-family:Inter,system-ui,sans-serif}.admin-dashboard>header,.filters,.panel,.metric-grid article{border:1px solid rgba(255,255,255,.1);background:#121513;border-radius:14px}.admin-dashboard>header{display:flex;align-items:center;justify-content:space-between;padding:20px 24px}.admin-dashboard h1,.admin-dashboard h2,.admin-dashboard p{margin:0}.admin-dashboard header p{color:#35f59a;font-size:11px;font-weight:800;letter-spacing:.16em}.admin-dashboard button,.admin-dashboard input,.admin-dashboard select{height:36px;padding:0 12px;border:1px solid rgba(255,255,255,.14);border-radius:8px;color:#eaf2ee;background:#1b201d}.filters{display:flex;align-items:end;gap:12px;margin:16px 0;padding:16px}.filters label{display:grid;gap:6px;color:#8d9892;font-size:12px}.metric-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.metric-grid article{display:grid;gap:8px;padding:18px}.metric-grid span,.metric-grid small{color:#8d9892}.metric-grid strong{font-size:28px}.panel{margin-top:16px;padding:20px;overflow:auto}.panel h2{margin-bottom:14px;font-size:16px}.funnel{display:grid;grid-template-columns:repeat(8,minmax(110px,1fr));gap:8px}.funnel div{display:grid;gap:8px;padding:12px;border-radius:9px;background:rgba(53,245,154,.07)}.funnel span{font-size:11px;color:#93a099;overflow-wrap:anywhere}.two-columns{display:grid;grid-template-columns:1.4fr 1fr;gap:16px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:10px;border-bottom:1px solid rgba(255,255,255,.08);text-align:left}th{color:#7f8a84}.panel ol{display:grid;gap:8px;padding-left:20px}.panel li,.panel footer{display:flex;justify-content:space-between;gap:12px}.panel footer{align-items:center;margin-top:16px}.state{padding:80px;text-align:center;color:#9da7a1}.state.error{color:#ff9c9c}.stability-actions{display:flex;align-items:center;gap:12px}.stability-list{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:16px 0 0}.stability-list div{display:flex;justify-content:space-between;padding:10px;border-radius:8px;background:rgba(255,255,255,.04)}.stability-list dt{color:#8d9892}.stability-list dd{margin:0;font-weight:800}@media(max-width:1100px){.metric-grid{grid-template-columns:repeat(2,1fr)}.two-columns{grid-template-columns:1fr}.filters{flex-wrap:wrap}}
+.filter-error{max-width:260px;color:#ff9c9c}.filter-error button{height:auto;padding:0;border:0;color:#ffb6b6;background:transparent;text-decoration:underline}
 </style>

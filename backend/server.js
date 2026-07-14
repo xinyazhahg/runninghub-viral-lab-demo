@@ -729,11 +729,14 @@ function sendApiError(res, status, errorOrCode, messageOrDetails, maybeDetails) 
   const details = explicitCode ? maybeDetails : messageOrDetails;
   const code = explicitCode || inferErrorCode(status, message);
   logger.error({ requestId: res.locals.requestId, action: 'api.error', status: String(status), errorCode: code, errorMessage: message, metadata: details || {} });
+  const publicMessage = /column\s+[^\s]+\s+does not exist|relation\s+[^\s]+\s+does not exist|schema cache/i.test(String(message))
+    ? '素材信息加载失败，请稍后重试'
+    : message;
   res.status(status).json({
     ok: false,
     error: code,
     code,
-    message,
+    message: publicMessage,
     requestId: res.locals.requestId,
     ...(details ? { details } : {}),
   });

@@ -113,6 +113,10 @@ export function getProjectResults(projectId) {
   return requestJson(`/api/projects/${encodeURIComponent(projectId)}/results`)
 }
 
+export function getGenerationConfig() {
+  return requestJson('/api/generate-config')
+}
+
 export function retryTask(taskId) {
   return requestJson(`/api/tasks/${encodeURIComponent(taskId)}/retry`, { method: 'POST' })
 }
