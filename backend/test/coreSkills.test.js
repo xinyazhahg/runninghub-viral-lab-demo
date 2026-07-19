@@ -21,9 +21,12 @@ test('video understanding skill can be tested with a Mock without calling a prov
   let called = 0;
   const output = await service.execute('video_understanding', {
     project_id: 'project-1', task_id: 'task-1', video_path: '/tmp/mock.mp4', prompt: 'mock prompt', original_asset_id: null,
-  }, {}, async () => { called += 1; return '{"overview":{},"shots":[]}'; });
+  }, {}, async () => { called += 1; return {
+    rawUnderstandingResult: {}, normalizedBreakdown: { shots: [] },
+    modelName: 'mock-model', modelVersion: 'mock-v1', provider: 'mock',
+  }; });
   assert.equal(called, 1);
-  assert.match(output, /overview/);
+  assert.equal(output.modelName, 'mock-model');
 });
 
 test('prompt generation skill validates and returns the existing Prompt snapshot shape', async () => {

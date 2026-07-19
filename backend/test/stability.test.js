@@ -18,6 +18,7 @@ test('structured logger redacts secrets, tokens, prompts, buffers and base64', (
 
 test('retry policy retries temporary failures and never retries content rejection', async () => {
   assert.equal(isRetryable(appError('MODEL_CONTENT_REJECTED')), false);
+  assert.equal(isRetryable(Object.assign(new Error('provider validation failed'), { providerErrorCode: 1007 })), false);
   assert.equal(isRetryable(appError('MODEL_REQUEST_FAILED', '', { retryable: true })), true);
   let calls = 0;
   const result = await withRetry(async () => {

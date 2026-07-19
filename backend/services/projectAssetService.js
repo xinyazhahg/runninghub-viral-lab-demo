@@ -4,6 +4,11 @@ const { getSupabaseClient, getStorageBucket } = require("../lib/supabase");
 const { normalizeMultipartFilename } = require("../lib/filenameEncoding");
 const { appError } = require("../lib/errorCodes");
 const { createLogger } = require("../lib/logger");
+const {
+  assertPhysicalAssetType,
+  normalizePhysicalMimeType,
+  isGeneratedVideoAsset,
+} = require('../lib/assetTypes');
 const logger = createLogger();
 
 const PROJECT_STATUSES = new Set(["draft", "analyzing", "customizing", "completed", "error"]);
@@ -11,7 +16,7 @@ const REPLACEMENT_TYPES = new Set(["subject", "scene", "element"]);
 
 function sanitizeFilename(filename) {
   const extension = path.extname(filename || "").toLowerCase();
-  const allowedExtensions = new Set([".mp4", ".mov", ".webm", ".jpg", ".jpeg", ".png", ".webp"]);
+  const allowedExtensions = new Set([".mp4", ".mov", ".webm", ".jpg", ".jpeg", ".png", ".webp", ".mp3", ".wav", ".m4a", ".aac"]);
   return `${crypto.randomUUID()}${allowedExtensions.has(extension) ? extension : ""}`;
 }
 
@@ -62,11 +67,16 @@ function createProjectAssetService({ client = getSupabaseClient(), bucket = getS
     };
   }
 
-  async function uploadAsset({ projectId, userId, file, assetType, replacementType = null, sourceTaskId = null }) {
+  async function uploadAsset({
+    projectId, userId, file, assetType, purpose = 'general_reference', replacementType = null,
+    sourceTaskId = null, assetRef = null, targetPlaceholderId = null, confidence = null,
+  }) {
     if (!file?.buffer?.length) throw new Error("上传文件为空");
-    if (assetType === "replacement_image") assertReplacementType(replacementType);
-    if (assetType === "result_video" && sourceTaskId) {
-      const { data: existing, error: existingError } = await client.from("assets").select("*").eq("source_task_id", sourceTaskId).eq("asset_type", "result_video").maybeSingle();
+    assertPhysicalAssetType(assetType);
+    file.mimetype = normalizePhysicalMimeType(assetType, file.mimetype, file.originalname);
+    if (replacementType) assertReplacementType(replacementType);
+    if (purpose === "generated_video" && sourceTaskId) {
+      const { data: existing, error: existingError } = await client.from("assets").select("*").eq("source_task_id", sourceTaskId).eq("purpose", "generated_video").maybeSingle();
       if (existingError) throw existingError;
       if (existing) return { ...await signedAsset(existing), idempotent: true };
     }
@@ -77,21 +87,73 @@ function createProjectAssetService({ client = getSupabaseClient(), bucket = getS
       contentType: file.mimetype, upsert: false,
     });
     if (uploadError) throw uploadError;
+    logger.info({
+      userId, projectId, action: 'asset_upload.storage_completed', status: 'success',
+      metadata: {
+        fieldName: file.fieldname || null, originalname: originalFilename,
+        mimetype: file.mimetype, bytes: file.size, storagePath,
+      },
+    });
     const record = {
-      project_id: projectId, user_id: userId, asset_type: assetType, replacement_type: replacementType,
+      project_id: projectId, user_id: userId, asset_type: assetType, purpose, replacement_type: replacementType,
+      asset_ref: assetRef || null, target_placeholder_id: targetPlaceholderId || null,
+      confidence: confidence !== null && confidence !== '' && Number.isFinite(Number(confidence))
+        ? Math.min(1, Math.max(0, Number(confidence)))
+        : null,
       original_filename: originalFilename, mime_type: file.mimetype, file_size: file.size,
       storage_path: storagePath, public_url: null, status: "active", source_task_id: sourceTaskId,
     };
-    const { data, error: insertError } = await client.from("assets").insert(record).select("*").single();
+    logger.info({
+      userId, projectId, action: 'asset_upload.database_insert', status: 'attempting',
+      metadata: { fieldName: file.fieldname || null, originalname: originalFilename, mimetype: file.mimetype, insert: record },
+    });
+    let { data, error: insertError } = await client.from("assets").insert(record).select("*").single();
+    if (insertError && purpose === 'source_video' && insertError.code === 'PGRST204'
+      && /schema cache|Could not find/i.test(insertError.message || '')) {
+      const legacyRecord = {
+        project_id: projectId, user_id: userId, asset_type: 'original_video', replacement_type: null,
+        original_filename: originalFilename, mime_type: file.mimetype, file_size: file.size,
+        storage_path: storagePath, public_url: null, status: 'active', source_task_id: null,
+      };
+      logger.warn({
+        userId, projectId, action: 'asset_upload.legacy_schema_fallback', status: 'retrying',
+        errorCode: insertError.code, errorMessage: insertError.message,
+        metadata: { insert: legacyRecord },
+      });
+      const legacyInsert = await client.from('assets').insert(legacyRecord).select('*').single();
+      data = legacyInsert.data;
+      insertError = legacyInsert.error;
+    }
     if (insertError) {
       await storage.remove([storagePath]).catch(() => {});
       if (insertError.code === '23505' && sourceTaskId) {
-        const { data: existing, error: existingError } = await client.from("assets").select("*").eq("source_task_id", sourceTaskId).eq("asset_type", "result_video").single();
-        if (!existingError && existing) return { ...await signedAsset(existing), idempotent: true };
+        const { data: existing, error: existingError } = await client.from("assets").select("*").eq("source_task_id", sourceTaskId).eq("purpose", "generated_video").single();
+        if (!existingError && isGeneratedVideoAsset(existing)) return { ...await signedAsset(existing), idempotent: true };
       }
-      throw insertError;
+      const databaseError = new Error(insertError.message || "assets 表写入失败", { cause: insertError });
+      databaseError.name = "AssetDatabaseInsertError";
+      databaseError.code = insertError.code;
+      databaseError.details = insertError.details;
+      databaseError.hint = insertError.hint;
+      throw databaseError;
     }
     return signedAsset(data);
+  }
+
+  async function updateAssetBinding(projectId, assetId, userId, binding = {}) {
+    const confidence = Number(binding.confidence);
+    const updates = {
+      purpose: String(binding.purpose || 'general_reference').trim(),
+      asset_ref: String(binding.assetRef || '').trim() || null,
+      target_placeholder_id: String(binding.targetPlaceholderId || '').trim() || null,
+      confidence: Number.isFinite(confidence) ? Math.min(1, Math.max(0, confidence)) : 1,
+    };
+    let query = client.from('assets').update(updates)
+      .eq('id', assetId).eq('project_id', projectId).eq('status', 'active');
+    if (userId) query = query.eq('user_id', userId);
+    const { data, error } = await query.select('*').maybeSingle();
+    if (error) throw error;
+    return data ? signedAsset(data) : null;
   }
 
   async function setOriginalAsset(projectId, assetId, userId) {
@@ -211,7 +273,7 @@ function createProjectAssetService({ client = getSupabaseClient(), bucket = getS
     return { deleted: true, warnings };
   }
 
-  return { createProject, getProject, listProjects, uploadAsset, setOriginalAsset, deleteAsset, deleteProject, signedAsset };
+  return { createProject, getProject, listProjects, uploadAsset, updateAssetBinding, setOriginalAsset, deleteAsset, deleteProject, signedAsset };
 }
 
 module.exports = { createProjectAssetService, assertReplacementType, sanitizeFilename };

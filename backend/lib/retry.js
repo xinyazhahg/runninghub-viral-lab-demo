@@ -1,6 +1,7 @@
-const NON_RETRYABLE_CODES = new Set(['MODEL_CONTENT_REJECTED','BALANCE_INSUFFICIENT','AUTH_REQUIRED','AUTH_INVALID','PERMISSION_DENIED','TASK_CANCELLED','TASK_STATE_INVALID','FILE_TYPE_NOT_SUPPORTED','FILE_TOO_LARGE']);
+const NON_RETRYABLE_CODES = new Set(['MODEL_CONTENT_REJECTED','BALANCE_INSUFFICIENT','AUTH_REQUIRED','AUTH_INVALID','AUTH_EXPIRED','PERMISSION_DENIED','TASK_CANCELLED','TASK_STATE_INVALID','FILE_TYPE_NOT_SUPPORTED','FILE_TOO_LARGE']);
 
 function isRetryable(error) {
+  if (String(error?.providerErrorCode || '') === '1007' || /errorCode\D*1007|参数无效/i.test(error?.message || '')) return false;
   if (error?.retryable === true) return true;
   if (NON_RETRYABLE_CODES.has(error?.code)) return false;
   return error?.code === 'MODEL_RATE_LIMITED' || error?.code === 'MODEL_REQUEST_FAILED' || /ECONNRESET|ETIMEDOUT|fetch failed|HTTP 429|HTTP 5\d\d/i.test(error?.message || '');
@@ -21,4 +22,3 @@ async function withRetry(operation, { maxRetries = 3, baseDelayMs = 1000, onRetr
 }
 
 module.exports = { NON_RETRYABLE_CODES, isRetryable, withRetry };
-

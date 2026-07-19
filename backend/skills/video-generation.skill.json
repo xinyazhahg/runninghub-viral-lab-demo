@@ -23,7 +23,7 @@
     "description": "现有RunningHub脚本stdout，包含TASK_ID、OUTPUT_FILE、COST和DURATION标记。"
   },
   "provider": "RunningHub",
-  "model": "由model_configs动态选择，当前为可灵模型",
+  "model": "由model_configs读取，当前新任务仅允许 Seedance 2.0；历史任务保留原模型记录",
   "timeout": { "milliseconds": 1200000, "source": "runninghub.js MAX_POLL_SECONDS" },
   "retry_policy": { "max_retries": 5, "strategy": "exponential_backoff", "retryable": ["poll_network_error", "provider_5xx", "rate_limit"], "non_retryable": ["content_rejected", "invalid_parameters", "balance_insufficient", "cancelled"] },
   "error_codes": ["TASK_TIMEOUT", "TASK_CANCELLED", "MODEL_UNAVAILABLE", "MODEL_REQUEST_FAILED", "MODEL_RATE_LIMITED", "MODEL_CONTENT_REJECTED", "MODEL_RESULT_INVALID", "BALANCE_INSUFFICIENT"],

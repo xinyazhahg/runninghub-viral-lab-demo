@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { createAuthService, createRequireAuth, extractBearerToken } = require("../services/authService");
+const { createAuthService, createRequireAuth, extractBearerToken, isExpiredAuthError } = require("../services/authService");
 
 test("Bearer token parser rejects non-Bearer credentials", () => {
   assert.equal(extractBearerToken("Bearer access-token"), "access-token");
@@ -29,6 +29,35 @@ test("auth middleware returns 401 without a valid user", async () => {
   assert.equal(response.status, 401);
   assert.equal(response.payload.error, "AUTH_REQUIRED");
   assert.equal(nextCalled, false);
+});
+
+test("Supabase Auth upstream 403 is returned as AUTH_EXPIRED", async () => {
+  const middleware = createRequireAuth({ serviceFactory: () => ({
+    verifyAccessToken: async () => ({
+      user: null,
+      error: { status: 403, code: "user_not_found", message: "User from sub claim in JWT does not exist" },
+    }),
+  }) });
+  const req = { headers: { authorization: "Bearer expired-access-token" } };
+  const response = {};
+  const res = {
+    locals: { requestId: "request-auth-expired" },
+    status(code) { response.status = code; return this; },
+    json(payload) { response.payload = payload; return this; },
+  };
+  let nextCalled = false;
+  await middleware(req, res, () => { nextCalled = true; });
+  assert.equal(response.status, 401);
+  assert.equal(response.payload.code, "AUTH_EXPIRED");
+  assert.equal(response.payload.message, "登录已过期，请重新登录");
+  assert.equal(nextCalled, false);
+});
+
+test("expired auth errors include upstream 401, 403 and expired JWT messages", () => {
+  assert.equal(isExpiredAuthError({ status: 401 }), true);
+  assert.equal(isExpiredAuthError({ status: 403 }), true);
+  assert.equal(isExpiredAuthError({ message: "JWT expired" }), true);
+  assert.equal(isExpiredAuthError({ status: 500, message: "database failed" }), false);
 });
 
 test("user ownership migration defines RLS and private storage", () => {

@@ -93,7 +93,7 @@ insert into public.model_configs (
   supported_durations, supported_ratios, supported_resolutions, cost_rule, status, priority
 ) values (
   'kling-v3-pro', '可灵 v3.0 Pro', 'RunningHub', 'bytedance/seedance-2.0-global-fast/multimodal-video',
-  '{"type":"image_to_video","generate_audio":false,"real_person_mode":true}'::jsonb,
+  '{"type":"image_to_video","generate_audio":false}'::jsonb,
   '["4","5","6","7","8","9","10","11","12","13","14","15"]'::jsonb,
   '["9:16","16:9","4:3","1:1","3:4","21:9"]'::jsonb,
   '["480p","720p","1080p","2k","4k"]'::jsonb,

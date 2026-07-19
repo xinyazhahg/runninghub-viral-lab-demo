@@ -1,15 +1,15 @@
 const DEFAULT_MODEL_CONFIG = Object.freeze({
-  model_id: 'kling-v3-pro',
-  model_name: '可灵 v3.0 Pro',
+  model_id: 'seedance-2.0',
+  model_name: 'Seedance 2.0',
   provider: 'RunningHub',
-  endpoint: 'bytedance/seedance-2.0-global-fast/multimodal-video',
-  capability: { type: 'image_to_video', generate_audio: false, real_person_mode: true },
+  endpoint: 'rhart-video/sparkvideo-2.0/multimodal-video',
+  capability: { type: 'multimodal_video', requires_replacement_images: true, generate_audio: true },
   supported_durations: ['4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15'],
-  supported_ratios: ['9:16', '16:9', '4:3', '1:1', '3:4', '21:9'],
-  supported_resolutions: ['480p', '720p', '1080p', '2k', '4k'],
+  supported_ratios: ['adaptive', '16:9', '4:3', '1:1', '3:4', '9:16', '21:9'],
+  supported_resolutions: ['480p', '720p'],
   cost_rule: {},
   status: 'active',
-  priority: 10,
+  priority: 1,
   _source: 'compatibility_fallback',
 });
 

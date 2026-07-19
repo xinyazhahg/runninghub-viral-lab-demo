@@ -1,10 +1,11 @@
 const { getSupabaseClient } = require('../lib/supabase');
 const { DEFAULT_MODEL_CONFIG, isMissingModelConfigTable } = require('../config/defaultModelConfig');
+const GENERATION_MODEL_ID = 'seedance-2.0';
 
 function createPromptModelService({ client = getSupabaseClient() } = {}) {
   async function listActiveModels() {
     const { data, error } = await client.from('model_configs').select('*')
-      .eq('status', 'active').order('priority', { ascending: true });
+      .eq('status', 'active').eq('model_id', GENERATION_MODEL_ID).order('priority', { ascending: true });
     if (error) {
       if (isMissingModelConfigTable(error)) return [{ ...DEFAULT_MODEL_CONFIG }];
       throw error;
@@ -13,6 +14,7 @@ function createPromptModelService({ client = getSupabaseClient() } = {}) {
   }
 
   async function getActiveModel(modelId) {
+    if (modelId !== GENERATION_MODEL_ID) return null;
     const { data, error } = await client.from('model_configs').select('*')
       .eq('model_id', modelId).eq('status', 'active').maybeSingle();
     if (error) {

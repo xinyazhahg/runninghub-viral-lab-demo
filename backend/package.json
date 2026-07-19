@@ -5,7 +5,7 @@
   "main": "script copy.js",
   "scripts": {
     "test": "node --test test/*.test.js",
-    "start": "node server.js"
+    "start": "node --env-file=.env server.js"
   },
   "keywords": [],
   "author": "",

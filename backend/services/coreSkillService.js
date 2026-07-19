@@ -48,7 +48,9 @@ function createCoreSkillService({ contracts = loadContracts(), logger = createLo
       logger.info({ ...context, skillName: name, action: 'skill.execute', durationMs: Date.now() - started, status: 'success', modelName: contract.model });
       return output;
     } catch (error) {
-      const normalized = normalizeError(error, name === 'prompt_generation' ? 'INTERNAL_ERROR' : 'MODEL_REQUEST_FAILED');
+      const normalized = error?.preserveUpstream === true
+        ? error
+        : normalizeError(error, name === 'prompt_generation' ? 'INTERNAL_ERROR' : 'MODEL_REQUEST_FAILED');
       logger.error({ ...context, skillName: name, action: 'skill.execute', durationMs: Date.now() - started, status: 'failed', modelName: contract.model, errorCode: normalized.code, errorMessage: normalized.message });
       throw normalized;
     }

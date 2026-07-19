@@ -1,6 +1,6 @@
 {
   "name": "video_understanding",
-  "description": "读取原视频并输出结构化视频拆解结果，保留现有RunningHub video-to-text处理方式。",
+  "description": "通过 RunningHub AI站 LLM API 调用 Gemini，联合分析视频画面与原始音轨并输出 normalized_breakdown。",
   "input_schema": {
     "type": "object",
     "required": ["project_id", "task_id", "video_path", "prompt"],
@@ -13,15 +13,15 @@
     }
   },
   "output_schema": {
-    "type": "string",
-    "description": "现有格式化视频理解文本；后续由cleanBreakdownForResponse与parseBreakdownResult处理。"
+    "type": "object",
+    "required": ["rawUnderstandingResult", "normalizedBreakdown", "modelName", "modelVersion", "provider"]
   },
-  "provider": "RunningHub",
-  "model": "rhart-text-g-25-flash/video-to-text",
-  "timeout": { "milliseconds": 1200000, "source": "RH_MAX_POLL_SECONDS" },
+  "provider": "RunningHub LLM API",
+  "model": "google/gemini-3.5-flash",
+  "timeout": { "milliseconds": 300000, "source": "videoUnderstandingService" },
   "retry_policy": { "max_retries": 5, "strategy": "exponential_backoff", "retryable": ["network_error", "provider_5xx", "rate_limit"], "non_retryable": ["content_rejected", "invalid_input", "cancelled"] },
-  "error_codes": ["TASK_TIMEOUT", "MODEL_UNAVAILABLE", "MODEL_REQUEST_FAILED", "MODEL_RATE_LIMITED", "MODEL_CONTENT_REJECTED", "MODEL_RESULT_INVALID"],
-  "cost_rule": { "type": "provider_usage", "source": "RunningHub response usage.consumeMoney", "user_points": false },
-  "implementation_files": ["backend/server.js#runVideoToTextDirect", "backend/server.js#pollRunningHubTask", "backend/services/taskResultService.js"],
+  "error_codes": ["VIDEO_ANALYSIS_TIMEOUT", "TASK_TIMEOUT", "MODEL_UNAVAILABLE", "MODEL_REQUEST_FAILED", "MODEL_RATE_LIMITED", "MODEL_CONTENT_REJECTED", "MODEL_RESULT_INVALID"],
+  "cost_rule": { "type": "token_usage", "source": "Ark response usage + configured per-million-token rates", "user_points": false },
+  "implementation_files": ["backend/services/videoUnderstandingService.js", "backend/lib/fineVideoBreakdown.js", "backend/server.js#runFineVideoUnderstanding"],
   "standalone_test": "node --test --test-name-pattern='video understanding skill' test/coreSkills.test.js"
 }
