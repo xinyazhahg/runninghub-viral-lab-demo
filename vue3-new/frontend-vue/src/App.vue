@@ -54,6 +54,7 @@ let worksRequestPromise = null
 let worksLoadedAt = 0
 const coverRetryKeys = new Set()
 const PROJECT_ID_KEY = 'viral-lab-current-project-id'
+const PROMPT_UI_STATE_KEY_PREFIX = 'viral-lab-prompt-ui-state:v1:'
 const HISTORY_VIDEO_EXPIRED_MESSAGE = '历史视频地址已失效，请重新生成'
 const VIDEO_ANALYSIS_WAIT_TIMEOUT_MS = 330_000
 const VIDEO_ANALYSIS_TIMEOUT_MESSAGE = '视频分析超时，请重新尝试；无需重新上传时优先支持重新分析。'
@@ -122,6 +123,60 @@ const refreshingResultIds = ref(new Set())
 const resultRefreshAttempts = new Map()
 const resultRefreshPromises = new Map()
 let generationTimer = null
+
+function promptUiStateKey(id = projectId.value) {
+  return id ? `${PROMPT_UI_STATE_KEY_PREFIX}${id}` : ''
+}
+
+function persistPromptUiState(status) {
+  if (typeof localStorage === 'undefined') return
+  const key = promptUiStateKey()
+  if (!key) return
+  localStorage.setItem(key, JSON.stringify({
+    status,
+    error: promptGenerationError.value,
+    draft: {
+      status: promptDraft.status,
+      automaticPrompt: promptDraft.automaticPrompt,
+      finalPrompt: promptDraft.finalPrompt,
+      promptSource: promptDraft.promptSource,
+      editedAt: promptDraft.editedAt,
+      fingerprint: promptDraft.fingerprint,
+      mappings: promptDraft.mappings,
+      creativePlan: promptDraft.creativePlan,
+      warnings: promptDraft.warnings,
+      source: promptDraft.source,
+    },
+    updatedAt: new Date().toISOString(),
+  }))
+}
+
+function restorePromptUiState(id) {
+  if (typeof localStorage === 'undefined') return
+  const key = promptUiStateKey(id)
+  if (!key) return
+  let saved
+  try { saved = JSON.parse(localStorage.getItem(key) || 'null') } catch { saved = null }
+  if (!saved || typeof saved !== 'object') return
+  if (saved.status === 'success' && saved.draft?.finalPrompt) {
+    Object.assign(promptDraft, createEmptyPromptDraft(), saved.draft)
+    promptGenerationFailed.value = false
+    promptGenerationError.value = ''
+    return
+  }
+  if (saved.status === 'failed' || saved.status === 'generating') {
+    promptGenerationFailed.value = true
+    promptGenerationError.value = saved.status === 'generating'
+      ? '提示词生成请求已因页面刷新中断，请重新生成'
+      : (saved.error || '提示词生成失败，请重试')
+  }
+}
+
+function clearPromptUiState(id = projectId.value) {
+  if (typeof localStorage === 'undefined') return
+  const key = promptUiStateKey(id)
+  if (key) localStorage.removeItem(key)
+}
 const resultParams = reactive({
   ratio: 'adaptive',
   quality: '720p',
@@ -765,6 +820,7 @@ async function restoreProjectState() {
     breakdownData.value = getEmptyBreakdownData('已恢复持久化项目')
     flowMode.value = 'customizing'
     await restoreProjectTasksAndResults(data)
+    restorePromptUiState(project.id)
     demoStateRestored = true
     // 不阻塞工作台恢复；媒体元素在后台读取 metadata，避免先下载完整视频。
     getRemoteVideoPreviewInfo(videoObjectUrl.value).then((previewInfo) => {
@@ -798,6 +854,7 @@ async function retryWorkspaceRestore() {
 
 function clearDemoState(options = {}) {
   const preserveLayout = options?.preserveLayout === true
+  clearPromptUiState()
   suppressDemoPersist = true
   canvas.clearSavedOffsets({ removePersisted: !preserveLayout })
   canvas.setStorageKey('')
@@ -2275,6 +2332,8 @@ async function uploadGenerationReference({ expectedType, type = expectedType, fi
       extraReferenceAssets.value.push(nextAsset)
     }
     showNotice(nextAsset.needsConfirmation ? '已按通用参考保存，请确认素材用途' : '参考素材上传成功')
+    await nextTick()
+    await handleGeneratePrompt()
   } catch (error) {
     generateError.value = error.message || '参考素材上传失败，请重试'
   } finally {
@@ -2338,6 +2397,7 @@ function currentSourceVideoDuration() {
 
 function invalidatePromptDraft() {
   Object.assign(promptDraft, markPromptDraftStale(promptDraft))
+  if (promptDraft.finalPrompt) persistPromptUiState('success')
 }
 
 function stopPromptCreationPresentation() {
@@ -2373,6 +2433,7 @@ async function handleGeneratePrompt() {
   }
   syncInitialGenerationDurationToSource(currentSourceVideoDuration())
   isGeneratingPrompt.value = true
+  persistPromptUiState('generating')
   startPromptCreationPresentation()
   try {
     const response = await authFetch(apiUrl('/api/generate-prompt'), {
@@ -2420,6 +2481,7 @@ async function handleGeneratePrompt() {
     generationStatus.value = ''
     generateError.value = ''
     promptGenerationFailed.value = false
+    persistPromptUiState('success')
     clearReplacementImageError()
     showNotice('创作方案已生成')
     await nextTick()
@@ -2427,6 +2489,7 @@ async function handleGeneratePrompt() {
   } catch (error) {
     promptGenerationFailed.value = true
     promptGenerationError.value = error.message || '创作方案生成失败，请重试'
+    persistPromptUiState('failed')
     showNotice('创作方案生成失败')
   } finally {
     stopPromptCreationPresentation()
@@ -2438,6 +2501,7 @@ function handlePromptDraftInput(value) {
   Object.assign(promptDraft, editPromptDraft(promptDraft, value))
   promptGenerationFailed.value = false
   promptGenerationError.value = ''
+  persistPromptUiState('success')
 }
 
 async function handleConfirmGeneration() {
@@ -2846,6 +2910,7 @@ function handleRevise(version) {
   customItems.value = resetItemsForRevision(customItems.value, uploadedVideo.coverUrl)
   adjustmentText.value = ''
   Object.assign(promptDraft, createEmptyPromptDraft())
+  clearPromptUiState()
   generationNodeResult.value = null
   resetGenerationStatus()
   promptGenerationFailed.value = false
@@ -3091,6 +3156,7 @@ function retry() {
                   :prompt-mappings="promptDraft.mappings"
                   :creative-plan="promptDraft.creativePlan"
                   :prompt-error="promptGenerationError"
+                  :prompt-generation-failed="promptGenerationFailed"
                   :generation-error="generateError"
                   :is-generating-prompt="isGeneratingPrompt"
                   :is-generating="isGenerating"
@@ -3103,6 +3169,7 @@ function retry() {
                   @update:prompt="handlePromptDraftInput"
                   @generate="handleGenerate"
                   @retry-generation="handleGenerate"
+                  @retry-prompt="handleGeneratePrompt"
                   @retry-config="retryGenerationConfiguration"
                   @upload-reference="uploadGenerationReference"
                   @update-reference-binding="updateGenerationReferenceBinding"

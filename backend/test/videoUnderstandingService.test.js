@@ -61,12 +61,62 @@ test('RunningHub AI站 Gemini 使用 video_url 联合分析画面音轨并要求
   assert.equal(request.options.headers.Authorization, 'Bearer runninghub-test-key');
   assert.equal(request.body.model, 'google/gemini-3.5-flash');
   assert.equal(request.body.response_format.type, 'json_object');
-  assert.equal(request.body.messages[0].content[1].type, 'video_url');
-  assert.equal(request.body.messages[0].content[1].video_url.url, 'https://runninghub.example/test.mp4');
-  assert.match(request.body.messages[0].content[0].text, /原始音轨/);
+  assert.equal(request.body.messages[0].role, 'system');
+  assert.match(request.body.messages[0].content, /所有面向用户展示的自然语言字段内容必须只使用自然、流畅的简体中文/);
+  assert.equal(request.body.messages[1].content[1].type, 'video_url');
+  assert.equal(request.body.messages[1].content[1].video_url.url, 'https://runninghub.example/test.mp4');
+  assert.match(request.body.messages[1].content[0].text, /完整画面和原始音轨/);
   assert.equal(output.provider, 'runninghub_llm');
   assert.equal(output.modelVersion, 'rh-llm-g/rh-g-flash-35');
   assert.equal(output.normalizedBreakdown.shots[0].beats.length, 5);
+});
+
+test('模型仍返回英文时按原字段路径中文化且保持镜头和时间轴不变', async () => {
+  const english = dogBreakdown();
+  english.summary = 'A puppy answers the owner and then smiles.';
+  english.subjects = ['Puppy'];
+  english.shots[0].narrative.summary = 'The puppy answers the question.';
+  english.shots[0].beats[0].title = 'Puppy answers the question';
+  english.shots[0].beats[0].trigger = 'Owner asks who is good-looking';
+  english.shots[0].beats[0].action = 'Puppy opens its mouth and smiles';
+  english.shots[0].beats[0].emotionBefore = 'Curious';
+  english.shots[0].beats[0].emotionAfter = 'Happy';
+  const dictionary = new Map([
+    ['A puppy answers the owner and then smiles.', '小狗回答主人后露出笑容。'],
+    ['Puppy', '小狗'],
+    ['The puppy answers the question.', '小狗回答问题。'],
+    ['Puppy answers the question', '小狗回答问题'],
+    ['Owner asks who is good-looking', '主人询问谁更好看'],
+    ['Puppy opens its mouth and smiles', '小狗张开嘴巴并露出笑容'],
+    ['Curious', '好奇'],
+    ['Happy', '开心'],
+  ]);
+  let calls = 0;
+  const fetchImpl = async (_url, options) => {
+    calls += 1;
+    const request = JSON.parse(options.body);
+    if (calls === 1) {
+      return { ok: true, text: async () => JSON.stringify({ model: 'mock', choices: [{ message: { content: JSON.stringify(english) } }] }) };
+    }
+    const input = JSON.parse(request.messages[1].content);
+    const translations = input.translations.map((item) => ({ ...item, text: dictionary.get(item.text) || item.text }));
+    return { ok: true, text: async () => JSON.stringify({ choices: [{ message: { content: JSON.stringify({ translations }) } }] }) };
+  };
+  const output = await callRunningHubGeminiVideoUnderstanding({
+    apiKey: 'test-key', videoUrl: 'https://example.com/dog.mp4', fetchImpl, requestId: 'req-localize',
+  });
+  assert.equal(calls, 2);
+  assert.equal(output.translationApplied, true);
+  assert.equal(output.normalizedBreakdown.summary, '小狗回答主人后露出笑容。');
+  assert.equal(output.normalizedBreakdown.shots[0].beats[0].trigger, '主人询问谁更好看');
+  assert.equal(output.normalizedBreakdown.shots[0].beats[0].action, '小狗张开嘴巴并露出笑容');
+  assert.equal(output.normalizedBreakdown.shots[0].beats[0].emotionBefore, '好奇');
+  assert.equal(output.normalizedBreakdown.shots[0].beats[0].emotionAfter, '开心');
+  assert.equal(output.normalizedBreakdown.shots.length, english.shots.length);
+  assert.equal(output.normalizedBreakdown.shots[0].beats.length, english.shots[0].beats.length);
+  assert.equal(output.normalizedBreakdown.shots[0].beats[0].startTime, english.shots[0].beats[0].startTime);
+  assert.equal(output.normalizedBreakdown.shots[0].beats[0].endTime, english.shots[0].beats[0].endTime);
+  assert.equal(output.normalizedBreakdown.shots[0].id, 'shot_1');
 });
 
 test('小狗精细拆解聚合服装且不产生厨房、蛋糕、桌子', async () => {

@@ -20,6 +20,7 @@ const props = defineProps({
   promptMappings: { type: Array, default: () => [] },
   creativePlan: { type: Object, default: null },
   promptError: { type: String, default: '' },
+  promptGenerationFailed: { type: Boolean, default: false },
   generationError: { type: String, default: '' },
   isGeneratingPrompt: { type: Boolean, default: false },
   isGenerating: { type: Boolean, default: false },
@@ -32,7 +33,7 @@ const props = defineProps({
 
 const emit = defineEmits([
   'update:generationConfig', 'update:prompt', 'generate',
-  'retry-config', 'retry-generation',
+  'retry-config', 'retry-generation', 'retry-prompt',
   'upload-reference', 'delete-reference',
   'update-reference-binding',
 ])
@@ -98,6 +99,7 @@ const configReady = computed(() => props.configStatus === 'ready'
   && props.generationOptions.durations?.length)
 const generateDisabled = computed(() => props.isGenerating
   || props.isGeneratingPrompt
+  || props.promptGenerationFailed
   || props.referenceUploading
   || !configReady.value
   || !String(props.promptValue || '').trim())
@@ -216,28 +218,47 @@ function updateConfig(key, value) {
     <section class="node-section prompt-section">
       <div class="section-heading">
         <strong>完整 Prompt</strong>
-        <span v-if="promptStatus === 'edited'">已修改</span>
+        <span v-if="isGeneratingPrompt" class="prompt-heading-state">生成中</span>
+        <span v-else-if="promptGenerationFailed" class="prompt-heading-state is-error">生成失败</span>
+        <span v-else-if="promptStatus === 'edited'">已修改</span>
         <span v-else-if="promptStatus === 'stale'">已失效</span>
         <span v-else>可编辑</span>
       </div>
-      <p v-if="promptStale" class="state-text error">素材或生成内容已变化，请重新生成创作方案。</p>
-      <ul v-if="promptMappings.length" class="mapping-list">
-        <li v-for="mapping in promptMappings" :key="mapping.reference">
-          <strong>{{ mapping.reference }}</strong>：{{ mapping.group }}<template v-if="mapping.name && mapping.name !== mapping.group"> · {{ mapping.name }}</template>
-        </li>
-      </ul>
-      <PromptEditor
-        :model-value="visiblePrompt"
-        :highlight-terms="replacementHighlightTerms"
-        :disabled="isGenerating"
-        :expanded="promptExpanded || !promptHasOverflow"
-        @update:model-value="emit('update:prompt', $event)"
-        @focus="promptExpanded = true"
-      />
-      <button v-if="promptHasOverflow" type="button" class="prompt-expand-button" @click="promptExpanded = !promptExpanded">
-        {{ promptExpanded ? '收起' : '展开全部' }}
-      </button>
-      <p v-if="promptError" class="state-text error">{{ promptError }}</p>
+      <div v-if="isGeneratingPrompt" class="prompt-loading-state" role="status" aria-live="polite">
+        <span class="prompt-loading-spinner" aria-hidden="true"></span>
+        <div>
+          <strong>正在生成创作提示词<span class="loading-ellipsis" aria-hidden="true"></span></strong>
+          <p>正在结合视频拆解和参考素材生成，请稍候</p>
+        </div>
+      </div>
+      <div v-else-if="promptGenerationFailed" class="prompt-failed-state" role="alert">
+        <span class="status-dot" aria-hidden="true"></span>
+        <div>
+          <strong>提示词生成失败，请重试</strong>
+          <p v-if="promptError">{{ promptError }}</p>
+        </div>
+        <button type="button" @click="emit('retry-prompt')">重新生成</button>
+      </div>
+      <template v-else>
+        <p v-if="promptStale" class="state-text error">素材或生成内容已变化，请重新生成创作方案。</p>
+        <ul v-if="promptMappings.length" class="mapping-list">
+          <li v-for="mapping in promptMappings" :key="mapping.reference">
+            <strong>{{ mapping.reference }}</strong>：{{ mapping.group }}<template v-if="mapping.name && mapping.name !== mapping.group"> · {{ mapping.name }}</template>
+          </li>
+        </ul>
+        <PromptEditor
+          :model-value="visiblePrompt"
+          :highlight-terms="replacementHighlightTerms"
+          :disabled="isGenerating"
+          :expanded="promptExpanded || !promptHasOverflow"
+          @update:model-value="emit('update:prompt', $event)"
+          @focus="promptExpanded = true"
+        />
+        <button v-if="promptHasOverflow" type="button" class="prompt-expand-button" @click="promptExpanded = !promptExpanded">
+          {{ promptExpanded ? '收起' : '展开全部' }}
+        </button>
+        <p v-if="promptError" class="state-text error">{{ promptError }}</p>
+      </template>
     </section>
 
     <section class="node-section config-section">
@@ -350,6 +371,18 @@ function updateConfig(key, value) {
 .config-grid select { min-height: 38px; padding: 0 10px; border: 1px solid rgba(255,255,255,.11); border-radius: 9px; color: #fff; background: #151817; }
 .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .section-heading span { color: var(--muted); font-size: 12px; }
+.section-heading .prompt-heading-state { color: #9bcfb4; }
+.section-heading .prompt-heading-state.is-error { color: #ff9696; }
+.prompt-loading-state, .prompt-failed-state { display: flex; align-items: center; gap: 12px; min-height: 148px; padding: 18px; box-sizing: border-box; border: 1px solid rgba(53,245,154,.13); border-radius: 10px; background: #0b0e0d; }
+.prompt-loading-state > div, .prompt-failed-state > div { display: grid; min-width: 0; flex: 1; gap: 5px; }
+.prompt-loading-state strong, .prompt-failed-state strong { color: #e9efec; font-size: 13px; }
+.prompt-loading-state p, .prompt-failed-state p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.prompt-loading-spinner { width: 22px; height: 22px; flex: 0 0 auto; border: 2px solid rgba(53,245,154,.18); border-top-color: var(--green); border-radius: 50%; animation: spin .8s linear infinite; }
+.loading-ellipsis::after { content: '...'; display: inline-block; width: 1.5em; overflow: hidden; vertical-align: bottom; animation: loading-dots 1.2s steps(4,end) infinite; }
+@keyframes loading-dots { 0% { width: 0; } 100% { width: 1.5em; } }
+.prompt-failed-state { min-height: 112px; border-color: rgba(255,92,92,.2); background: rgba(255,92,92,.035); }
+.prompt-failed-state .status-dot { color: #ff9696; }
+.prompt-failed-state button { flex: 0 0 auto; padding: 7px 11px; border-radius: 8px; color: #ffd1d1; background: rgba(255,92,92,.11); }
 .mapping-list { display: grid; gap: 4px; margin: 0; padding-left: 20px; color: var(--muted); font-size: 12px; }
 .prompt-expand-button { justify-self: end; padding: 4px 2px; color: #8eeebb; background: transparent; font-size: 11px; font-weight: 800; }
 .config-section { gap: 8px; }
