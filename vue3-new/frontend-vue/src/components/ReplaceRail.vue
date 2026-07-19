@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed } from 'vue'
 import { deleteProjectAsset, persistReplacementImage, toBackendUrl } from '../api.js'
+import FlowNodeHeader from './FlowNodeHeader.vue'
 const reviseMuted = ref(false)
 let reviseMutedTimer = null
 function scheduleReviseMute() {
@@ -56,17 +57,13 @@ const props = defineProps({
     type: String,
     default: '',
   },
-  modelValue: {
-    type: String,
-    default: '',
-  },
   generateBtnText: {
     type: String,
     default: '生成视频',
   },
   generationConfigText: {
     type: String,
-    default: '9:16 / 720P / 10s / 可灵 v3.0 Pro',
+    default: 'adaptive / 720P / 4s / Seedance 2.0',
   },
   generationConfig: { type: Object, default: () => ({}) },
   generationOptions: { type: Object, default: () => ({ models: [], ratios: [], resolutions: [], durations: [] }) },
@@ -76,6 +73,12 @@ const props = defineProps({
   configStatus: { type: String, default: 'loading' },
   configError: { type: String, default: '' },
   configWarning: { type: String, default: '' },
+  promptStatus: { type: String, default: 'idle' },
+  promptValue: { type: String, default: '' },
+  promptMappings: { type: Array, default: () => [] },
+  promptError: { type: String, default: '' },
+  isGeneratingPrompt: { type: Boolean, default: false },
+  creationStage: { type: String, default: 'IDLE' },
   isGenerating: {
     type: Boolean,
     default: false,
@@ -90,15 +93,22 @@ const props = defineProps({
   },
 })
 
-const emit = defineEmits(['replace', 'restore', 'update:modelValue', 'update:generationConfig', 'generate', 'retry-config'])
+const emit = defineEmits([
+  'replace', 'restore', 'update:generationConfig',
+  'generate-prompt', 'update:prompt', 'confirm-generate', 'retry-config',
+])
 
-const generationDisabled = computed(() => props.isGenerating
-  || props.configStatus !== 'ready'
-  || props.priceStatus !== 'ready'
-  || !props.generationOptions.models?.length
-  || !props.generationOptions.ratios?.length
-  || !props.generationOptions.resolutions?.length
-  || !props.generationOptions.durations?.length)
+const promptGenerationDisabled = computed(() => props.isGenerating || props.isGeneratingPrompt)
+const creationCopy = computed(() => {
+  if (!props.isGeneratingPrompt) return { title: '开始创作', subtitle: '' }
+  if (props.creationStage === 'VIDEO_UNDERSTAND') {
+    return { title: '正在理解参考视频...', subtitle: '分析剧情、镜头、节奏与导演思路' }
+  }
+  if (['REPLACEMENT_ANALYZE', 'CREATIVE_PLAN'].includes(props.creationStage)) {
+    return { title: '正在分析导演思路...', subtitle: '规划作品结构与创作逻辑' }
+  }
+  return { title: '正在生成创作方案...', subtitle: '融合新的角色、场景和参考素材' }
+})
 
 function updateGenerationConfig(key, value) {
   emit('update:generationConfig', { ...props.generationConfig, [key]: value })
@@ -192,6 +202,7 @@ function openUploadModal(itemId) {
   const item = props.items.find((i) => i.id === itemId)
   if (!item) return
   activeItemId.value = itemId
+  assetUploadError.value = ''
   assetModalSource.value = 'upload'
   assetModalTitle.value = '上传新素材'
   const acceptText = item.group === '字幕/文案' ? '支持图片或视频' : '支持图片或视频'
@@ -204,6 +215,7 @@ function openLibraryModal(itemId) {
   const item = props.items.find((i) => i.id === itemId)
   if (!item) return
   activeItemId.value = itemId
+  assetUploadError.value = ''
   assetModalSource.value = 'library'
   const titleMap = {
     '主体': '选择主体素材',
@@ -233,9 +245,11 @@ async function onFileChange(e) {
   const file = e.target.files?.[0]
   if (!file) return
   if (!file.type.startsWith('image/')) {
-  alert('元素替换仅支持上传图片格式，请选择 JPG、PNG、WEBP 等图片文件。')
-  return
-}
+    assetUploadError.value = '仅支持 JPG、PNG、WEBP 等图片文件，请重新选择。'
+    assetModalSubtitle.value = assetUploadError.value
+    e.target.value = ''
+    return
+  }
   await applyReplacement(file.name, file)
   // 重置 input 以便重复选择同一文件
   e.target.value = ''
@@ -252,7 +266,7 @@ async function applyReplacement(fileName, file, previewUrl = '') {
 
   if (file && !props.projectId) {
     assetUploadError.value = '请先上传原视频并创建项目。'
-    alert(assetUploadError.value)
+    assetModalSubtitle.value = assetUploadError.value
     return
   }
 
@@ -315,14 +329,16 @@ async function applyReplacement(fileName, file, previewUrl = '') {
     item.replacement = fileName
     item.changed = true
 
+    // closeAssetModal 会保护上传中的弹窗，因此成功后先结束上传态，再关闭并同步父组件。
+    const completedItemId = item.id
+    isAssetUploading.value = false
     closeAssetModal()
-    emit('replace', item.id)
+    emit('replace', completedItemId)
   } catch (error) {
     Object.keys(item).forEach((key) => delete item[key])
     Object.assign(item, previous)
     assetUploadError.value = `素材上传失败：${error.message}`
     assetModalSubtitle.value = assetUploadError.value
-    alert(assetUploadError.value)
   } finally {
     isAssetUploading.value = false
     if (temporaryPreviewUrl) URL.revokeObjectURL(temporaryPreviewUrl)
@@ -337,6 +353,17 @@ const groupedItems = computed(() => {
 })
 
 const changedItems = computed(() => props.items.filter((item) => item.changed))
+function changeSummaryOriginal(item) {
+  const label = String(item.title || item.original || item.group || '').trim()
+  return label.replace(/^(宠物|主体|场景|元素)[：:\s_-]*/, '').trim() || label
+}
+
+const changedSummaryItems = computed(() => changedItems.value.map((item) => ({
+  id: item.id,
+  group: item.group,
+  original: changeSummaryOriginal(item),
+  replacement: String(item.replacement || item.current || '').trim(),
+})))
 
 function itemPreviewLabel(group) {
   if (group === '主体') return '视频截取'
@@ -553,12 +580,7 @@ function restoreLabel(group) {
 
 <template>
   <aside :class="['replace-rail', 'flow-node', { 'is-revising': revising }]" data-node-key="replaceRail">
-    <div class="replace-head">
-      <div>
-        <h2>上传替换与定制</h2>
-        <p>选择要替换的内容，未修改的部分会保留原样。</p>
-      </div>
-    </div>
+    <FlowNodeHeader step="02" title="上传替换与定制" />
 
     <div v-if="reviseVisible" :class="['revise-notice', { 'is-muted': reviseMuted }]">
       <span></span>
@@ -667,84 +689,32 @@ class="custom-group-grid"
 </div>
       </section>
     </div>
-
-    <!-- 底部生成区域：本次修改 + 补充生成要求 + 生成按钮 -->
-    <div class="change-list">
-      <div class="change-list-main">
-        <span class="node-caption change-list-title">本次修改</span>
-        <ul id="changeList">
-          <li
-            v-for="item in changedItems"
-            :key="item.id"
-            class="change-tag"
-          >
-            <strong class="change-object">{{ item.title }}</strong>
-            <span class="change-arrow">→</span>
-            <span class="change-value">{{ item.replacement || item.current }}</span>
-          </li>
-          <li v-if="changedItems.length === 0" class="change-empty">
-            还没有替换内容
-          </li>
-        </ul>
+    <p v-if="!changedSummaryItems.length" class="change-summary">暂未修改</p>
+    <div v-else class="change-summary has-changes">
+      <div class="change-summary-muted">修改：</div>
+      <div v-for="item in changedSummaryItems" :key="item.id" class="change-summary-item">
+        <span class="change-summary-muted">{{ item.group }}：{{ item.original }}</span>
+        <span class="change-summary-result"> → {{ item.replacement }}</span>
       </div>
+    </div>
 
+    <!-- 底部创作区域 -->
+    <div class="change-list">
       <div id="customGeneratePanel" class="custom-generate-panel">
-        <div class="custom-generate-summary">
-          <strong>补充生成要求</strong>
-          <p>这些要求会和上方替换素材一起用于生成新版本，也可以留空。</p>
-          <textarea
-            id="customAdjustmentInput"
-            :value="modelValue"
-            @input="emit('update:modelValue', $event.target.value)"
-            placeholder="例如：画面更明亮，动作更慢，镜头更稳定，保留夜晚氛围。"
-          ></textarea>
-        </div>
-        <div class="generation-config-panel">
-          <strong>生成配置</strong>
-          <p v-if="configStatus === 'loading'" class="config-state">模型配置加载中…</p>
-          <p v-else-if="configStatus === 'error'" class="config-state error">
-            {{ configError || '模型配置加载失败' }}
-            <button type="button" @click="emit('retry-config')">重试</button>
-          </p>
-          <p v-else-if="configWarning" class="config-state warning">{{ configWarning }}</p>
-          <p v-if="configStatus === 'ready' && priceStatus === 'error'" class="config-state error">
-            {{ priceError || '计费配置加载失败' }}
-            <button type="button" @click="emit('retry-config')">重试</button>
-          </p>
-          <div v-if="configStatus === 'ready'" class="generation-config-grid">
-            <label>视频比例
-              <select :value="generationConfig.ratio" :disabled="isGenerating" @change="updateGenerationConfig('ratio', $event.target.value)">
-                <option v-for="value in generationOptions.ratios" :key="value" :value="value">{{ value }}</option>
-              </select>
-            </label>
-            <label>视频清晰度
-              <select :value="generationConfig.quality" :disabled="isGenerating" @change="updateGenerationConfig('quality', $event.target.value)">
-                <option v-for="value in generationOptions.resolutions" :key="value" :value="value">{{ value.toUpperCase() }}</option>
-              </select>
-            </label>
-            <label>视频时长
-              <select :value="generationConfig.duration" :disabled="isGenerating" @change="updateGenerationConfig('duration', $event.target.value)">
-                <option v-for="value in generationOptions.durations" :key="value" :value="`${value}s`">{{ value }}s</option>
-              </select>
-            </label>
-            <label>生成模型
-              <select :value="generationConfig.modelId" :disabled="isGenerating" @change="updateGenerationConfig('modelId', $event.target.value)">
-                <option v-for="item in generationOptions.models" :key="item.id" :value="item.id">{{ item.label }}</option>
-              </select>
-            </label>
-          </div>
-        </div>
+        <p v-if="promptError" class="config-state error">{{ promptError }}</p>
         <div class="custom-generate-footer">
-          <span class="generation-config-text">预计消耗：{{ estimatedPriceText }}</span>
-          <button
-            id="customDirectGenerateBtn"
-            class="primary-button branch-generate"
-            type="button"
-            :disabled="generationDisabled"
-            @click="emit('generate')"
-          >
-            {{ isGenerating ? '生成中...' : configStatus === 'loading' ? '配置加载中...' : configStatus === 'error' ? '配置加载失败' : priceStatus !== 'ready' ? '费用不可用' : generateBtnText }}
-          </button>
+          <div class="creation-action">
+            <button
+              id="customDirectGenerateBtn"
+              class="primary-button branch-generate"
+              type="button"
+              :disabled="promptGenerationDisabled"
+              @click="emit('generate-prompt')"
+            >
+              {{ creationCopy.title }}
+            </button>
+            <small v-if="creationCopy.subtitle" class="creation-subtitle">{{ creationCopy.subtitle }}</small>
+          </div>
         </div>
       </div>
     </div>
@@ -906,25 +876,10 @@ class="custom-group-grid"
   }
 }
 
-.replace-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.replace-head h2 {
-  margin: 0;
-  color: #f4f5f6;
-  font-size: 20px;
-  font-weight: 800;
-}
-
-.replace-head p {
-  margin: 6px 0 0;
-  color: var(--muted);
-  font-size: 12px;
-}
+.change-summary { margin: 2px 0 4px !important; color: rgba(255,255,255,.5) !important; font-size: 12px; line-height: 1.45; }
+.change-summary-item { margin-top: 4px; }
+.change-summary-muted { color: rgba(255,255,255,.5); }
+.change-summary-result { color: #35f59a; }
 
 /* ── 替换项网格 ── */
 .custom-grid {
@@ -1273,93 +1228,18 @@ class="custom-group-grid"
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  gap: 10px;
+  gap: 0;
   width: 100%;
+  height: auto;
+  min-height: 0;
   box-sizing: border-box;
-  margin-top: 18px;
-  padding: 18px 20px;
-  border-radius: 20px;
-  background: linear-gradient(135deg, rgba(23, 44, 36, 0.88), rgba(12, 28, 24, 0.92));
-  border: 1px solid rgba(53, 245, 154, 0.2);
-  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.22);
-}
-
-.change-list-main {
-  width: 100%;
-}
-
-.change-list > strong {
-  display: block;
-  margin: 0 0 8px;
-  font-size: 14px;
-  font-weight: 700;
-  line-height: 1.4;
-  color: rgba(255, 255, 255, 0.94);
-  text-align: left;
-}
-
-.change-list-title {
-  display: block;
-  margin: 0 0 8px;
-  font-size: 16px;
-  font-weight: 800;
-  line-height: 1.4;
-  color: rgba(255, 255, 255, 0.96);
-  text-align: left;
-}
-
-#changeList {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin: 0 0 22px;
+  margin-top: 8px;
   padding: 0;
-  list-style: none;
-  width: 100%;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
 }
 
-.change-tag,
-.change-empty {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  width: fit-content;
-  min-height: 32px;
-  padding: 6px 14px;
-  border-radius: 999px;
-  font-size: 13px;
-  line-height: 1.3;
-  white-space: nowrap;
-}
-
-.change-tag {
-  background: rgba(53, 245, 154, 0.1);
-  border: 1px solid rgba(53, 245, 154, 0.28);
-}
-
-.change-object {
-  color: #f3f6f5;
-  font-weight: 800;
-}
-
-.change-arrow {
-  color: rgba(53, 245, 154, 0.72);
-  font-weight: 800;
-  font-size: 13px;
-}
-
-.change-value {
-  color: #79ffc0;
-  font-weight: 800;
-}
-
-.change-empty {
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  color: rgba(255, 255, 255, 0.56);
-}
-
-/* 补充生成要求 */
 .custom-generate-panel {
   display: flex;
   flex-direction: column;
@@ -1372,59 +1252,6 @@ class="custom-group-grid"
   background: transparent;
 }
 
-.custom-generate-summary {
-  width: 100%;
-  max-width: none;
-  text-align: left;
-  padding-top: 2px;
-}
-
-.custom-generate-summary strong {
-  display: block;
-  margin: 0 0 4px;
-  font-size: 16px;
-  font-weight: 800;
-  line-height: 1.4;
-  color: rgba(255, 255, 255, 0.96);
-  text-align: left;
-}
-
-.custom-generate-summary p {
-  margin: 0 0 10px;
-  color: rgba(255, 255, 255, 0.58);
-  font-size: 12px;
-  line-height: 1.5;
-  text-align: left;
-}
-
-#customAdjustmentInput {
-  display: block;
-  width: 100%;
-  max-width: none;
-  min-width: 100%;
-  min-height: 84px;
-  height: 84px;
-  margin: 0;
-  box-sizing: border-box;
-  resize: vertical;
-  border-radius: 14px;
-  padding: 12px 14px;
-  color: #fff;
-  font-size: 13px;
-  line-height: 1.6;
-  background: rgba(0, 0, 0, 0.28);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  outline: none;
-  font-family: inherit;
-}
-
-#customAdjustmentInput::placeholder {
-  color: rgba(255, 255, 255, 0.34);
-}
-
-#customAdjustmentInput:focus {
-  border-color: rgba(53, 245, 154, 0.3);
-}
 
 .custom-generate-footer {
   display: flex;
@@ -1432,12 +1259,56 @@ class="custom-group-grid"
   align-items: center;
   gap: 12px;
   width: 100%;
-  margin-top: 14px;
+  margin-top: 0;
+}
+
+.creation-action {
+  display: grid;
+  justify-items: end;
+  gap: 6px;
+}
+
+.creation-subtitle {
+  color: rgba(255, 255, 255, 0.56);
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .generation-config-panel {
   margin-top: 14px;
 }
+.prompt-draft-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid rgba(53, 245, 154, 0.18);
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.2);
+}
+.prompt-draft-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.prompt-draft-heading strong { color: rgba(255,255,255,.96); font-size: 14px; }
+.prompt-draft-heading span { color: #79ffc0; font-size: 11px; }
+.prompt-mapping-list { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; color: rgba(255,255,255,.66); font-size: 12px; }
+.prompt-mapping-list strong { color: #79ffc0; }
+.prompt-mapping-title { color: rgba(255,255,255,.9); font-weight: 800; }
+.prompt-draft-editor {
+  width: 100%;
+  min-height: 280px;
+  resize: vertical;
+  box-sizing: border-box;
+  padding: 13px 14px;
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 12px;
+  outline: none;
+  background: rgba(0,0,0,.32);
+  color: #edf5f1;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.65;
+}
+.prompt-draft-editor:focus { border-color: rgba(53,245,154,.42); }
+.prompt-regenerate { justify-self: start; }
 .config-state { display: flex; align-items: center; gap: 10px; margin: 8px 0 0; color: rgba(255,255,255,.58); font-size: 12px; }
 .config-state.error { color: #ff8585; }
 .config-state.warning { color: #d5ad63; }
@@ -1499,7 +1370,7 @@ class="custom-group-grid"
   align-items: center;
   justify-content: center;
   height: 38px;
-  min-width: 112px;
+  min-width: 132px;
   padding: 0 22px;
   border-radius: 999px;
   font-size: 14px;

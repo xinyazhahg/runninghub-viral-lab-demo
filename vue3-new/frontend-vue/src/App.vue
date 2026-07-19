@@ -1,29 +1,38 @@
 <script setup>
-import { ref, reactive, computed, watch, nextTick, onMounted } from 'vue'
+import { ref, reactive, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import LeftToolbar from './components/LeftToolbar.vue'
 import TopBar from './components/TopBar.vue'
 import LabHead from './components/LabHead.vue'
 import UploadCard from './components/UploadCard.vue'
 import AnalysisNode from './components/AnalysisNode.vue'
 import ReplaceRail from './components/ReplaceRail.vue'
+import VideoGenerationNode from './components/VideoGenerationNode.vue'
 import FlowConnector from './components/FlowConnector.vue'
 import InspirationGrid from './components/InspirationGrid.vue'
 import BottomControls from './components/BottomControls.vue'
 import BreakdownModal from './components/BreakdownModal.vue'
 import ResultCard from './components/ResultCard.vue'
+import FlowNodeHeader from './components/FlowNodeHeader.vue'
 import ViralLabTestBench from './components/ViralLabTestBench.vue'
 import AuthView from './components/AuthView.vue'
 import WorksView from './components/WorksView.vue'
 import AdminDashboard from './components/AdminDashboard.vue'
 import {
   apiUrl, authFetch, toBackendUrl, deleteProject, deleteProjectAsset, getCurrentUser,
-  getProject, getProjects, getProjectResults, getProjectTasks, getTask, persistOriginalVideo, retryTask,
-  getBillingAccount, getBillingTransactions,
+  getProject, getProjects, getProjectResults, getProjectTasks, getTask, persistOriginalVideo,
+  getBillingAccount, getBillingTransactions, persistReferenceAsset, updateProjectAssetBinding,
 } from './api.js'
 import { getSession, isAuthConfigured, signIn, signOut, signUp, supabase } from './auth.js'
 import { useCanvasNodes } from './composables/useCanvasNodes.js'
+import { hasRevisionChanges, nextVersionId, resetItemsForRevision } from './revisionFlow.js'
+import { persistedAssetType, isReplacementAsset, isReferenceAsset, isSourceVideoAsset } from './assetTypes.js'
+import { inferReferenceBinding } from './referenceBinding.js'
 import { cleanBreakdownResult } from './utils/cleanBreakdown.js'
 import { flushAnalytics, track, trackOnce } from './analytics.js'
+import {
+  applyGeneratedPrompt, confirmPromptDraft, createEmptyPromptDraft, editPromptDraft,
+  markPromptDraftStale, promptInputFingerprint, validatePromptDraft,
+} from './promptDraftFlow.js'
 
 // ── 状态管理 ──
 const activeView = ref('demo')
@@ -46,6 +55,9 @@ let worksLoadedAt = 0
 const coverRetryKeys = new Set()
 const PROJECT_ID_KEY = 'viral-lab-current-project-id'
 const HISTORY_VIDEO_EXPIRED_MESSAGE = '历史视频地址已失效，请重新生成'
+const VIDEO_ANALYSIS_WAIT_TIMEOUT_MS = 330_000
+const VIDEO_ANALYSIS_TIMEOUT_MESSAGE = '视频分析超时，请重新尝试；无需重新上传时优先支持重新分析。'
+const VIDEO_GENERATION_TIMEOUT_MESSAGE = '视频生成超时，请重试或稍后再试。'
 let demoStateRestored = false
 let suppressDemoPersist = false
 
@@ -58,6 +70,7 @@ const uploadedVideo = reactive({
   assetUrl: '',
   coverUrl: '',
   duration: '',
+  durationSeconds: 0,
   ratio: '',
   size: '',
 })
@@ -69,14 +82,19 @@ const analysisStage = ref('')
 const errorMsg = ref('')
 const breakdownData = ref(null)
 const videoToTextResult = ref(null)
+const canRetryVideoAnalysis = ref(false)
 const breakdownVisible = ref(false)
+const originalVideoPreviewVisible = ref(false)
 const videoObjectUrl = ref('')
 const originalVideoLoading = ref(false)
 const originalVideoError = ref('')
 const originalVideoSourceKey = ref(0)
 let originalVideoRefreshPromise = null
 let originalVideoRefreshAttempts = 0
+let lastUploadedVideoFile = null
 const customItems = ref(createDefaultCustomItems())
+const extraReferenceAssets = ref([])
+const referenceUploading = ref(false)
 
 // ── 生成 / 版本管理 ──
 const versions = ref([])
@@ -84,6 +102,13 @@ const currentVersionId = ref('')
 const isGenerating = ref(false)
 const generateError = ref('')
 const adjustmentText = ref('')
+const promptDraft = reactive(createEmptyPromptDraft())
+const isGeneratingPrompt = ref(false)
+const promptCreationStage = ref('IDLE')
+let promptCreationStageTimers = []
+const promptGenerationError = ref('')
+const promptGenerationFailed = ref(false)
+const generationNodeResult = ref(null)
 const currentGeneratingPrompt = ref('')
 const generationPhase = ref('')
 const generationElapsed = ref('0秒')
@@ -98,11 +123,11 @@ const resultRefreshAttempts = new Map()
 const resultRefreshPromises = new Map()
 let generationTimer = null
 const resultParams = reactive({
-  ratio: '9:16',
+  ratio: 'adaptive',
   quality: '720p',
-  duration: '10s',
-  modelId: 'kling-v3-pro',
-  model: '可灵 v3.0 Pro',
+  duration: '4s',
+  modelId: 'seedance-2.0',
+  model: 'Seedance 2.0',
   timeStart: 0,
   timeEnd: null,
 })
@@ -110,6 +135,73 @@ const generationOptions = ref({ models: [], ratios: [], resolutions: [], duratio
 const generationOptionsStatus = ref('loading')
 const generationOptionsError = ref('')
 const generationOptionsWarning = ref('')
+let sourceDurationSecondsForGeneration = 0
+let generationDurationChangedByUser = false
+let revisionResetInProgress = false
+const REPLACEMENT_IMAGE_ERROR = '请至少替换 1 个主体、场景或元素，并上传对应参考图片'
+const REPLACEMENT_IMAGE_ERROR_PATTERN = /Seedance 2\.0 需要至少一张替换素材图片|至少需要一张替换素材图片|请至少替换 1 个主体、场景或元素|素材上传失败/
+
+function submittedReplacementUrl(item) {
+  const url = String(
+    item?.assetUrl || item?.imageUrl || item?.replacementPreviewUrl || item?.previewUrl || ''
+  ).trim()
+  if (!url || /^(blob:|data:)/i.test(url)) return ''
+  return url
+}
+
+const validReplacementImages = computed(() => customItems.value.filter((item) =>
+  ['主体', '场景', '元素'].includes(item?.group)
+  && item?.changed === true
+  && Boolean(item?.assetId)
+  && Boolean(submittedReplacementUrl(item))
+))
+
+const hasValidReplacementImage = computed(() => validReplacementImages.value.length > 0)
+
+const generationReferenceAssets = computed(() => {
+  const replacements = promptReplacementPayload().map((item, index) => ({
+    key: `replacement-${item.asset_id}`, assetId: item.asset_id, type: 'image',
+    reference: `@图片${index + 1}`, name: item.original_filename || item.replacement,
+    purpose: { 主体: 'character_reference', 场景: 'scene_reference', 元素: 'prop_reference' }[item.group] || 'general_reference',
+    targetPlaceholderId: item.target_placeholder_id || '', confidence: 1,
+    url: item.asset_url, locked: true,
+  }))
+  const counters = { image: replacements.length, audio: 0, video: 0 }
+  const prefixes = { image: '图片', audio: '音频', video: '视频' }
+  return [...replacements, ...extraReferenceAssets.value.map((asset) => {
+    counters[asset.type] += 1
+    return { ...asset, reference: `@${prefixes[asset.type]}${counters[asset.type]}` }
+  })]
+})
+
+function clearReplacementImageError() {
+  if (REPLACEMENT_IMAGE_ERROR_PATTERN.test(String(generateError.value || ''))) {
+    generateError.value = ''
+  }
+}
+
+function validateReplacementImages({ showWhenMissing = false } = {}) {
+  if (hasValidReplacementImage.value) {
+    clearReplacementImageError()
+    return true
+  }
+  if (showWhenMissing) generateError.value = REPLACEMENT_IMAGE_ERROR
+  return false
+}
+
+watch(
+  () => validReplacementImages.value.map((item) => `${item.assetId}:${submittedReplacementUrl(item)}`).join('|'),
+  (current) => {
+    if (current) clearReplacementImageError()
+  }
+)
+
+watch(
+  () => currentPromptFingerprint(),
+  (fingerprint) => {
+    if (promptDraft.fingerprint && fingerprint !== promptDraft.fingerprint) invalidatePromptDraft()
+  }
+)
 
 function userFacingWorkspaceError(message, fallback = '操作失败，请稍后重试') {
   const text = String(message || '')
@@ -127,6 +219,27 @@ const activeGenerationOptions = computed(() => {
     durations: model?.durations?.length ? model.durations : generationOptions.value.durations,
   }
 })
+
+function syncInitialGenerationDurationToSource(rawDuration) {
+  const sourceDuration = Number(rawDuration)
+  if (!Number.isFinite(sourceDuration) || sourceDuration <= 0) return false
+  sourceDurationSecondsForGeneration = sourceDuration
+  if (generationDurationChangedByUser) return false
+
+  const supportedDurations = activeGenerationOptions.value.durations
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value > 0)
+  if (!supportedDurations.length) return false
+
+  const roundedSourceDuration = Math.max(1, Math.round(sourceDuration))
+  const selectedDuration = supportedDurations.includes(roundedSourceDuration)
+    ? roundedSourceDuration
+    : supportedDurations.reduce((nearest, candidate) => (
+      Math.abs(candidate - sourceDuration) < Math.abs(nearest - sourceDuration) ? candidate : nearest
+    ))
+  resultParams.duration = `${selectedDuration}s`
+  return true
+}
 const estimatedPrice = ref(null)
 const estimatedCredits = ref(null)
 const creditBalance = ref(0)
@@ -277,6 +390,7 @@ function applyPersistedGenerationConfig(source, { active = false } = {}) {
   const restored = readPersistedGenerationConfig(source)
   if (!restored) return null
   Object.assign(resultParams, restored)
+  generationDurationChangedByUser = true
   if (active) activeGenerationParams.value = { ...restored }
   return restored
 }
@@ -340,6 +454,9 @@ async function initializeAuth() {
     console.warn('登录状态恢复失败：', error)
     await signOut().catch(() => {})
     localStorage.removeItem(PROJECT_ID_KEY)
+    authError.value = ['AUTH_EXPIRED', 'AUTH_INVALID'].includes(error?.code) || [401, 403].includes(Number(error?.status))
+      ? '登录已过期，请重新登录'
+      : (error.message || '登录状态恢复失败，请重新登录')
   } finally {
     authReady.value = true
   }
@@ -379,6 +496,14 @@ async function handleLogout() {
   currentUser.value = null
   projects.value = []
   activeView.value = 'demo'
+}
+
+function handleAuthExpired(event) {
+  clearDemoState({ preserveLayout: true })
+  currentUser.value = null
+  projects.value = []
+  activeView.value = 'demo'
+  authError.value = event?.detail?.message || '登录已过期，请重新登录'
 }
 
 async function loadWorks({ silent = false } = {}) {
@@ -477,7 +602,7 @@ function pollRestoredTask(task) {
         generateError.value = ''
       } else {
         videoToTextResult.value = data
-        const parsed = parseBreakdownResult(data.result)
+        const parsed = parseBreakdownResult(data.normalizedBreakdown)
         breakdownData.value = parsed
         customItems.value = buildCustomItems(parsed)
         flowMode.value = 'customizing'
@@ -485,7 +610,14 @@ function pollRestoredTask(task) {
       return
     }
     if (['failed', 'timeout', 'cancelled'].includes(data.status)) {
-      const message = userFacingWorkspaceError(data.error, '任务失败，请稍后重试')
+      const taskErrorCode = data.errorCode || data.error_code || data.code
+      const generationTimedOut = data.taskType === 'generate_video'
+        && (data.status === 'timeout' || taskErrorCode === 'TASK_TIMEOUT')
+      const message = generationTimedOut
+        ? VIDEO_GENERATION_TIMEOUT_MESSAGE
+        : taskErrorCode === 'VIDEO_ANALYSIS_TIMEOUT'
+        ? VIDEO_ANALYSIS_TIMEOUT_MESSAGE
+        : userFacingWorkspaceError(data.error, '任务失败，请稍后重试')
       if (data.taskType === 'generate_video') {
         generationStatus.value = data.status
         generateError.value = message
@@ -513,17 +645,19 @@ async function restoreProjectTasksAndResults(payload = null) {
   const tasks = Array.isArray(tasksData.tasks) ? tasksData.tasks : []
   hydratePersistedResults(resultsData.results, tasks)
   const latestSuccessfulBreakdown = tasks.find((task) =>
-    task.task_type === 'video_to_text' && task.status === 'success' && task.output_data?.result
+    task.task_type === 'video_to_text' && task.status === 'success' && task.output_data?.normalized_breakdown
   )
   if (latestSuccessfulBreakdown) {
-    const result = latestSuccessfulBreakdown.output_data.result
+    const normalizedBreakdown = latestSuccessfulBreakdown.output_data.normalized_breakdown
     videoToTextResult.value = {
       taskId: latestSuccessfulBreakdown.id,
       status: 'success',
-      result,
-      rawResult: latestSuccessfulBreakdown.output_data.rawResult,
+      normalizedBreakdown,
+      breakdownVersion: latestSuccessfulBreakdown.output_data.breakdown_version,
+      modelName: latestSuccessfulBreakdown.output_data.model_name,
+      modelVersion: latestSuccessfulBreakdown.output_data.model_version,
     }
-    breakdownData.value = parseBreakdownResult(result)
+    breakdownData.value = parseBreakdownResult(normalizedBreakdown)
     flowMode.value = 'customizing'
   }
   const failedGeneration = tasks.find((task) =>
@@ -532,7 +666,13 @@ async function restoreProjectTasksAndResults(payload = null) {
   if (failedGeneration) {
     applyPersistedGenerationConfig(failedGeneration)
     lastFailedTaskId.value = failedGeneration.id
-    generateError.value = userFacingWorkspaceError(failedGeneration.error_message, '上一次生成失败，可重新生成。')
+    const generationTimedOut = failedGeneration.status === 'timeout'
+      || failedGeneration.error_code === 'TASK_TIMEOUT'
+      || /GenerateToTimeoutError|GenerationTimeoutError|超时|timeout/i.test(String(failedGeneration.error_message || ''))
+    generationStatus.value = generationTimedOut ? 'timeout' : 'failed'
+    generateError.value = generationTimedOut
+      ? VIDEO_GENERATION_TIMEOUT_MESSAGE
+      : userFacingWorkspaceError(failedGeneration.error_message, '上一次生成失败，可重新生成。')
   }
   const incomplete = tasks.filter((task) => ['created', 'queued', 'analyzing', 'generating'].includes(task.status))
   const activeGenerationTask = incomplete.find((task) => task.task_type === 'generate_video')
@@ -565,6 +705,13 @@ async function restoreProjectTasksAndResults(payload = null) {
 
 async function restoreProjectState() {
   if (typeof localStorage === 'undefined') return
+  sourceDurationSecondsForGeneration = 0
+  generationDurationChangedByUser = false
+  clearReplacementImageError()
+  promptGenerationFailed.value = false
+  promptGenerationError.value = ''
+  Object.assign(promptDraft, createEmptyPromptDraft())
+  generationNodeResult.value = null
   ;['viral-lab-demo-state:v1', 'viral-lab-test-bench-state:v1']
     .forEach((key) => localStorage.removeItem(key))
   const savedProjectId = localStorage.getItem(PROJECT_ID_KEY) || ''
@@ -577,7 +724,7 @@ async function restoreProjectState() {
     const project = data.project
     const assets = Array.isArray(data.assets) ? data.assets : []
     const original = assets.find((asset) => asset.id === project.original_asset_id)
-      || assets.find((asset) => asset.asset_type === 'original_video')
+      || assets.find(isSourceVideoAsset)
     const originalSignedUrl = assetSignedUrl(original)
     if (!originalSignedUrl) throw new Error('Project 缺少有效原视频')
     projectId.value = project.id
@@ -586,14 +733,14 @@ async function restoreProjectState() {
       name: original.original_filename || project.name,
       assetId: original.id,
       assetUrl: originalSignedUrl,
-      coverUrl: '', duration: '已持久化', ratio: '',
+      coverUrl: '', duration: '已持久化', durationSeconds: 0, ratio: '',
       size: original.file_size ? formatFileSize(Number(original.file_size)) : '',
     })
     videoObjectUrl.value = originalSignedUrl
     originalVideoError.value = ''
     originalVideoRefreshAttempts = 0
     const restoredItems = createDefaultCustomItems()
-    assets.filter((asset) => asset.asset_type === 'replacement_image').forEach((asset) => {
+    assets.filter(isReplacementAsset).forEach((asset) => {
       const group = mapReplacementTypeToGroup(asset.replacement_type)
       const item = restoredItems.find((entry) => entry.group === group && !entry.assetId)
       if (!item) return
@@ -605,6 +752,15 @@ async function restoreProjectState() {
       })
     })
     customItems.value = restoredItems
+    extraReferenceAssets.value = assets
+      .filter(isReferenceAsset)
+      .map((asset) => ({
+        key: asset.id, assetId: asset.id, type: persistedAssetType(asset), purpose: asset.purpose || 'general_reference',
+        assetRef: asset.asset_ref || '', targetPlaceholderId: asset.target_placeholder_id || '',
+        confidence: Number.isFinite(Number(asset.confidence)) ? Number(asset.confidence) : 0.5,
+        needsConfirmation: (asset.purpose || 'general_reference') === 'general_reference',
+        name: asset.original_filename, url: assetSignedUrl(asset), storagePath: asset.storage_path || '', locked: false,
+      }))
     // Task 恢复前先提供安全的最小容器，避免历史任务读取失败时页面黑屏。
     breakdownData.value = getEmptyBreakdownData('已恢复持久化项目')
     flowMode.value = 'customizing'
@@ -615,7 +771,9 @@ async function restoreProjectState() {
       if (requestSequence !== restoreRequestSequence || projectId.value !== project.id) return
       if (previewInfo.coverUrl) uploadedVideo.coverUrl = previewInfo.coverUrl
       if (previewInfo.duration) uploadedVideo.duration = previewInfo.duration
+      if (previewInfo.durationSeconds) uploadedVideo.durationSeconds = previewInfo.durationSeconds
       if (previewInfo.ratio) uploadedVideo.ratio = previewInfo.ratio
+      syncInitialGenerationDurationToSource(previewInfo.durationSeconds)
     }).catch((error) => console.warn('持久化原视频封面恢复失败：', error))
   } catch (error) {
     console.warn('Project 恢复失败：', error)
@@ -657,6 +815,7 @@ function clearDemoState(options = {}) {
     assetUrl: '',
     coverUrl: '',
     duration: '',
+    durationSeconds: 0,
     ratio: '',
     size: '',
   })
@@ -668,9 +827,14 @@ function clearDemoState(options = {}) {
   breakdownData.value = null
   breakdownVisible.value = false
   customItems.value = createDefaultCustomItems()
+  extraReferenceAssets.value = []
   versions.value = []
   currentVersionId.value = ''
   currentGeneratingPrompt.value = ''
+  Object.assign(promptDraft, createEmptyPromptDraft())
+  generationNodeResult.value = null
+  promptGenerationFailed.value = false
+  promptGenerationError.value = ''
   adjustmentText.value = ''
   generateError.value = ''
   errorMsg.value = ''
@@ -682,9 +846,11 @@ function clearDemoState(options = {}) {
   isGenerating.value = false
   activeGenerationParams.value = null
   pendingVersionId.value = ''
+  sourceDurationSecondsForGeneration = 0
+  generationDurationChangedByUser = false
   Object.assign(resultParams, {
-    ratio: '9:16', quality: '720p', duration: '10s',
-    modelId: 'kling-v3-pro', model: '可灵 v3.0 Pro', timeStart: 0, timeEnd: null,
+    ratio: 'adaptive', quality: '720p', duration: '4s',
+    modelId: 'seedance-2.0', model: 'Seedance 2.0', timeStart: 0, timeEnd: null,
   })
   showNotice('当前状态已清空')
 
@@ -765,6 +931,7 @@ const boardEl = ref(null)
 const uploadNodeEl = ref(null)
 const analysisNodeEl = ref(null)
 const replaceRailEl = ref(null)
+const videoGenerationNodeEl = ref(null)
 const resultNodeRefs = ref([])
 const activeNodeKey = ref('uploadNode')
 const pulsingNodeKey = ref('')
@@ -775,6 +942,7 @@ function registerCanvasNodes() {
   canvas.registerNode('uploadNode', uploadNodeEl.value)
   canvas.registerNode('analysisNode', analysisNodeEl.value)
   canvas.registerNode('replaceRail', replaceRailEl.value)
+  canvas.registerNode('videoGenerationNode', videoGenerationNodeEl.value)
   // 注册结果节点
   resultNodeRefs.value.forEach((el, index) => {
     const version = displayVersions.value[index]
@@ -804,24 +972,66 @@ const displayVersions = computed(() => {
     summary: [...(version.summary || [])],
   }))
 
-  if (isGenerating.value) {
-    const activeParams = activeGenerationParams.value || resultParams
-    list.push({
-      id: pendingVersionId.value || getNextVersionId(),
-      isGenerating: true,
-      videoUrl: '',
-      coverUrl: '',
-      ...activeParams,
-      prompt: '正在生成新版本...',
-      summary: [
-        '正在生成视频',
-        '预计需要 1-3 分钟，请勿关闭页面',
-      ]
-    })
-  }
-
   return list
 })
+const latestDisplayVersion = computed(() => displayVersions.value.at(-1) || null)
+const historicalDisplayVersions = computed(() => displayVersions.value
+  .slice(0, -1)
+  .map((version, index) => ({ version, index }))
+  .reverse())
+
+const currentWorkflowNodeKey = computed(() => {
+  if (flowMode.value === 'idle') return 'uploadNode'
+  if (flowMode.value === 'analyzing' || flowMode.value === 'error') return 'analysisNode'
+
+  const generationIsActiveOrFailed = [
+    'created', 'queued', 'analyzing', 'generating', 'running',
+    'failed', 'timeout', 'cancelled',
+  ].includes(generationStatus.value)
+
+  if (isGeneratingPrompt.value || promptGenerationFailed.value || isGenerating.value || generationIsActiveOrFailed) {
+    return 'videoGenerationNode'
+  }
+  if (generationStatus.value === 'success' && latestDisplayVersion.value) {
+    return `result-${latestDisplayVersion.value.id}`
+  }
+  if (revising.value) return 'replaceRail'
+  if (latestDisplayVersion.value) return `result-${latestDisplayVersion.value.id}`
+  if (generationNodeVisible.value) return 'videoGenerationNode'
+  return 'replaceRail'
+})
+
+const completedWorkflowNodeKeys = computed(() => {
+  const completed = new Set()
+  const current = currentWorkflowNodeKey.value
+  if (current === 'analysisNode') completed.add('uploadNode')
+  if (['replaceRail', 'videoGenerationNode'].includes(current) || current.startsWith('result-')) {
+    completed.add('uploadNode')
+  }
+  if (current === 'videoGenerationNode' || current.startsWith('result-')) {
+    completed.add('replaceRail')
+  }
+  if (current.startsWith('result-')) completed.add('videoGenerationNode')
+  return completed
+})
+
+function workflowNodeClass(nodeKey) {
+  return {
+    'is-current-node': currentWorkflowNodeKey.value === nodeKey,
+    'is-completed-node': completedWorkflowNodeKeys.value.has(nodeKey),
+  }
+}
+
+function setHistoryResultContainer(element) {
+  if (!element) return
+  historicalDisplayVersions.value.forEach((entry) => {
+    resultNodeRefs.value[entry.index] = element
+  })
+}
+
+const generationNodeVisible = computed(() => (
+  promptDraft.status !== 'idle' || isGeneratingPrompt.value || promptGenerationFailed.value
+))
 
 // 根据状态计算连线
 const currentEdges = computed(() => {
@@ -830,9 +1040,11 @@ const currentEdges = computed(() => {
   }
   if (flowMode.value === 'customizing') {
     const edges = [{ source: 'uploadNode', target: 'replaceRail' }]
-    // 替换面板 → 结果节点连线
+    if (generationNodeVisible.value) {
+      edges.push({ source: 'replaceRail', target: 'videoGenerationNode' })
+    }
     displayVersions.value.forEach((version) => {
-      edges.push({ source: 'replaceRail', target: `result-${version.id}` })
+      edges.push({ source: generationNodeVisible.value ? 'videoGenerationNode' : 'replaceRail', target: `result-${version.id}` })
     })
     return edges
   }
@@ -923,6 +1135,7 @@ async function loadGenerationOptions() {
     resultParams.model = selected.label
     generationOptionsWarning.value = data.warning || ''
     generationOptionsStatus.value = 'ready'
+    syncInitialGenerationDurationToSource(sourceDurationSecondsForGeneration || currentSourceVideoDuration())
     trackOnce(`generation-config:${projectId.value || 'new'}`, 'generation_config_view', { projectId: projectId.value || null, modelId: selected.id, properties: { model_name: selected.label } })
   } catch (error) {
     generationOptions.value = { models: [], ratios: [], resolutions: [], durations: [] }
@@ -944,6 +1157,10 @@ async function refreshEstimatedPrice() {
   estimatedPrice.value = null
   estimatedCredits.value = null
   try {
+    const inputVideoDuration = Number(uploadedVideo.durationSeconds) || parseDisplayDurationSeconds(uploadedVideo.duration)
+    if (!inputVideoDuration) {
+      throw new Error('未能读取参考视频时长，请重新上传视频。')
+    }
     const response = await authFetch(apiUrl('/api/generate-price'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -952,6 +1169,7 @@ async function refreshEstimatedPrice() {
         aspectRatio: resultParams.ratio,
         resolution: resultParams.quality,
         duration: resultParams.duration.replace(/s$/i, ''),
+        inputVideoDuration,
       }),
     })
     const { data } = await readApiResponse(response)
@@ -976,11 +1194,12 @@ async function refreshEstimatedPrice() {
 }
 
 watch(
-  () => [resultParams.modelId, resultParams.ratio, resultParams.quality, resultParams.duration],
+  () => [resultParams.modelId, resultParams.ratio, resultParams.quality, resultParams.duration, uploadedVideo.durationSeconds, uploadedVideo.duration],
   () => { if (currentUser.value) refreshEstimatedPrice() }
 )
 
 onMounted(async () => {
+  window.addEventListener('viral-lab:auth-expired', handleAuthExpired)
   await initializeAuth()
   if (currentUser.value) {
     trackOnce('page-view-workbench', 'page_view', { page: 'workbench' })
@@ -1000,6 +1219,10 @@ onMounted(async () => {
   if (flowMode.value === 'idle') focusFlowNode('uploadNode')
 })
 
+onBeforeUnmount(() => {
+  window.removeEventListener('viral-lab:auth-expired', handleAuthExpired)
+})
+
 // ── 工具函数（从 react-old 1:1 迁移）──
 function formatFileSize(bytes = 0) {
   if (!bytes) return '未知大小'
@@ -1013,6 +1236,14 @@ function formatDuration(seconds = 0) {
   const minutes = Math.floor(total / 60)
   const restSeconds = total % 60
   return `${String(minutes).padStart(2, '0')}:${String(restSeconds).padStart(2, '0')}`
+}
+
+function parseDisplayDurationSeconds(value) {
+  const text = String(value || '').trim()
+  if (/^\d+(?:\.\d+)?$/.test(text)) return Number(text)
+  const match = text.match(/^(\d{1,3}):(\d{2})$/)
+  if (!match) return 0
+  return Number(match[1]) * 60 + Number(match[2])
 }
 
 function getVideoRatio(width = 0, height = 0) {
@@ -1053,9 +1284,9 @@ function getVideoPreviewInfo(file) {
           const ctx = canvasEl.getContext('2d')
           ctx.drawImage(video, 0, 0, canvasEl.width, canvasEl.height)
           const coverUrl = canvasEl.toDataURL('image/jpeg', 0.82)
-          finish({ coverUrl, duration, ratio })
+          finish({ coverUrl, duration, durationSeconds: video.duration, ratio })
         } catch {
-          finish({ coverUrl: '', duration, ratio })
+          finish({ coverUrl: '', duration, durationSeconds: video.duration, ratio })
         }
       }
     }
@@ -1093,9 +1324,9 @@ function getRemoteVideoPreviewInfo(url) {
           canvasEl.width = video.videoWidth || 320
           canvasEl.height = video.videoHeight || 180
           canvasEl.getContext('2d').drawImage(video, 0, 0, canvasEl.width, canvasEl.height)
-          finish({ coverUrl: canvasEl.toDataURL('image/jpeg', 0.82), duration, ratio })
+          finish({ coverUrl: canvasEl.toDataURL('image/jpeg', 0.82), duration, durationSeconds: video.duration, ratio })
         } catch {
-          finish({ coverUrl: '', duration, ratio })
+          finish({ coverUrl: '', duration, durationSeconds: video.duration, ratio })
         }
       }
     }
@@ -1178,6 +1409,9 @@ function buildSceneListFromShots(shots = [], overviewScenes = []) {
 
 function parseBreakdownResult(rawText = '') {
   if (rawText && typeof rawText === 'object') {
+    if (Number(rawText.breakdownVersion || 0) >= 3 || rawText.shots?.some((shot) => shot?.narrative)) {
+      return normalizeFineBreakdownData(rawText)
+    }
     return cleanBreakdownResult(normalizeBreakdownData(rawText))
   }
   const text = String(rawText || '')
@@ -1196,6 +1430,9 @@ function parseBreakdownResult(rawText = '') {
 
   try {
     const data = JSON.parse(jsonText)
+    if (Number(data.breakdownVersion || 0) >= 3 || data.shots?.some((shot) => shot?.narrative)) {
+      return normalizeFineBreakdownData(data)
+    }
     return cleanBreakdownResult(normalizeBreakdownData(data))
   } catch {
     try {
@@ -1205,6 +1442,9 @@ function parseBreakdownResult(rawText = '') {
         .replace(/^json\s*/i, '')
         .trim()
       const data = JSON.parse(repairedJsonText)
+      if (Number(data.breakdownVersion || 0) >= 3 || data.shots?.some((shot) => shot?.narrative)) {
+        return normalizeFineBreakdownData(data)
+      }
       return cleanBreakdownResult(normalizeBreakdownData(data))
     } catch (secondError) {
       console.error('视频拆解 JSON 解析失败：', secondError)
@@ -1213,14 +1453,67 @@ function parseBreakdownResult(rawText = '') {
   }
 }
 
+function normalizeFineBreakdownData(data = {}) {
+  const rawShots = Array.isArray(data.shots) ? data.shots : []
+  const shots = rawShots.map((shot, index) => ({
+    ...shot,
+    title: shot.narrative?.summary || `镜头${index + 1}`,
+    time: shot.timeConfirmed === false ? '' : `${shot.startTime}-${shot.endTime}`,
+    description: shot.narrative?.summary || '',
+    people: normalizeList(shot.narrative?.characters).join('、'),
+    scene: shot.narrative?.scene || '',
+    elements: normalizeList(shot.replaceable?.elements),
+    action: (shot.beats || []).map((beat) => beat.action).filter(Boolean).join('；'),
+    expression: (shot.beats || []).map((beat) => beat.expression).filter(Boolean).join('；'),
+    emotion: shot.narrativeFunction?.emotionChange || '',
+    dialogue: (shot.narrative?.dialogue || []).map((line) => `${line.speaker || '说话人未确认'}：${line.text}`).join('；'),
+    sound: shot.sound?.audioSummary || '',
+    camera: [shot.cinematography?.shotSize, shot.cinematography?.viewAngle, shot.cinematography?.cameraPosition, shot.cinematography?.cameraMovement].filter(Boolean).join('、'),
+    lighting: shot.visualTreatment?.lighting || '',
+    colorTone: shot.visualTreatment?.colorTone || '',
+  }))
+  const shotReplaceable = shots.map((shot) => shot.replaceable || {})
+  const subjects = normalizeList(data.subjects?.length ? data.subjects : shotReplaceable.flatMap((item) => item.subjects || []))
+  const scenes = normalizeList(data.scenes?.length ? data.scenes : shotReplaceable.flatMap((item) => item.scenes || []))
+  const elements = normalizeList(data.elements?.length ? data.elements : shotReplaceable.flatMap((item) => item.elements || []))
+  return {
+    ...data,
+    breakdownVersion: Number(data.breakdownVersion || 3),
+    summary: data.summary || '',
+    duration: Number(data.duration || 0),
+    shotCount: Number(data.shotCount || shots.length),
+    subjects, scenes, elements,
+    overview: {
+      referenceVideo: data.summary || uploadedVideo.name || '已上传参考视频',
+      shotCount: Number(data.shotCount || shots.length),
+      actionStageCount: shots.reduce((count, shot) => count + (shot.beats?.length || 0), 0),
+      replaceableSubjects: subjects,
+      replaceableScenes: scenes,
+      replaceableElements: elements,
+      replaceableText: [],
+    },
+    shots,
+    previews: data.previews || { subjects: [], scenes: [], elements: [] },
+  }
+}
+
 function normalizeBreakdownData(data = {}) {
   const overview = data.overview || {}
-  const shots = Array.isArray(data.shots) ? data.shots : []
+  const shots = Array.isArray(data.actionStages) && data.actionStages.length
+    ? data.actionStages
+    : (Array.isArray(data.shots) ? data.shots : [])
 
   return {
+    breakdownVersion: data.breakdownVersion || data.refinement?.version || 0,
+    evidence: {
+      subjects: normalizeList(data.evidence?.subjects),
+      scenes: normalizeList(data.evidence?.scenes),
+      elements: normalizeList(data.evidence?.elements),
+    },
     overview: {
       referenceVideo: overview.referenceVideo || uploadedVideo.name || '已上传参考视频',
-      shotCount: overview.shotCount || shots.length || 0,
+      shotCount: overview.actionStageCount || overview.shotCount || shots.length || 0,
+      actionStageCount: overview.actionStageCount || overview.shotCount || shots.length || 0,
       replaceableSubjects: normalizeList(overview.replaceableSubjects),
       replaceableScenes: normalizeList(overview.replaceableScenes),
       replaceableElements: normalizeList(overview.replaceableElements),
@@ -1228,15 +1521,27 @@ function normalizeBreakdownData(data = {}) {
     },
     shots: shots.map((shot, index) => ({
       id: shot.id || `shot${index + 1}`,
-      title: shot.title || `镜头${index + 1}`,
-      time: shot.time || '',
-      description: shot.description || '暂无画面描述',
+      title: shot.title || `动作阶段${index + 1}`,
+      startTime: shot.startTime || '',
+      endTime: shot.endTime || '',
+      timeConfirmed: shot.timeConfirmed !== false && Boolean(shot.startTime && shot.endTime),
+      time: shot.time || (shot.startTime && shot.endTime ? `${shot.startTime}-${shot.endTime}` : '未确认时间'),
+      description: shot.actions || shot.action || shot.description || '暂无动作描述',
       replaceable: normalizeList(shot.replaceable),
       suggestKeep: normalizeList(shot.suggestKeep),
-      people: shot.people || '未识别',
-      scene: shot.scene || '未识别',
+      subjects: normalizeList(shot.subjects || shot.people),
+      people: normalizeList(shot.subjects || shot.people).join('、'),
+      scene: shot.scene || '',
       elements: normalizeList(shot.elements),
-      action: shot.action || '未识别',
+      actions: shot.actions || shot.action || shot.description || '',
+      action: shot.actions || shot.action || shot.description || '',
+      expressions: shot.expressions || shot.expression || '',
+      emotion: shot.emotion || '',
+      dialogue: shot.dialogue || '对白尚未识别',
+      sound: shot.sound || '',
+      replaceableSubjects: normalizeList(shot.replaceableSubjects),
+      replaceableScenes: normalizeList(shot.replaceableScenes),
+      replaceableElements: normalizeList(shot.replaceableElements),
       camera: shot.camera || '未识别',
       rhythm: shot.rhythm || '未识别',
     })),
@@ -1327,47 +1632,55 @@ const texts = normalizeList(overview.replaceableText).filter((text) => !isEmptyC
 
 // ── 进度模拟 ──
 
-let fakeProgressTimer = null
+let fakeProgressTimers = []
 
 function stopFakeProgress() {
-  if (fakeProgressTimer) {
-    clearTimeout(fakeProgressTimer)
-    fakeProgressTimer = null
-  }
+  fakeProgressTimers.forEach((timer) => clearTimeout(timer))
+  fakeProgressTimers = []
 }
 
 function startFakeProgress() {
   stopFakeProgress()
 
   analysisProgress.value = 12
-  analysisStage.value = '正在整理主体、场景、元素和字幕...'
+  analysisStage.value = '正在分析视频'
 
-  fakeProgressTimer = setTimeout(() => {
+  fakeProgressTimers.push(setTimeout(() => {
     if (flowMode.value !== 'analyzing') return
     analysisProgress.value = 45
-    analysisStage.value = '正在提取可替换内容...'
-  }, 1200)
+    analysisStage.value = '正在分析视频'
+  }, 1200))
 
-  setTimeout(() => {
+  fakeProgressTimers.push(setTimeout(() => {
     if (flowMode.value !== 'analyzing') return
     analysisProgress.value = 72
-    analysisStage.value = '等待后端返回...'
-  }, 2600)
+    analysisStage.value = '分析时间较长，请勿关闭页面'
+  }, 60_000))
 
-  setTimeout(() => {
+  fakeProgressTimers.push(setTimeout(() => {
     if (flowMode.value !== 'analyzing') return
     analysisProgress.value = 89
-    analysisStage.value = '整理最终结构...'
-  }, 4200)
+    analysisStage.value = '分析时间较长，请勿关闭页面'
+  }, 240_000))
 }
 
 // ── 上传 + 真实接口调用 ──
 async function handleUploaded(file) {
   if (!file || isUploadingVideo.value) return
+  sourceDurationSecondsForGeneration = 0
+  generationDurationChangedByUser = false
+  lastUploadedVideoFile = file
+  canRetryVideoAnalysis.value = false
+  clearReplacementImageError()
+  promptGenerationFailed.value = false
+  promptGenerationError.value = ''
+  Object.assign(promptDraft, createEmptyPromptDraft())
   track('upload_original_video_start', { projectId: projectId.value || null, properties: { file_size: file.size, mime_type: file.type } })
   isUploadingVideo.value = true
+  analysisStage.value = '正在上传视频'
   uploadedVideo.name = file?.name || '上传的视频.mp4'
   uploadedVideo.size = formatFileSize(file.size)
+  uploadedVideo.durationSeconds = 0
 
   // Blob URL 仅用于持久化上传完成前的本地预览。
   if (videoObjectUrl.value) URL.revokeObjectURL(videoObjectUrl.value)
@@ -1378,9 +1691,12 @@ async function handleUploaded(file) {
     if (uploadedVideo.name !== file.name) return
     uploadedVideo.coverUrl = info.coverUrl
     uploadedVideo.duration = info.duration
+    uploadedVideo.durationSeconds = Number(info.durationSeconds) || 0
     uploadedVideo.ratio = info.ratio
+    syncInitialGenerationDurationToSource(info.durationSeconds)
   })
 
+  const sourceUploadStartedAt = Date.now()
   try {
     const persisted = await persistOriginalVideo(file, projectId.value)
     projectId.value = persisted.project.id
@@ -1393,7 +1709,9 @@ async function handleUploaded(file) {
     originalVideoSourceKey.value += 1
     originalVideoError.value = ''
     originalVideoRefreshAttempts = 0
+    console.info('[video-analysis-timing]', { stage: 'source_upload', status: 'success', durationMs: Date.now() - sourceUploadStartedAt })
   } catch (error) {
+    console.info('[video-analysis-timing]', { stage: 'source_upload', status: 'failed', durationMs: Date.now() - sourceUploadStartedAt })
     track('upload_original_video_failed', { projectId: projectId.value || null, properties: { error_message: error.message, file_size: file.size, mime_type: file.type } })
     URL.revokeObjectURL(temporaryVideoUrl)
     Object.assign(uploadedVideo, {
@@ -1407,12 +1725,18 @@ async function handleUploaded(file) {
   }
 
   isUploadingVideo.value = false
+  await analyzeUploadedVideo(file)
+}
 
+async function analyzeUploadedVideo(file) {
+  if (!file || !uploadedVideo.assetId || !projectId.value) return
+  const analysisStartedAt = Date.now()
+  canRetryVideoAnalysis.value = false
   errorMsg.value = ''
   flowMode.value = 'analyzing'
   startFakeProgress()
   focusFlowNode('analysisNode')
-  const videoToTextDeadline = Date.now() + 3 * 60 * 1000
+  const videoToTextDeadline = Date.now() + VIDEO_ANALYSIS_WAIT_TIMEOUT_MS
 
   try {
     const formData = new FormData()
@@ -1437,12 +1761,14 @@ try {
 }
 
 if (!response.ok || !data?.ok) {
-  throw new Error(
+  const requestError = new Error(
     data?.message ||
       data?.error ||
       rawText ||
       '视频拆解失败，请检查后端服务或 API Key。'
-    )
+  )
+  requestError.code = data?.code || data?.error || 'MODEL_REQUEST_FAILED'
+  throw requestError
 }
 
     const taskId = data.taskId
@@ -1465,20 +1791,26 @@ if (!response.ok || !data?.ok) {
         )
       }
       if (data.status === 'success') break
-      if (data.status === 'failed') throw new Error(data.error || '视频拆解失败')
+      if (['failed', 'timeout', 'cancelled'].includes(data.status)) {
+        const taskError = new Error(data.error || '视频拆解失败')
+        taskError.code = data.errorCode || data.code || (data.status === 'timeout' ? 'VIDEO_ANALYSIS_TIMEOUT' : 'MODEL_REQUEST_FAILED')
+        throw taskError
+      }
     }
 
     if (data.status !== 'success') {
-      const timeoutError = new Error('视频拆解超时，请稍后重试')
+      const timeoutError = new Error('视频分析超时，请重新尝试')
       timeoutError.name = 'VideoToTextTimeoutError'
+      timeoutError.code = 'VIDEO_ANALYSIS_TIMEOUT'
       throw timeoutError
     }
 
     videoToTextResult.value = data
-    console.log('✅ 视频拆解结果：', data.result)
+    console.log('✅ 视频拆解最终结果版本：', data.breakdownVersion)
 
-    const parsed = parseBreakdownResult(data.result)
+    const parsed = parseBreakdownResult(data.normalizedBreakdown)
     breakdownData.value = parsed
+    syncInitialGenerationDurationToSource(currentSourceVideoDuration())
     console.log('📋 解析后的拆解数据：', parsed)
 
     customItems.value = buildCustomItems(parsed)
@@ -1488,16 +1820,28 @@ stopFakeProgress()
     analysisStage.value = '拆解完成，可操作内容已准备就绪。'
     flowMode.value = 'customizing'
     focusFlowNode('replaceRail')
+    console.info('[video-analysis-timing]', { stage: 'total', status: 'success', durationMs: Date.now() - analysisStartedAt })
   } catch (err) {
     stopFakeProgress()
     console.error('❌ 视频拆解失败：', err)
     analysisProgress.value = 0
     analysisStage.value = ''
-    errorMsg.value = err.name === 'VideoToTextTimeoutError'
-      ? '视频拆解超时，请稍后重试'
-      : `视频拆解失败：${err.message || '请稍后重试。'}`
+    const analysisTimedOut = err.code === 'VIDEO_ANALYSIS_TIMEOUT' || err.name === 'VideoToTextTimeoutError'
+    canRetryVideoAnalysis.value = analysisTimedOut && Boolean(lastUploadedVideoFile && uploadedVideo.assetId)
+    const invalidUnderstandingResult = /Skill\s*输出必须是对象|视频拆解结果格式异常|视频理解结果格式异常|MODEL_RESULT_INVALID/i.test(String(err.message || ''))
+    errorMsg.value = analysisTimedOut
+      ? VIDEO_ANALYSIS_TIMEOUT_MESSAGE
+      : invalidUnderstandingResult
+        ? '视频拆解结果格式异常，请重新拆解。'
+        : `视频拆解失败：${err.message || '请稍后重试。'}`
     flowMode.value = 'error'
+    console.info('[video-analysis-timing]', { stage: 'total', status: 'failed', durationMs: Date.now() - analysisStartedAt, errorCode: err.code || 'UNKNOWN' })
   }
+}
+
+async function retryVideoAnalysis() {
+  if (!canRetryVideoAnalysis.value || !lastUploadedVideoFile) return retry()
+  await analyzeUploadedVideo(lastUploadedVideoFile)
 }
 
 // 替换由 ReplaceRail 内部处理（上传/资产库），此处仅做状态同步
@@ -1507,12 +1851,25 @@ function handleReplace(itemId) {
   const item = customItems.value.find((entry) => entry.id === itemId)
   track('confirm_replacement', { projectId: projectId.value, properties: { replacement_type: item?.replacementType || item?.group || '', asset_id: item?.assetId || '' } })
   pulsingNodeKey.value = ''
+  clearReplacementImageError()
+  refreshEstimatedPrice()
 }
 
 function openBreakdown() {
   originalVideoError.value = ''
   originalVideoRefreshAttempts = 0
   breakdownVisible.value = true
+}
+
+function openOriginalVideoPreview() {
+  if (!videoObjectUrl.value && !uploadedVideo.assetUrl) return
+  originalVideoError.value = ''
+  originalVideoRefreshAttempts = 0
+  originalVideoPreviewVisible.value = true
+}
+
+function closeOriginalVideoPreview() {
+  originalVideoPreviewVisible.value = false
 }
 
 async function refreshOriginalVideoSignedUrl() {
@@ -1530,7 +1887,7 @@ async function refreshOriginalVideoSignedUrl() {
       if (projectId.value !== targetProjectId) return false
       const assets = Array.isArray(data.assets) ? data.assets : []
       const original = assets.find((asset) => asset.id === data.project?.original_asset_id)
-        || assets.find((asset) => asset.asset_type === 'original_video')
+        || assets.find(isSourceVideoAsset)
       const nextUrl = assetSignedUrl(original)
       if (!nextUrl) throw new Error('后端未返回有效 signed URL')
       uploadedVideo.assetUrl = nextUrl
@@ -1633,54 +1990,8 @@ function getChangedItems() {
   return customItems.value.filter((item) => item.changed)
 }
 
-function buildGenerationDescription(items = getChangedItems()) {
-  const changedByGroup = (group) => items.filter((item) => item.group === group)
-
-  const subjectText = changedByGroup('主体').length
-    ? changedByGroup('主体').map((item) => `${item.title}替换为${item.current}`).join('；')
-    : '主体保持原视频人物关系、动作节奏和站位。'
-
-  const sceneText = changedByGroup('场景').length
-    ? changedByGroup('场景').map((item) => `${item.title}替换为${item.current}`).join('；')
-    : '场景保持原视频空间关系、镜头推进和环境氛围。'
-
-  const elementText = changedByGroup('元素').length
-    ? changedByGroup('元素').map((item) => `${item.title}替换为${item.current}`).join('；')
-    : '元素保持原视频中的核心视觉符号和画面关系。'
-
-  const copyText = changedByGroup('字幕/文案').length
-    ? changedByGroup('字幕/文案').map((item) => `${item.title}修改为${item.current}`).join('；')
-    : '不新增无关字幕，若原视频无文字则保持无文字。'
-
-  const shots = Array.isArray(breakdownData.value?.shots) ? breakdownData.value.shots : []
-  const shotDescription = shots.length
-    ? shots.map((shot, index) => {
-        const time = shot.time || `镜头${index + 1}`
-        const title = shot.title || `镜头${index + 1}`
-        const description = shot.description || '保留参考视频画面结构。'
-        const action = shot.action ? `动作：${shot.action}` : ''
-        const camera = shot.camera ? `镜头：${shot.camera}` : ''
-        const rhythm = shot.rhythm ? `节奏：${shot.rhythm}` : ''
-        return `${time}：${title}。${description}${action ? ` ${action}。` : ''}${camera ? ` ${camera}。` : ''}${rhythm ? ` ${rhythm}。` : ''}`
-      }).join('\n')
-    : '按参考视频原有镜头结构生成，保持人物动作、镜头节奏和场景关系。'
-
-  return `【参考视频结构】\n${shotDescription}\n\n【本次替换】\n主体：${subjectText}\n场景：${sceneText}\n元素：${elementText}\n字幕 / 文案：${copyText}\n\n【生成要求】\n根据参考视频拆解结构生成新视频。保持原视频的镜头顺序、人物动作节奏、场景关系、画面氛围和运镜方式；只替换用户指定的主体、场景或元素，未修改内容保持原样。画面真实自然，人物动作连贯，镜头稳定，不要生成无关字幕、水印或额外文字。`
-}
-
-function buildGenerationDescriptionWithAdjustment(items = getChangedItems(), adjText = '') {
-  const base = buildGenerationDescription(items)
-  const clean = adjText.trim()
-  if (!clean) return base
-  return `${base}\n\n【用户本次调整要求】\n${clean}\n\n【执行要求】\n在保留参考视频镜头结构、主体运动节奏和画面关系的基础上，优先满足用户本次调整要求。不要生成无关文字、水印或额外字幕。`
-}
-
 function getNextVersionId() {
-  const maxNumber = versions.value.reduce((max, v) => {
-    const m = String(v.id || '').match(/^V(\d+)$/)
-    return m ? Math.max(max, Number(m[1])) : max
-  }, 0)
-  return `V${maxNumber + 1}`
+  return nextVersionId(versions.value)
 }
 
 function getChangeSummaryItems() {
@@ -1841,13 +2152,21 @@ async function readApiResponse(response) {
   }
 }
 
+function isVideoGenerationTimeout(error) {
+  const name = String(error?.name || '')
+  const code = String(error?.code || error?.errorCode || '')
+  const message = String(error?.message || '')
+  return ['GenerateToTimeoutError', 'GenerationTimeoutError'].includes(name)
+    || code === 'TASK_TIMEOUT'
+    || /视频生成超时|生成超时|generation.*timeout/i.test(message)
+}
+
 const generateBtnText = computed(() => {
   if (isGenerating.value) return '生成中'
-  if (versions.value.length || revising.value) return '生成新版本'
   return '生成视频'
 })
 
-const showResultPanel = computed(() => flowMode.value === 'customizing' || versions.value.length > 0 || isGenerating.value)
+const showResultPanel = computed(() => versions.value.length > 0)
 
 function getVersionById(id) {
   return versions.value.find((version) => version.id === id) || null
@@ -1867,8 +2186,18 @@ function selectVersion(versionId) {
 
 // 生成中占位版本
 function updateGenerationConfig(nextConfig) {
+  const configChanged = ['ratio']
+    .some((key) => nextConfig?.[key] !== undefined && nextConfig[key] !== resultParams[key])
+  if (configChanged) {
+    currentGeneratingPrompt.value = ''
+    Object.assign(promptDraft, markPromptDraftStale(promptDraft))
+    clearReplacementImageError()
+  }
   priceStatus.value = 'loading'
   estimatedPrice.value = null
+  if (nextConfig?.duration !== undefined && nextConfig.duration !== resultParams.duration) {
+    generationDurationChangedByUser = true
+  }
   Object.assign(resultParams, nextConfig)
   const selectedModel = generationOptions.value.models.find((item) => item.id === resultParams.modelId)
   if (selectedModel) {
@@ -1882,8 +2211,263 @@ function updateGenerationConfig(nextConfig) {
   }
 }
 
+function promptReplacementPayload() {
+  return getChangedItems()
+    .filter((item) => ['主体', '场景', '元素'].includes(item.group) && item.assetId && submittedReplacementUrl(item))
+    .map((item) => ({
+      group: item.group,
+      original: item.title || item.original,
+      replacement: item.current || item.replacement,
+      asset_id: item.assetId,
+      storage_path: item.storagePath || null,
+      asset_url: submittedReplacementUrl(item),
+      original_filename: item.replacement || item.current || '',
+      target_placeholder_id: item.id || '',
+    }))
+}
+
+function nextReferenceAssetRef(type, replaceAsset = null) {
+  if (replaceAsset?.reference) return replaceAsset.reference
+  const prefix = { image: '图片', video: '视频', audio: '音频' }[type] || '图片'
+  const count = generationReferenceAssets.value.filter((asset) => asset.type === type).length
+  return `@${prefix}${count + 1}`
+}
+
+function targetPlaceholderForPurpose(purpose) {
+  const group = {
+    character_reference: '主体', scene_reference: '场景', prop_reference: '元素',
+    action_reference: '主体',
+  }[purpose]
+  return group ? customItems.value.find((item) => item.group === group)?.id || '' : ''
+}
+
+async function uploadGenerationReference({ expectedType, type = expectedType, file, replaceAsset = null }) {
+  if (!projectId.value || referenceUploading.value) return
+  referenceUploading.value = true
+  try {
+    const inferred = replaceAsset?.assetId
+      ? {
+          purpose: replaceAsset.purpose || 'general_reference',
+          targetPlaceholderId: replaceAsset.targetPlaceholderId || '',
+          confidence: replaceAsset.confidence ?? 1,
+        }
+      : inferReferenceBinding({ type, fileName: file.name, placeholders: customItems.value })
+    const binding = { ...inferred, assetRef: nextReferenceAssetRef(type, replaceAsset) }
+    const response = await persistReferenceAsset(projectId.value, file, type, binding)
+    const asset = response.asset
+    console.info('[reference-upload] response', {
+      status: 'success', assetId: asset.id, assetType: asset.asset_type || type,
+      purpose: asset.purpose || binding.purpose, assetRef: asset.asset_ref || binding.assetRef,
+    })
+    const nextAsset = {
+      key: asset.id, assetId: asset.id, type, purpose: asset.purpose || binding.purpose,
+      assetRef: asset.asset_ref || binding.assetRef,
+      targetPlaceholderId: asset.target_placeholder_id || binding.targetPlaceholderId,
+      confidence: Number.isFinite(Number(asset.confidence)) ? Number(asset.confidence) : binding.confidence,
+      needsConfirmation: (asset.purpose || binding.purpose) === 'general_reference',
+      name: asset.original_filename || file.name,
+      url: asset.signed_url || asset.public_url || '', storagePath: asset.storage_path, locked: false,
+    }
+    if (replaceAsset?.assetId) {
+      extraReferenceAssets.value = extraReferenceAssets.value.map((item) => item.assetId === replaceAsset.assetId ? nextAsset : item)
+      await deleteProjectAsset(projectId.value, replaceAsset.assetId).catch((error) => console.warn('旧参考素材清理失败：', error))
+    } else {
+      extraReferenceAssets.value.push(nextAsset)
+    }
+    showNotice(nextAsset.needsConfirmation ? '已按通用参考保存，请确认素材用途' : '参考素材上传成功')
+  } catch (error) {
+    generateError.value = error.message || '参考素材上传失败，请重试'
+  } finally {
+    referenceUploading.value = false
+  }
+}
+
+async function updateGenerationReferenceBinding({ asset, purpose }) {
+  if (!asset?.assetId || asset.locked) return
+  const nextBinding = {
+    purpose,
+    assetRef: asset.reference || asset.assetRef || '',
+    targetPlaceholderId: targetPlaceholderForPurpose(purpose),
+    confidence: 1,
+  }
+  try {
+    const response = await updateProjectAssetBinding(projectId.value, asset.assetId, nextBinding)
+    const persisted = response.asset
+    extraReferenceAssets.value = extraReferenceAssets.value.map((item) => item.assetId === asset.assetId ? {
+      ...item,
+      purpose: persisted.purpose || purpose,
+      assetRef: persisted.asset_ref || nextBinding.assetRef,
+      targetPlaceholderId: persisted.target_placeholder_id || nextBinding.targetPlaceholderId,
+      confidence: Number.isFinite(Number(persisted.confidence)) ? Number(persisted.confidence) : 1,
+      needsConfirmation: false,
+    } : item)
+    invalidatePromptDraft()
+    showNotice('素材用途已更新')
+  } catch (error) {
+    generateError.value = error.message || '素材用途保存失败，请重试'
+  }
+}
+
+async function deleteGenerationReference(asset) {
+  if (!asset?.assetId || asset.locked) return
+  try {
+    await deleteProjectAsset(projectId.value, asset.assetId)
+    extraReferenceAssets.value = extraReferenceAssets.value.filter((item) => item.assetId !== asset.assetId)
+  } catch (error) {
+    generateError.value = error.message || '参考素材删除失败，请重试'
+  }
+}
+
+function currentPromptFingerprint() {
+  return promptInputFingerprint({
+    replacements: generationReferenceAssets.value.map((item) => ({
+      assetId: item.assetId, url: item.url, group: item.type, name: item.name,
+      purpose: item.purpose || '', targetPlaceholderId: item.targetPlaceholderId || '',
+    })),
+    extraPrompt: adjustmentText.value,
+    ratio: resultParams.ratio,
+  })
+}
+
+function currentSourceVideoDuration() {
+  const analyzedDurationValue = breakdownData.value?.source?.videoDuration ?? breakdownData.value?.duration
+  const analyzedDuration = Number(analyzedDurationValue) || parseDisplayDurationSeconds(analyzedDurationValue)
+  if (Number.isFinite(analyzedDuration) && analyzedDuration > 0) return analyzedDuration
+  return Number(uploadedVideo.durationSeconds) || parseDisplayDurationSeconds(uploadedVideo.duration) || 0
+}
+
+function invalidatePromptDraft() {
+  Object.assign(promptDraft, markPromptDraftStale(promptDraft))
+}
+
+function stopPromptCreationPresentation() {
+  promptCreationStageTimers.forEach((timer) => clearTimeout(timer))
+  promptCreationStageTimers = []
+  promptCreationStage.value = 'IDLE'
+}
+
+function startPromptCreationPresentation() {
+  stopPromptCreationPresentation()
+  promptCreationStage.value = 'VIDEO_UNDERSTAND'
+  promptCreationStageTimers.push(setTimeout(() => { promptCreationStage.value = 'REPLACEMENT_ANALYZE' }, 900))
+  promptCreationStageTimers.push(setTimeout(() => { promptCreationStage.value = 'CREATIVE_PLAN' }, 1800))
+  promptCreationStageTimers.push(setTimeout(() => { promptCreationStage.value = 'PROMPT_GENERATE' }, 2800))
+}
+
+async function handleGeneratePrompt() {
+  if (isGeneratingPrompt.value || isGenerating.value) return
+  promptGenerationFailed.value = false
+  promptGenerationError.value = ''
+  generateError.value = ''
+  if (!validateReplacementImages({ showWhenMissing: true })) {
+    promptGenerationError.value = REPLACEMENT_IMAGE_ERROR
+    return
+  }
+  if (!breakdownData.value || flowMode.value !== 'customizing') {
+    promptGenerationError.value = '请先上传视频并完成拆解'
+    return
+  }
+  if (generationOptionsStatus.value !== 'ready') {
+    promptGenerationError.value = '模型配置尚未加载完成，请重试'
+    return
+  }
+  syncInitialGenerationDurationToSource(currentSourceVideoDuration())
+  isGeneratingPrompt.value = true
+  startPromptCreationPresentation()
+  try {
+    const response = await authFetch(apiUrl('/api/generate-prompt'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        projectId: projectId.value,
+        source: { videoDuration: currentSourceVideoDuration() },
+        videoAnalysis: breakdownData.value,
+        normalizedBreakdown: breakdownData.value,
+        replacements: promptReplacementPayload(),
+        assets: extraReferenceAssets.value.map((asset) => ({
+          assetId: asset.assetId, type: asset.type, name: asset.name,
+          assetRef: asset.reference || asset.assetRef || '', purpose: asset.purpose || 'general_reference',
+          targetPlaceholderId: asset.targetPlaceholderId || '', confidence: asset.confidence ?? 0.5,
+          url: asset.url, storagePath: asset.storagePath || '',
+        })),
+        referenceAssetIds: extraReferenceAssets.value.map((asset) => asset.assetId),
+        userRequirement: adjustmentText.value,
+        extraPrompt: adjustmentText.value,
+        generationConfig: {
+          modelId: resultParams.modelId, modelName: resultParams.model,
+          aspectRatio: resultParams.ratio, resolution: resultParams.quality,
+        },
+        context: {
+          projectId: projectId.value,
+          previousCreativePlan: promptDraft.creativePlan,
+          previousPrompt: promptDraft.finalPrompt,
+          generationCount: versions.value.length,
+          history: versions.value.slice(-5).map((version) => ({
+            version: version.id, prompt: version.prompt || '',
+            createdAt: version.createdAt || '',
+          })),
+          userPreference: {},
+        },
+        aspectRatio: resultParams.ratio,
+        resolution: resultParams.quality,
+        model: resultParams.modelId,
+      }),
+    })
+    const { data, rawText } = await readApiResponse(response)
+    if (!response.ok || (!data?.success && !data?.ok)) throw new Error(data?.message || data?.error || rawText || '创作方案生成失败')
+    Object.assign(promptDraft, applyGeneratedPrompt(promptDraft, data, currentPromptFingerprint()))
+    generationNodeResult.value = null
+    generationStatus.value = ''
+    generateError.value = ''
+    promptGenerationFailed.value = false
+    clearReplacementImageError()
+    showNotice('创作方案已生成')
+    await nextTick()
+    await focusFlowNode('videoGenerationNode')
+  } catch (error) {
+    promptGenerationFailed.value = true
+    promptGenerationError.value = error.message || '创作方案生成失败，请重试'
+    showNotice('创作方案生成失败')
+  } finally {
+    stopPromptCreationPresentation()
+    isGeneratingPrompt.value = false
+  }
+}
+
+function handlePromptDraftInput(value) {
+  Object.assign(promptDraft, editPromptDraft(promptDraft, value))
+  promptGenerationFailed.value = false
+  promptGenerationError.value = ''
+}
+
+async function handleConfirmGeneration() {
+  const validationError = validatePromptDraft({
+    state: promptDraft,
+    currentFingerprint: currentPromptFingerprint(),
+    replacementCount: generationReferenceAssets.value.filter((item) => item.type === 'image').length,
+  })
+  if (validationError) {
+    generateError.value = validationError
+    return
+  }
+  return startGeneration(revising.value)
+}
+
 async function startGeneration(isRevise = false) {
   generateError.value = ''
+  if (isRevise && !hasRevisionChanges(customItems.value, '')) {
+    generateError.value = '请至少替换一个主体、场景或元素。'
+    return
+  }
+  const promptValidationError = validatePromptDraft({
+    state: promptDraft,
+    currentFingerprint: currentPromptFingerprint(),
+    replacementCount: generationReferenceAssets.value.filter((item) => item.type === 'image').length,
+  })
+  if (promptValidationError) {
+    generateError.value = promptValidationError
+    return
+  }
   if (generationOptionsStatus.value !== 'ready' || !activeGenerationOptions.value.models.length
     || !activeGenerationOptions.value.ratios.length || !activeGenerationOptions.value.resolutions.length
     || !activeGenerationOptions.value.durations.length) {
@@ -1892,6 +2476,10 @@ async function startGeneration(isRevise = false) {
   }
   if (!breakdownData.value || flowMode.value !== 'customizing') {
     generateError.value = '请先上传视频并完成拆解'
+    return
+  }
+  if (!(Number(uploadedVideo.durationSeconds) || parseDisplayDurationSeconds(uploadedVideo.duration))) {
+    generateError.value = '未能读取参考视频时长，请重新上传视频。'
     return
   }
   if (priceStatus.value !== 'ready' || estimatedPrice.value === null) {
@@ -1912,16 +2500,7 @@ async function startGeneration(isRevise = false) {
 }
 
 async function handleGenerate() {
-  if (lastFailedTaskId.value) {
-    try {
-      await retryTask(lastFailedTaskId.value)
-      lastFailedTaskId.value = ''
-    } catch (error) {
-      generateError.value = `重新生成准备失败：${error.message}`
-      return
-    }
-  }
-  return startGeneration(false)
+  return handleConfirmGeneration()
 }
 
 async function executeGenerate() {
@@ -1950,7 +2529,7 @@ async function executeGenerate() {
 
   const changed = getChangedItems()
   const adjText = adjustmentText.value
-  const description = buildGenerationDescriptionWithAdjustment(changed, adjText)
+  const description = promptDraft.finalPrompt.trim()
   currentGeneratingPrompt.value = description
   const summaryItems = getChangeSummaryItems()
   const summary = summaryItems.length
@@ -2010,15 +2589,13 @@ async function executeGenerate() {
     formData.append('projectId', projectId.value)
     formData.append('prompt', description)
     formData.append('breakdown', JSON.stringify(breakdownData.value))
-    formData.append('replacements', JSON.stringify(changed.map((item) => ({
-      group: item.group,
-      original: item.title || item.original,
-      replacement: item.current || item.replacement,
-      asset_id: item.assetId || null,
-      storage_path: item.storagePath || null,
-      original_filename: item.replacement || item.current || '',
-    }))))
+    formData.append('replacements', JSON.stringify(promptReplacementPayload()))
+    formData.append('referenceAssetIds', JSON.stringify(extraReferenceAssets.value.map((asset) => asset.assetId)))
     formData.append('extraPrompt', adjText)
+    formData.append('automaticPrompt', promptDraft.automaticPrompt)
+    formData.append('promptStatus', promptDraft.status)
+    formData.append('promptSource', promptDraft.promptSource)
+    if (promptDraft.editedAt) formData.append('editedAt', promptDraft.editedAt)
     formData.append('sourceVideoTaskId', videoToTextResult.value?.taskId || '')
     formData.append('idempotencyKey', crypto.randomUUID())
     const clipStart = Math.max(0, Number(submittedParams.timeStart) || 0)
@@ -2033,6 +2610,7 @@ async function executeGenerate() {
     formData.append('aspectRatio', submittedParams.ratio)
     formData.append('resolution', submittedParams.quality)
     formData.append('model', submittedParams.modelId)
+    formData.append('inputVideoDuration', String(Number(uploadedVideo.durationSeconds) || parseDisplayDurationSeconds(uploadedVideo.duration) || ''))
 
     console.log('[debug] 实际传给 generate-video 的 image 来源:', imageSource)
     console.log('[debug] 发送给模型的图片:', imageFile.name, imageFile.type, imageFile.size)
@@ -2047,8 +2625,13 @@ async function executeGenerate() {
     let { data, rawText } = await readApiResponse(response)
 
     if (!response.ok || !data?.ok) {
-      throw new Error(data?.message || data?.error || rawText || '视频生成失败')
+      const requestError = new Error(data?.message || data?.error || rawText || '视频生成失败')
+      requestError.code = data?.errorCode || data?.code || ''
+      requestError.name = data?.name || (requestError.code === 'TASK_TIMEOUT' ? 'GenerateToTimeoutError' : 'GenerationRequestError')
+      throw requestError
     }
+
+    Object.assign(promptDraft, confirmPromptDraft(promptDraft))
 
     const taskId = data.taskId
     if (!taskId) throw new Error('后端未返回生成任务 taskId')
@@ -2072,14 +2655,18 @@ async function executeGenerate() {
       if (data.status === 'success') break
       if (['failed', 'timeout', 'cancelled'].includes(data.status)) {
         const terminalError = new Error(data.error || (data.status === 'cancelled' ? '任务已取消' : '视频生成失败'))
-        terminalError.name = data.status === 'timeout' ? 'GenerationTimeoutError' : 'GenerationTerminalError'
+        terminalError.code = data.errorCode || data.code || (data.status === 'timeout' ? 'TASK_TIMEOUT' : '')
+        terminalError.name = data.status === 'timeout' || terminalError.code === 'TASK_TIMEOUT'
+          ? 'GenerateToTimeoutError'
+          : 'GenerationTerminalError'
         throw terminalError
       }
     }
 
     if (data.status !== 'success') {
-      const timeoutError = new Error('生成超时，请稍后查看任务状态或重新生成')
-      timeoutError.name = 'GenerationTimeoutError'
+      const timeoutError = new Error(VIDEO_GENERATION_TIMEOUT_MESSAGE)
+      timeoutError.name = 'GenerateToTimeoutError'
+      timeoutError.code = 'TASK_TIMEOUT'
       throw timeoutError
     }
 
@@ -2128,26 +2715,31 @@ async function executeGenerate() {
 
     versions.value = versions.value.filter((item) => item.id !== version.id)
     versions.value.push(version)
+    generationNodeResult.value = version
     currentVersionId.value = version.id
     if (activeView.value === 'works') await loadWorks({ silent: true })
-    focusFlowNode(`result-${version.id}`)
+    focusFlowNode('videoGenerationNode')
     console.log(`✅ ${nextVersionId} 已生成`)
   } catch (error) {
     console.error('视频生成失败：', error)
-    const isTimeout = error.name === 'GenerationTimeoutError'
+    const isTimeout = isVideoGenerationTimeout(error)
     generationStatus.value = isTimeout ? 'timeout' : 'failed'
+    generationPhase.value = ''
     lastFailedTaskId.value = generationTaskId.value || lastFailedTaskId.value
     generateError.value = isTimeout
-      ? '生成超时，请稍后查看任务状态或重新生成'
+      ? VIDEO_GENERATION_TIMEOUT_MESSAGE
       : error.message || '视频生成失败'
   } finally {
     if (submittedTaskId) activeTaskPollIds.delete(submittedTaskId)
-    await loadBillingAccount()
+    try {
+      await loadBillingAccount()
+    } catch (billingError) {
+      console.warn('生成结束后刷新积分失败：', billingError)
+    }
     stopGenerationTimer()
     isGenerating.value = false
     activeGenerationParams.value = null
     pendingVersionId.value = ''
-    setTimeout(resetGenerationStatus, 1200)
   }
 }
 
@@ -2246,32 +2838,33 @@ const replaceRailComp = ref(null)
 const railFocusHighlight = ref(false)
 
 function handleRevise(version) {
-  if (revisingVersionId.value) return
+  if (revisingVersionId.value || isGenerating.value) return
   const targetVersion = getCurrentVersion(getVersionById(version?.id) || version)
-  revisingVersionId.value = targetVersion?.id || 'current'
-  track('regenerate', { projectId: projectId.value, taskId: targetVersion?.taskId, resultId: targetVersion?.resultId, properties: { version: targetVersion?.id || '' } })
   if (targetVersion?.id) currentVersionId.value = targetVersion.id
-  customItems.value.forEach((item) => {
-    if (typeof item.previewUrl === 'string' && item.previewUrl.startsWith('blob:')) {
-      URL.revokeObjectURL(item.previewUrl)
-    }
-  })
-  customItems.value = breakdownData.value
-    ? buildCustomItems(breakdownData.value)
-    : createDefaultCustomItems()
+  const replacementAssetIds = customItems.value.map((item) => item.assetId).filter(Boolean)
+  revisionResetInProgress = true
+  customItems.value = resetItemsForRevision(customItems.value, uploadedVideo.coverUrl)
   adjustmentText.value = ''
+  Object.assign(promptDraft, createEmptyPromptDraft())
+  generationNodeResult.value = null
+  resetGenerationStatus()
+  promptGenerationFailed.value = false
+  promptGenerationError.value = ''
   currentGeneratingPrompt.value = ''
+  generateError.value = ''
+  lastFailedTaskId.value = ''
+  activeGenerationParams.value = null
+  pendingVersionId.value = ''
   revising.value = true
-  flowMode.value = 'customizing'
-  railFocusHighlight.value = true
-  focusFlowNode('replaceRail', { pulse: true })
-  showNotice('正在进入重新改造')
-  setTimeout(() => { revisingVersionId.value = '' }, 300)
-}
-
-// 重新改造后点击生成：重置 revising，走正常生成流程
-async function handleGenerateFromRevise() {
-  return startGeneration(true)
+  showNotice('请重新上传替换素材并生成创作方案')
+  nextTick(() => {
+    revisionResetInProgress = false
+    focusFlowNode('replaceRail', { pulse: true })
+  })
+  Promise.allSettled(replacementAssetIds.map((assetId) => deleteProjectAsset(projectId.value, assetId)))
+    .then((outcomes) => outcomes.forEach((outcome) => {
+      if (outcome.status === 'rejected') console.warn('旧替换素材清理失败：', outcome.reason)
+    }))
 }
 
 async function handleRestore(itemId) {
@@ -2291,9 +2884,16 @@ async function handleRestore(itemId) {
   item.previewUrl = ''
   item.assetId = ''
   item.assetUrl = ''
+  clearReplacementImageError()
+  invalidatePromptDraft()
 }
 
 function retry() {
+  lastUploadedVideoFile = null
+  canRetryVideoAnalysis.value = false
+  clearReplacementImageError()
+  promptGenerationFailed.value = false
+  promptGenerationError.value = ''
   errorMsg.value = ''
   flowMode.value = 'idle'
   uploadedVideo.name = ''
@@ -2301,6 +2901,7 @@ function retry() {
   uploadedVideo.assetUrl = ''
   uploadedVideo.coverUrl = ''
   uploadedVideo.duration = ''
+  uploadedVideo.durationSeconds = 0
   uploadedVideo.ratio = ''
   uploadedVideo.size = ''
   if (videoObjectUrl.value) {
@@ -2378,7 +2979,7 @@ function retry() {
             <div
               ref="uploadNodeEl"
               data-node-key="uploadNode"
-              :class="['flow-node-wrapper', { 'is-current-node': activeNodeKey === 'uploadNode', 'is-completed-node': flowMode !== 'idle' }]"
+              :class="['flow-node-wrapper', workflowNodeClass('uploadNode')]"
               @pointerdown="uploadedVideo.name ? canvas.onPointerDown($event, 'uploadNode') : undefined"
             >
               <UploadCard
@@ -2387,7 +2988,7 @@ function retry() {
                 :status="flowMode === 'analyzing' ? 'analyzing' : flowMode === 'customizing' ? 'done' : flowMode === 'error' ? 'error' : 'idle'"
                 @upload="handleUploaded"
                 @view-breakdown="openBreakdown"
-                @view-original="openBreakdown"
+                @play-original="openOriginalVideoPreview"
               />
             </div>
             <InspirationGrid v-if="showInspiration" />
@@ -2399,7 +3000,7 @@ function retry() {
               <div
                 ref="analysisNodeEl"
                 data-node-key="analysisNode"
-                :class="['flow-node-wrapper', { 'is-current-node': activeNodeKey === 'analysisNode' }]"
+                :class="['flow-node-wrapper', workflowNodeClass('analysisNode')]"
                 @pointerdown="canvas.onPointerDown($event, 'analysisNode')"
               >
                 <AnalysisNode
@@ -2416,16 +3017,18 @@ function retry() {
               <div
                 ref="analysisNodeEl"
                 data-node-key="analysisNode"
-                :class="['flow-node-wrapper', { 'is-current-node': activeNodeKey === 'analysisNode' }]"
+                :class="['flow-node-wrapper', workflowNodeClass('analysisNode')]"
                 @pointerdown="canvas.onPointerDown($event, 'analysisNode')"
               >
                 <div class="error-node flow-node">
+                  <FlowNodeHeader step="01" title="视频解析" />
                   <div class="node-head">
                     <span class="error-dot">✕</span>
                     <strong>拆解失败</strong>
                   </div>
                   <p class="error-msg">{{ errorMsg }}</p>
-                  <button class="retry-button" @click="retry">重新上传</button>
+                  <button v-if="canRetryVideoAnalysis" class="retry-button" @click="retryVideoAnalysis">重新分析</button>
+                  <button v-else class="retry-button" @click="retry">重新上传</button>
                 </div>
               </div>
             </section>
@@ -2437,7 +3040,11 @@ function retry() {
               <div
                 ref="replaceRailEl"
                 data-node-key="replaceRail"
-                :class="['flow-node-wrapper', { 'is-current-node': activeNodeKey === 'replaceRail', 'is-node-pulsing': pulsingNodeKey === 'replaceRail', 'is-completed-node': activeNodeKey.startsWith('result-') }]"
+                :class="[
+                  'flow-node-wrapper',
+                  workflowNodeClass('replaceRail'),
+                  { 'is-node-pulsing': pulsingNodeKey === 'replaceRail' && currentWorkflowNodeKey === 'replaceRail' },
+                ]"
                 @pointerdown="canvas.onPointerDown($event, 'replaceRail')"
               >
                 <ReplaceRail
@@ -2445,9 +3052,32 @@ function retry() {
                   :project-id="projectId"
                   :items="customItems"
                   :cover-url="uploadedVideo.coverUrl"
-                  v-model="adjustmentText"
-                  :generate-btn-text="generateBtnText"
-                  :generation-config-text="generationConfigText"
+                  :prompt-status="promptDraft.status"
+                  :prompt-error="promptGenerationError"
+                  :is-generating-prompt="isGeneratingPrompt"
+                  :creation-stage="promptCreationStage"
+                  :is-generating="isGenerating"
+                  :revise-visible="reviseVisible"
+                  :revising="revising"
+                  :focus-highlight="railFocusHighlight"
+                  @replace="handleReplace"
+                  @restore="handleRestore"
+                  @generate-prompt="handleGeneratePrompt"
+                />
+              </div>
+            </section>
+          </template>
+
+          <!-- Prompt 成功后创建：视频生成节点 -->
+          <template v-if="flowMode === 'customizing' && generationNodeVisible">
+            <section class="generation-column">
+              <div
+                ref="videoGenerationNodeEl"
+                data-node-key="videoGenerationNode"
+                :class="['flow-node-wrapper', workflowNodeClass('videoGenerationNode')]"
+                @pointerdown="canvas.onPointerDown($event, 'videoGenerationNode')"
+              >
+                <VideoGenerationNode
                   :generation-config="resultParams"
                   :generation-options="activeGenerationOptions"
                   :estimated-price-text="estimatedPriceText"
@@ -2456,15 +3086,27 @@ function retry() {
                   :config-status="generationOptionsStatus"
                   :config-error="generationOptionsError"
                   :config-warning="generationOptionsWarning"
-                  @update:generation-config="updateGenerationConfig"
+                  :prompt-status="promptDraft.status"
+                  :prompt-value="promptDraft.finalPrompt"
+                  :prompt-mappings="promptDraft.mappings"
+                  :creative-plan="promptDraft.creativePlan"
+                  :prompt-error="promptGenerationError"
+                  :generation-error="generateError"
+                  :is-generating-prompt="isGeneratingPrompt"
                   :is-generating="isGenerating"
-                  :revise-visible="reviseVisible"
-                  :revising="revising"
-                  :focus-highlight="railFocusHighlight"
-                  @replace="handleReplace"
-                  @restore="handleRestore"
-                  @generate="revising ? handleGenerateFromRevise() : handleGenerate()"
+                  :generation-status="generationStatus"
+                  :generation-phase="generationPhase"
+                  :result="generationNodeResult"
+                  :reference-assets="generationReferenceAssets"
+                  :reference-uploading="referenceUploading"
+                  @update:generation-config="updateGenerationConfig"
+                  @update:prompt="handlePromptDraftInput"
+                  @generate="handleGenerate"
+                  @retry-generation="handleGenerate"
                   @retry-config="retryGenerationConfiguration"
+                  @upload-reference="uploadGenerationReference"
+                  @update-reference-binding="updateGenerationReferenceBinding"
+                  @delete-reference="deleteGenerationReference"
                 />
               </div>
             </section>
@@ -2474,31 +3116,63 @@ function retry() {
           <template v-if="showResultPanel">
             <section class="result-column">
               <div
-                v-for="(version, index) in displayVersions"
-                :key="version.id"
-                :ref="el => { if (el) resultNodeRefs[index] = el }"
-                :data-node-key="`result-${version.id}`"
-                :class="['flow-node-wrapper', { 'is-current-node': activeNodeKey === `result-${version.id}`, 'is-completed-node': activeNodeKey !== `result-${version.id}` }]"
-                @pointerdown="canvas.onPointerDown($event, `result-${version.id}`)"
-                @click="selectVersion(version.id)"
+                v-if="latestDisplayVersion"
+                :key="latestDisplayVersion.id"
+                :ref="el => { if (el) resultNodeRefs[displayVersions.length - 1] = el }"
+                :data-node-key="`result-${latestDisplayVersion.id}`"
+                :class="[
+                  'flow-node-wrapper',
+                  workflowNodeClass(`result-${latestDisplayVersion.id}`),
+                  { 'is-completed-node': currentWorkflowNodeKey !== `result-${latestDisplayVersion.id}` },
+                ]"
+                @pointerdown="canvas.onPointerDown($event, `result-${latestDisplayVersion.id}`)"
+                @click="selectVersion(latestDisplayVersion.id)"
               >
                 <ResultCard
-                  :version="version"
-                  :index="index"
-                  :is-exporting="exportingVersionId === version.id"
-                  :is-revising="revisingVersionId === version.id"
-                  :is-refreshing-video="refreshingResultIds.has(version.id)"
-                  :video-error="version.videoError || ''"
-                  @export="handleExport(version)"
-                  @save="handleSaveAsset(version)"
-                  @revise="handleRevise(version)"
+                  :version="latestDisplayVersion"
+                  :index="displayVersions.length - 1"
+                  :is-exporting="exportingVersionId === latestDisplayVersion.id"
+                  :is-revising="revisingVersionId === latestDisplayVersion.id"
+                  :is-refreshing-video="refreshingResultIds.has(latestDisplayVersion.id)"
+                  :video-error="latestDisplayVersion.videoError || ''"
+                  @export="handleExport(latestDisplayVersion)"
+                  @save="handleSaveAsset(latestDisplayVersion)"
+                  @revise="handleRevise(latestDisplayVersion)"
                   @video-error="handleResultVideoError"
                   @video-ready="handleResultVideoReady"
                   @retry-video="retryResultVideo"
                   @play="handleResultPlay"
-                  @view-prompt="handleViewPrompt"
                 />
               </div>
+              <details v-if="historicalDisplayVersions.length" :ref="setHistoryResultContainer" class="history-results" @toggle="refreshCanvasConnectors(30)">
+                <summary>历史版本（{{ historicalDisplayVersions.length }}）</summary>
+                <div class="history-result-list">
+                  <div
+                    v-for="entry in historicalDisplayVersions"
+                    :key="entry.version.id"
+                    :data-node-key="`result-${entry.version.id}`"
+                    :class="['flow-node-wrapper', 'history-result-node', 'is-completed-node']"
+                    @pointerdown="canvas.onPointerDown($event, `result-${entry.version.id}`)"
+                    @click="selectVersion(entry.version.id)"
+                  >
+                    <ResultCard
+                      :version="entry.version"
+                      :index="entry.index"
+                      :is-exporting="exportingVersionId === entry.version.id"
+                      :is-revising="revisingVersionId === entry.version.id"
+                      :is-refreshing-video="refreshingResultIds.has(entry.version.id)"
+                      :video-error="entry.version.videoError || ''"
+                      @export="handleExport(entry.version)"
+                      @save="handleSaveAsset(entry.version)"
+                      @revise="handleRevise(entry.version)"
+                      @video-error="handleResultVideoError"
+                      @video-ready="handleResultVideoReady"
+                      @retry-video="retryResultVideo"
+                      @play="handleResultPlay"
+                    />
+                  </div>
+                </div>
+              </details>
             </section>
           </template>
         </div>
@@ -2519,13 +3193,30 @@ function retry() {
       :video-name="uploadedVideo.name"
       :cover-url="uploadedVideo.coverUrl"
       :video-object-url="videoObjectUrl"
-      :video-source-key="originalVideoSourceKey"
-      :video-loading="originalVideoLoading"
-      :video-error="originalVideoError"
       @close="closeBreakdown"
-      @video-error="handleOriginalVideoPlaybackError"
-      @video-ready="handleOriginalVideoReady"
     />
+
+    <div v-if="originalVideoPreviewVisible" class="original-video-modal" @click.self="closeOriginalVideoPreview">
+      <section class="original-video-dialog">
+        <button type="button" class="original-video-close" aria-label="关闭视频" @click="closeOriginalVideoPreview">×</button>
+        <video
+          :key="originalVideoSourceKey"
+          :src="videoObjectUrl || uploadedVideo.assetUrl"
+          controls
+          autoplay
+          playsinline
+          preload="metadata"
+          @canplay="handleOriginalVideoReady"
+          @error="handleOriginalVideoPlaybackError"
+        ></video>
+        <strong>{{ uploadedVideo.name || '已上传视频' }}</strong>
+        <p v-if="originalVideoLoading">正在刷新视频播放地址…</p>
+        <p v-else-if="originalVideoError" class="original-video-error">
+          {{ originalVideoError }}
+          <button type="button" @click="refreshOriginalVideoSignedUrl">重试</button>
+        </p>
+      </section>
+    </div>
 
     <!-- 生成错误提示 -->
     <div v-if="generateError" class="generate-error-toast">
@@ -2676,7 +3367,7 @@ button {
 /* customizing：固定列起点；结果节点出现时不移动已有节点 */
 .flow-board.customizing {
   display: grid;
-  grid-template-columns: 310px minmax(620px, 700px) auto;
+  grid-template-columns: 310px minmax(620px, 700px) 720px auto;
   align-items: start;
   column-gap: 52px;
   row-gap: 0;
@@ -2713,6 +3404,13 @@ button {
   grid-column: 2;
   grid-row: 1;
   width: 100%;
+  z-index: 5;
+}
+
+.generation-column {
+  grid-column: 3;
+  grid-row: 1;
+  width: 720px;
   z-index: 5;
 }
 
@@ -2819,6 +3517,8 @@ button {
 
 /* ── 结果列 ── */
 .result-column {
+  grid-column: 4;
+  grid-row: 1;
   display: flex;
   flex-direction: column;
   gap: 18px;
@@ -2827,6 +3527,23 @@ button {
   z-index: 5;
   margin-left: 20px;
 }
+.history-results {
+  width: 860px;
+  padding: 0 14px 14px;
+  border: 1px solid rgba(255,255,255,.1);
+  border-radius: 14px;
+  background: rgba(18,19,20,.9);
+}
+.history-results > summary {
+  padding: 13px 0;
+  cursor: pointer;
+  color: #cbd3cf;
+  font-size: 12px;
+  font-weight: 800;
+}
+.history-result-list { display: grid; gap: 14px; }
+.history-result-node { transform: scale(.985); transform-origin: top center; }
+.history-result-node .result-card { width: 100%; }
 
 /* customizing 模式下如果有结果，扩展网格 */
 .canvas.is-restoring-project .lab-page { visibility: hidden; }
@@ -2863,6 +3580,14 @@ button {
 .billing-card b.positive { color: var(--green); }
 .billing-card b.negative { color: #ff8585; }
 .billing-state { padding: 42px; text-align: center; color: #7f8983; }
+.original-video-modal { position: fixed; inset: 0; z-index: 125; display: grid; place-items: center; padding: 24px; background: rgba(0,0,0,.76); backdrop-filter: blur(8px); }
+.original-video-dialog { position: relative; display: grid; gap: 12px; width: min(900px, 92vw); padding: 18px; border: 1px solid rgba(255,255,255,.14); border-radius: 16px; background: #121514; box-shadow: 0 28px 90px rgba(0,0,0,.55); }
+.original-video-dialog video { width: 100%; max-height: 76vh; border-radius: 11px; background: #050606; }
+.original-video-dialog > strong { color: #eff5f1; font-size: 13px; }
+.original-video-dialog > p { margin: 0; color: #8f9993; font-size: 12px; }
+.original-video-close { position: absolute; top: 10px; right: 10px; z-index: 2; width: 32px; height: 32px; border-radius: 50%; color: #fff; background: rgba(0,0,0,.7); }
+.original-video-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #ff9696 !important; }
+.original-video-error button { padding: 5px 10px; border-radius: 7px; color: #dfffee; background: rgba(53,245,154,.12); }
 
 /* 生成错误提示 */
 .generate-error-toast {

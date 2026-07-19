@@ -7,16 +7,16 @@ const props = defineProps({
   videoName: { type: String, default: '' },
   coverUrl: { type: String, default: '' },
   videoObjectUrl: { type: String, default: '' },
-  videoSourceKey: { type: Number, default: 0 },
-  videoLoading: { type: Boolean, default: false },
-  videoError: { type: String, default: '' },
 })
 
-const emit = defineEmits(['close', 'video-error', 'video-ready'])
+const emit = defineEmits(['close'])
 
 const overview = computed(() => props.data?.overview || {})
-const shots = computed(() => Array.isArray(props.data?.shots) ? props.data.shots : [])
+const shots = computed(() => Array.isArray(props.data?.actionStages) && props.data.actionStages.length
+  ? props.data.actionStages
+  : (Array.isArray(props.data?.shots) ? props.data.shots : []))
 const hasData = computed(() => shots.value.length > 0 || overview.value.referenceVideo)
+const isFineBreakdown = computed(() => Number(props.data?.breakdownVersion || 0) >= 3)
 
 function formatList(value) {
   if (Array.isArray(value) && value.length) return value.join('、')
@@ -25,14 +25,31 @@ function formatList(value) {
 }
 
 function getShotStartSeconds(time = '') {
+  const decimal = String(time).match(/^(\d+(?:\.\d+)?)\s*[-–—至]/)
+  if (decimal) return Number(decimal[1]) + 0.1
   const match = String(time).match(/(\d{1,2}):(\d{2})/)
-  if (!match) return 0.8
+  if (!match) return 0
   return Number(match[1]) * 60 + Number(match[2]) + 0.3
 }
 
 function elementsText(shot) {
   if (Array.isArray(shot.elements)) return shot.elements.join('、') || '未识别'
   return shot.elements || '未识别'
+}
+
+function formatSeconds(value) {
+  return Number.isFinite(Number(value)) ? `${Number(value).toFixed(2).replace(/\.00$/, '')}s` : '未确认'
+}
+
+function shotTime(shot) {
+  if (!isFineBreakdown.value) return shot.time || '未确认时间'
+  if (shot.timeConfirmed === false) return '时间未确认'
+  return `${formatSeconds(shot.startTime)}–${formatSeconds(shot.endTime)}`
+}
+
+function dialogueText(dialogue) {
+  if (!Array.isArray(dialogue) || !dialogue.length) return '对白尚未识别'
+  return dialogue.map((item) => `${item.speaker || '说话人未确认'}：${item.text || ''}（${formatSeconds(item.startTime)}–${formatSeconds(item.endTime)}）`).join('\n')
 }
 </script>
 
@@ -41,39 +58,17 @@ function elementsText(shot) {
     <div class="modal-card breakdown-card">
       <button class="close-modal" @click="emit('close')">×</button>
       <h2>视频拆解</h2>
-      <p class="breakdown-subtitle">按镜头整理视频结构，帮助后续替换和生成更贴近参考效果。</p>
-
-      <section class="original-video-section">
-        <div class="original-video-head">
-          <strong>原视频</strong>
-          <span>{{ videoName || '已上传参考视频' }}</span>
-        </div>
-        <div class="original-video-player">
-          <video
-            v-if="videoObjectUrl"
-            :key="videoSourceKey"
-            :src="videoObjectUrl"
-            controls
-            playsinline
-            preload="metadata"
-            @canplay="emit('video-ready')"
-            @error="emit('video-error')"
-          ></video>
-          <div v-else class="original-video-state">原视频地址暂不可用</div>
-          <div v-if="videoLoading" class="original-video-state is-overlay">正在刷新视频播放地址…</div>
-        </div>
-        <p v-if="videoError" class="original-video-error">{{ videoError }}</p>
-      </section>
+      <p class="breakdown-subtitle">按真实剧情变化整理动作阶段，保留时间依据、对白、动作与情绪信息。</p>
 
       <!-- 识别概览 -->
       <section v-if="hasData" class="breakdown-overview">
         <div>
-          <span>参考视频</span>
+          <span>视频摘要</span>
           <strong>{{ overview.referenceVideo || videoName || '已上传参考视频' }}</strong>
         </div>
         <div>
-          <span>总镜头</span>
-          <strong>{{ overview.shotCount || shots.length || 0 }} 个</strong>
+          <span>动作阶段</span>
+          <strong>{{ isFineBreakdown ? `${overview.shotCount || shots.length || 0} 个物理镜头` : `${overview.actionStageCount || overview.shotCount || shots.length || 0} 个` }}</strong>
         </div>
         <div>
           <span>可替换主体</span>
@@ -91,59 +86,88 @@ function elementsText(shot) {
 
       <!-- 镜头列表 -->
       <div v-if="hasData" class="shot-list" id="shotList">
-        <details v-for="(shot, index) in shots" :key="index" class="shot-card">
-          <summary>
-            <div class="shot-main">
-              <!-- 镜头缩略图 -->
-              <div class="shot-thumb">
-                <video
-                  v-if="videoObjectUrl"
-                  class="shot-thumb-video"
-                  :src="`${videoObjectUrl}#t=${getShotStartSeconds(shot.time)}`"
-                  muted
-                  playsinline
-                  preload="metadata"
-                ></video>
-                <img v-else-if="coverUrl" :src="coverUrl" :alt="`镜头 ${index + 1}`" />
-                <span class="play-dot">▶</span>
-                <span>镜头 {{ index + 1 }}</span>
-              </div>
-
-              <!-- 镜头文案 -->
-              <div class="shot-copy">
-                <h3>{{ shot.title || `镜头 ${index + 1}` }}</h3>
-                <p>{{ shot.description || '暂无画面描述' }}</p>
-                <div class="shot-tags">
-                  <span v-if="!shot.replaceable?.length">可替换：未识别</span>
-                  <span v-for="(tag, ti) in shot.replaceable" :key="ti">可替换：{{ tag }}</span>
-                </div>
-                <div class="shot-tags keep">
-                  <span v-if="!shot.suggestKeep?.length">建议保留：未识别</span>
-                  <span v-for="(tag, ti) in shot.suggestKeep" :key="ti">建议保留：{{ tag }}</span>
-                </div>
-              </div>
-
-              <time>{{ shot.time || '' }}</time>
-              <span class="shot-toggle">展开详情</span>
+        <article v-for="(shot, index) in shots" :key="shot.id || index" class="shot-card">
+          <aside class="shot-side">
+            <strong class="shot-number">镜头 {{ index + 1 }}</strong>
+            <div class="shot-thumb">
+              <video
+                v-if="videoObjectUrl"
+                class="shot-thumb-video"
+                :src="`${videoObjectUrl}#t=${getShotStartSeconds(isFineBreakdown ? shot.startTime : shot.time)}`"
+                muted
+                playsinline
+                preload="metadata"
+              ></video>
+              <img v-else-if="coverUrl" :src="coverUrl" :alt="`镜头 ${index + 1}`" />
+              <span class="play-dot">▶</span>
             </div>
-          </summary>
+            <time>{{ shotTime(shot) }}</time>
+            <h3>{{ shot.title || shot.narrative?.summary || `镜头 ${index + 1}` }}</h3>
+          </aside>
 
-          <!-- 展开详情 -->
-          <div class="shot-detail">
-            <section>
-              <h4>画面结构</h4>
-              <p><strong>人物：</strong>{{ shot.people || '未识别' }}</p>
-              <p><strong>场景：</strong>{{ shot.scene || '未识别' }}</p>
-              <p><strong>动作：</strong>{{ shot.action || '未识别' }}</p>
-              <p><strong>元素：</strong>{{ elementsText(shot) }}</p>
+          <div v-if="isFineBreakdown" class="shot-detail fine-detail">
+            <section class="detail-module">
+              <h4>叙事要素</h4>
+              <p><strong>场景：</strong>{{ shot.narrative?.scene || '未识别' }}</p>
+              <p><strong>角色：</strong>{{ formatList(shot.narrative?.characters) }}</p>
+              <p><strong>镜头摘要：</strong>{{ shot.narrative?.summary || '未识别' }}</p>
             </section>
-            <section>
-              <h4>镜头表达</h4>
-              <p><strong>镜头：</strong>{{ shot.camera || '未识别' }}</p>
-              <p><strong>节奏：</strong>{{ shot.rhythm || '未识别' }}</p>
+            <section class="detail-module">
+              <h4>台词对白</h4>
+              <p class="multiline">{{ dialogueText(shot.narrative?.dialogue) }}</p>
+            </section>
+            <section class="detail-module">
+              <h4>镜头语言</h4>
+              <p><strong>景别：</strong>{{ shot.cinematography?.shotSize || '未识别' }}</p>
+              <p><strong>构图：</strong>{{ shot.cinematography?.composition || '未识别' }}</p>
+              <p><strong>镜头类型：</strong>{{ [shot.cinematography?.viewAngle, shot.cinematography?.cameraPosition].filter(Boolean).join('、') || '未识别' }}</p>
+              <p><strong>运镜：</strong>{{ shot.cinematography?.cameraMovement || '未识别' }}</p>
+              <p><strong>焦距与景深：</strong>{{ shot.cinematography?.lensAndDepth || '未识别' }}</p>
+            </section>
+            <section class="detail-module">
+              <h4>影像处理</h4>
+              <p><strong>光影与色调：</strong>{{ [shot.visualTreatment?.lighting, shot.visualTreatment?.colorTone, shot.visualTreatment?.contrast, shot.visualTreatment?.imageTexture].filter(Boolean).join('；') || '未识别' }}</p>
+              <p><strong>剪辑：</strong>{{ shot.visualTreatment?.editing || '未识别' }}</p>
+            </section>
+            <section class="detail-module">
+              <h4>声音</h4>
+              <p><strong>音乐与音效：</strong>{{ [shot.sound?.backgroundMusic, shot.sound?.environmentSound, ...(shot.sound?.soundEffects || []), shot.sound?.laughter].filter(Boolean).join('；') || '未识别' }}</p>
+              <p><strong>声音摘要：</strong>{{ shot.sound?.audioSummary || '未识别' }}</p>
+            </section>
+            <section class="detail-module">
+              <h4>叙事功能</h4>
+              <p><strong>分镜功能：</strong>{{ shot.narrativeFunction?.shotPurpose || '未识别' }}</p>
+              <p><strong>镜头叙事功能：</strong>{{ shot.narrativeFunction?.storyFunction || '未识别' }}</p>
+              <p><strong>情绪变化：</strong>{{ shot.narrativeFunction?.emotionChange || '未识别' }}</p>
+            </section>
+            <section class="detail-module beats-section">
+              <h4>动作阶段（{{ shot.beats?.length || 0 }}）</h4>
+              <article v-for="beat in shot.beats || []" :key="beat.id" class="beat-row">
+                <strong>{{ beat.title || beat.id }} · {{ beat.timeConfirmed === false ? '时间未确认' : `${formatSeconds(beat.startTime)}–${formatSeconds(beat.endTime)}` }}</strong>
+                <p>{{ beat.trigger ? `触发：${beat.trigger}；` : '' }}{{ beat.action || '动作未识别' }}</p>
+                <p>表情：{{ beat.expression || '未识别' }}；情绪：{{ beat.emotionBefore || '未识别' }} → {{ beat.emotionAfter || '未识别' }}</p>
+              </article>
             </section>
           </div>
-        </details>
+          <div v-else class="shot-detail">
+            <section class="detail-module">
+              <h4>叙事要素</h4>
+              <p><strong>主体：</strong>{{ formatList(shot.subjects || shot.people) }}</p>
+              <p><strong>场景：</strong>{{ shot.scene || '未识别' }}</p>
+              <p><strong>动作：</strong>{{ shot.actions || shot.action || shot.description || '未识别' }}</p>
+              <p><strong>表情与情绪：</strong>{{ [shot.expressions || shot.expression, shot.emotion].filter(Boolean).join('；') || '未识别' }}</p>
+              <p><strong>元素：</strong>{{ elementsText(shot) }}</p>
+            </section>
+            <section class="detail-module">
+              <h4>台词对白</h4>
+              <p><strong>对白：</strong>{{ shot.dialogue || '对白尚未识别' }}</p>
+            </section>
+            <section class="detail-module">
+              <h4>声音</h4>
+              <p><strong>声音：</strong>{{ shot.sound || '未识别' }}</p>
+            </section>
+          </div>
+        </article>
       </div>
 
       <!-- 空状态 -->
@@ -188,7 +212,7 @@ function elementsText(shot) {
 }
 
 .breakdown-card {
-  width: min(1180px, calc(100vw - 64px));
+  width: min(1360px, calc(100vw - 64px));
   max-height: min(820px, 88vh);
   overflow: auto;
   padding: 24px;
@@ -205,29 +229,6 @@ function elementsText(shot) {
   font-size: 13px;
   line-height: 1.55;
 }
-
-.original-video-section {
-  display: grid;
-  gap: 10px;
-  margin-top: 18px;
-}
-.original-video-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-.original-video-head strong { color: #eef5f1; font-size: 14px; }
-.original-video-head span { overflow: hidden; color: #7f8789; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.original-video-player {
-  position: relative;
-  overflow: hidden;
-  display: grid;
-  place-items: center;
-  min-height: 260px;
-  max-height: 520px;
-  border-radius: 14px;
-  background: #050606;
-}
-.original-video-player video { display: block; width: 100%; max-height: 520px; background: #000; }
-.original-video-state { color: #858e89; font-size: 13px; }
-.original-video-state.is-overlay { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(5, 6, 6, .78); }
-.original-video-error { margin: 0; color: #ff8585; font-size: 12px; }
 
 .close-modal {
   position: absolute;
@@ -292,39 +293,25 @@ function elementsText(shot) {
 }
 
 .shot-card {
-  display: block;
+  display: grid;
+  grid-template-columns: 210px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+  padding: 18px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.045);
   overflow: hidden;
 }
 
-.shot-card[open] {
-  border-color: rgba(53, 245, 154, 0.18);
-  background: rgba(255, 255, 255, 0.045);
-}
-
-.shot-card summary {
-  list-style: none;
-  cursor: pointer;
-  padding: 18px;
-}
-
-.shot-card summary::-webkit-details-marker {
-  display: none;
-}
-
-.shot-main {
-  display: grid;
-  grid-template-columns: 140px 1fr auto auto;
-  gap: 18px;
-  align-items: center;
-}
+.shot-side { display: grid; gap: 10px; min-width: 0; }
+.shot-number { color: #79ffc0; font-size: 13px; font-weight: 800; }
+.shot-side h3 { margin: 0; color: #fff; font-size: 16px; line-height: 1.45; }
 
 /* 镜头缩略图 */
 .shot-thumb {
-  width: 140px;
-  height: 96px;
+  width: 100%;
+  height: 132px;
   border-radius: 14px;
   background:
     linear-gradient(135deg, rgba(43, 255, 154, 0.16), rgba(255, 255, 255, 0.06)),
@@ -371,115 +358,36 @@ function elementsText(shot) {
   color: #effff5;
 }
 
-.shot-thumb span:last-child {
-  position: relative;
-  z-index: 2;
-  color: #fff;
-  font-weight: 700;
-  font-size: 14px;
-}
-
-/* 镜头文案 */
-.shot-copy {
-  min-width: 0;
-}
-
-.shot-copy h3 {
-  margin: 0 0 8px;
-  font-size: 18px;
-  color: #ffffff;
-}
-
-.shot-copy p {
-  margin: 0 0 10px;
-  color: rgba(255, 255, 255, 0.72);
-  line-height: 1.6;
-  font-size: 13px;
-}
-
-.shot-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 8px;
-}
-
-.shot-tags span {
-  display: inline-flex;
-  align-items: center;
-  border-radius: 999px;
-  padding: 5px 10px;
-  font-size: 12px;
-  color: #9dffc5;
-  background: rgba(43, 255, 154, 0.1);
-  border: 1px solid rgba(43, 255, 154, 0.2);
-}
-
-.shot-tags.keep span {
-  color: rgba(255, 255, 255, 0.72);
-  background: rgba(255, 255, 255, 0.06);
-  border-color: rgba(255, 255, 255, 0.08);
-}
-
 /* 时间 */
 time {
   color: rgba(255, 255, 255, 0.7);
   font-weight: 700;
   white-space: nowrap;
-  align-self: flex-start;
-  padding-top: 4px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.055);
   font-size: 12px;
 }
 
-/* 展开按钮 */
-.shot-toggle {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 88px;
-  height: 38px;
-  margin: 0;
-  padding: 0 14px;
-  border: 1px solid rgba(53, 245, 154, 0.24);
-  border-radius: 999px;
-  color: #8dffba;
-  background: rgba(53, 245, 154, 0.045);
-  font-size: 13px;
-  font-weight: 700;
-  white-space: nowrap;
-  align-self: center;
-  justify-self: end;
-}
-
-.shot-card[open] .shot-toggle {
-  font-size: 0;
-}
-
-.shot-card[open] .shot-toggle::before {
-  content: "收起";
-  font-size: 13px;
-}
-
-/* 展开详情 */
+/* 右侧拆解模块 */
 .shot-detail {
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
-  padding: 0 18px 18px 176px;
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 18px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  min-width: 0;
 }
 
 .shot-detail section {
   min-width: 0;
-  padding: 12px;
+  padding: 12px 14px;
   border: 1px solid rgba(255, 255, 255, 0.065);
   border-radius: 12px;
   background: rgba(8, 9, 10, 0.34);
 }
 
 .shot-detail h4 {
-  margin: 14px 0 8px;
-  color: #ffffff;
+  margin: 0 0 8px;
+  color: var(--green);
   font-size: 13px;
   font-weight: 800;
 }
@@ -494,6 +402,11 @@ time {
 .shot-detail strong {
   color: rgba(255, 255, 255, 0.88);
 }
+.fine-detail .beats-section { grid-column: 1 / -1; }
+.multiline { white-space: pre-line; }
+.beat-row { padding: 10px 0; border-top: 1px solid rgba(255,255,255,.07); }
+.beat-row:first-of-type { border-top: 0; }
+.beat-row > strong { display: block; color: #e8f3ed; font-size: 12px; }
 
 /* ── 空状态 ── */
 .empty-breakdown {
@@ -539,15 +452,15 @@ time {
 
 /* ── 响应式 ── */
 @media (max-width: 768px) {
-  .shot-main {
+  .shot-card {
     grid-template-columns: 1fr;
-    gap: 12px;
   }
 
   .shot-detail {
-    padding: 0 14px 14px;
     grid-template-columns: 1fr;
   }
+
+  .fine-detail .beats-section { grid-column: auto; }
 
   .breakdown-overview {
     grid-template-columns: 1fr;

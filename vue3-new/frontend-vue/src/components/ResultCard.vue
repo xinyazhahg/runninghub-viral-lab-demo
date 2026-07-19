@@ -1,5 +1,7 @@
 <script setup>
 import { computed } from 'vue'
+import { formatGenerationSpecs } from '../generationPresentation.js'
+import FlowNodeHeader from './FlowNodeHeader.vue'
 
 const props = defineProps({
   version: { type: Object, required: true },
@@ -10,7 +12,7 @@ const props = defineProps({
   videoError: { type: String, default: '' },
 })
 
-const emit = defineEmits(['export', 'save', 'revise', 'video-error', 'video-ready', 'retry-video', 'play', 'view-prompt'])
+const emit = defineEmits(['export', 'save', 'revise', 'video-error', 'video-ready', 'retry-video', 'play'])
 
 const isGenerating = computed(() => props.version.isGenerating)
 const isSaved = computed(() => !!props.version.saved)
@@ -22,19 +24,9 @@ const summaryLines = computed(() => {
   ]
 })
 
-const specsText = computed(() => {
-  const p = props.version || {}
-  return [
-    p.ratio || '9:16',
-    (p.quality || '720P').toUpperCase(),
-    p.duration || '10s',
-    p.model || '可灵 v3.0 Pro',
-    p.creditCost !== null && p.creditCost !== undefined ? `${p.creditCost}积分` : (p.cost || ''),
-  ].filter(Boolean).join(' / ')
-})
+const specsText = computed(() => formatGenerationSpecs(props.version))
 
 const videoUrl = computed(() => props.version.videoUrl || '')
-const promptChanges = computed(() => props.version.promptDiff?.changed_fields || [])
 </script>
 
 <template>
@@ -43,7 +35,7 @@ const promptChanges = computed(() => props.version.promptDiff?.changed_fields ||
     :data-version="version.id"
     :data-node-key="`result-${version.id}`"
   >
-    <h2 class="result-node-title">生成结果</h2>
+    <FlowNodeHeader step="04" title="视频结果" />
 
     <!-- 视频预览区 -->
     <div class="result-video">
@@ -107,32 +99,10 @@ const promptChanges = computed(() => props.version.promptDiff?.changed_fields ||
         </ul>
       </div>
 
-      <!-- 生成依据 -->
-      <div class="result-prompt-head">
-        <strong>生成依据</strong>
-        <span>用于说明本次视频参考了哪些内容</span>
-      </div>
-      <textarea
-        class="result-prompt"
-        readonly
-        :value="version.prompt || ''"
-      ></textarea>
-      <details class="prompt-trace" @toggle="$event.target.open && emit('view-prompt', version)">
-        <summary>查看Prompt版本与差异</summary>
-        <dl>
-          <div><dt>Prompt ID</dt><dd>{{ version.promptId || '历史版本未记录' }}</dd></div>
-          <div><dt>模板</dt><dd>{{ version.templateName || '历史模板' }}{{ version.templateVersion ? ` v${version.templateVersion}` : '' }}</dd></div>
-          <div><dt>用户要求</dt><dd>{{ version.userRequirement || '无' }}</dd></div>
-          <div><dt>生成耗时</dt><dd>{{ version.generationSeconds === null || version.generationSeconds === undefined ? '历史版本未记录' : `${version.generationSeconds}秒` }}</dd></div>
-          <div><dt>实际积分</dt><dd>{{ version.creditCost === null || version.creditCost === undefined ? '未记录' : `${version.creditCost}积分` }}</dd></div>
-          <div><dt>模型成本</dt><dd>{{ version.providerCost ?? version.cost ?? '未记录' }}</dd></div>
-          <div><dt>创建时间</dt><dd>{{ version.time || version.createdAt || '未记录' }}</dd></div>
-          <div><dt>相对上一版</dt><dd>{{ promptChanges.length ? promptChanges.join('、') : '无可用差异记录' }}</dd></div>
-          <div><dt>系统Prompt</dt><dd>{{ version.systemPrompt || '历史版本未单独记录' }}</dd></div>
-          <div><dt>负向Prompt</dt><dd>{{ version.negativePrompt || '历史版本未单独记录' }}</dd></div>
-        </dl>
+      <details class="result-prompt-details">
+        <summary>查看本次创作指令</summary>
+        <pre>{{ version.prompt || '暂无创作指令记录' }}</pre>
       </details>
-
       <!-- 操作按钮 -->
       <div v-if="!isGenerating" class="result-actions">
         <button class="ghost-button" :disabled="isExporting" @click="emit('export')">
@@ -169,13 +139,6 @@ const promptChanges = computed(() => props.version.promptDiff?.changed_fields ||
   border-radius: 16px;
   background: rgba(18, 19, 20, 0.94);
   box-shadow: 0 28px 80px rgba(0, 0, 0, 0.44);
-}
-
-.result-node-title {
-  margin: 0;
-  color: #f4f7f6;
-  font-size: 16px;
-  font-weight: 900;
 }
 
 /* ── 视频预览区 ── */
@@ -381,53 +344,14 @@ const promptChanges = computed(() => props.version.promptDiff?.changed_fields ||
   line-height: 1.6;
 }
 
-/* ── 生成依据 ── */
-.result-prompt-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
-  margin-top: 2px;
-}
-
-.result-prompt-head strong {
-  color: #e8ecea;
-  font-size: 13px;
-  font-weight: 800;
-}
-
-.result-prompt-head span {
-  color: #7f8789;
-  font-size: 11px;
-}
-
-.result-prompt {
-  width: 100%;
-  min-height: 132px;
-  max-height: 210px;
-  resize: vertical;
-  padding: 14px 16px;
+.result-prompt-details {
+  padding: 12px 14px;
   border: 1px solid rgba(53, 245, 154, 0.24);
-  outline: none;
-  border-radius: 14px;
+  border-radius: 12px;
   background: rgba(7, 9, 10, 0.68);
-  color: #e0e8e4;
-  font: inherit;
-  font-size: 13px;
-  line-height: 1.6;
-  box-shadow: inset 0 0 0 1px rgba(53, 245, 154, 0.05), 0 12px 28px rgba(0, 0, 0, 0.22);
 }
-
-.result-prompt:focus {
-  border-color: rgba(53, 245, 154, 0.42);
-}
-.prompt-trace { color: #929b96; font-size: 12px; }
-.prompt-trace summary { cursor: pointer; color: #b8c2bd; font-weight: 700; }
-.prompt-trace dl { display: grid; gap: 7px; margin: 10px 0 0; }
-.prompt-trace dl div { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 8px; }
-.prompt-trace dt { color: #68716c; }
-.prompt-trace dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
-
+.result-prompt-details summary { cursor: pointer; color: #dce6e1; font-size: 12px; font-weight: 800; }
+.result-prompt-details pre { max-height: 260px; margin: 12px 0 0; overflow: auto; white-space: pre-wrap; color: #aebbb5; font: inherit; font-size: 12px; line-height: 1.6; }
 /* ── 参数 ── */
 .result-meta {
   display: flex;

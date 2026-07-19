@@ -1,5 +1,6 @@
 <script setup>
 import { ref, computed } from 'vue'
+import FlowNodeHeader from './FlowNodeHeader.vue'
 
 const props = defineProps({
   video: {
@@ -15,7 +16,7 @@ const props = defineProps({
   uploading: { type: Boolean, default: false },
 })
 
-const emit = defineEmits(['upload', 'view-breakdown', 'view-original'])
+const emit = defineEmits(['upload', 'view-breakdown', 'play-original'])
 
 const videoInput = ref(null)
 
@@ -50,6 +51,7 @@ function onStatusClick() {
 <template>
   <div class="upload-node flow-node">
     <input ref="videoInput" type="file" accept="video/*" hidden @change="onFileChange" />
+    <FlowNodeHeader v-if="video.name || status !== 'idle'" step="01" title="视频解析" />
 
     <!-- 空态：上传卡片 -->
     <div v-if="!video.name" class="upload-empty" :class="{ 'is-loading': uploading }" @click="triggerUpload">
@@ -60,18 +62,20 @@ function onStatusClick() {
 
     <!-- 已上传态 -->
     <div v-else class="uploaded-video-node">
-      <button
+      <div
         class="uploaded-thumb"
-        type="button"
-        :disabled="uploading || !video.assetUrl"
-        aria-label="查看并播放原视频"
         @pointerdown.stop
-        @click="emit('view-original')"
       >
         <img v-if="video.coverUrl" :src="video.coverUrl" alt="" />
         <video v-else-if="video.assetUrl" :src="video.assetUrl" muted playsinline preload="metadata"></video>
-        <div class="play-dot">▶</div>
-      </button>
+        <button
+          class="play-dot"
+          type="button"
+          :disabled="uploading || !video.assetUrl"
+          aria-label="播放已上传视频"
+          @click.stop="emit('play-original')"
+        >▶</button>
+      </div>
       <strong>{{ video.name }}</strong>
       <span>{{ video.duration }} · {{ video.ratio }} · {{ video.size }}</span>
       <button class="source-status" type="button" :disabled="uploading" @click="onStatusClick">
@@ -83,8 +87,9 @@ function onStatusClick() {
 
 <style scoped>
 .upload-node {
-  display: block;
-  padding: 0;
+  display: grid;
+  gap: 10px;
+  padding: 16px;
   text-align: center;
   border: 1px solid var(--line);
   border-radius: 16px;
@@ -110,9 +115,9 @@ function onStatusClick() {
   display: grid;
   justify-items: center;
   gap: 12px;
-  min-height: 360px;
+  min-height: 300px;
   align-content: center;
-  padding: 48px;
+  padding: 36px 32px 42px;
   border-radius: 20px;
   transition: border-color 0.18s ease, background 0.18s ease;
 }
@@ -147,7 +152,7 @@ function onStatusClick() {
   display: grid;
   justify-items: center;
   gap: 12px;
-  padding: 48px;
+  padding: 28px 36px 36px;
   border-radius: 20px;
 }
 
@@ -165,7 +170,6 @@ function onStatusClick() {
   cursor: pointer;
   border: 0;
 }
-.uploaded-thumb:disabled { cursor: wait; }
 
 .uploaded-thumb img,
 .uploaded-thumb video {
@@ -196,6 +200,7 @@ function onStatusClick() {
   color: #fff;
   font-size: 12px;
 }
+.play-dot:disabled { cursor: wait; opacity: .55; }
 
 .uploaded-video-node strong {
   max-width: 150px;

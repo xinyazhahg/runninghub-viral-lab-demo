@@ -1,11 +1,13 @@
-import { getAccessToken } from './auth.js'
+import { clearExpiredSession, getAccessToken } from './auth.js'
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
 const ERROR_MESSAGES = {
-  AUTH_REQUIRED: '请先登录后继续操作', AUTH_INVALID: '登录已过期，请重新登录', PERMISSION_DENIED: '无权访问该数据',
+  AUTH_REQUIRED: '请先登录后继续操作', AUTH_INVALID: '登录已过期，请重新登录', AUTH_EXPIRED: '登录已过期，请重新登录',
+  PERMISSION_DENIED: '无权访问该数据',
   PROJECT_NOT_FOUND: '项目不存在或已删除', FILE_TOO_LARGE: '文件超过大小限制', FILE_TYPE_NOT_SUPPORTED: '不支持该文件类型',
   ASSET_UPLOAD_FAILED: '素材上传失败，请稍后重试', ASSET_NOT_FOUND: '素材不存在或已被清理', SIGNED_URL_FAILED: '播放地址已失效，请重试刷新',
   TASK_NOT_FOUND: '任务不存在', TASK_DUPLICATE: '任务已提交，正在恢复原任务', TASK_CANCELLED: '任务已取消', TASK_TIMEOUT: '任务处理超时，可重新生成',
+  VIDEO_ANALYSIS_TIMEOUT: '视频分析超时，请重新尝试',
   TASK_STATE_INVALID: '当前任务状态不允许该操作', MODEL_UNAVAILABLE: '模型服务暂不可用', MODEL_REQUEST_FAILED: '模型服务请求失败，请稍后重试',
   MODEL_RATE_LIMITED: '请求过于频繁，请稍后重试', MODEL_CONTENT_REJECTED: '内容未通过审核，请调整后重试', MODEL_RESULT_INVALID: '模型结果无效',
   BALANCE_INSUFFICIENT: '积分余额不足', POINTS_FREEZE_FAILED: '积分冻结失败，任务尚未提交', POINTS_CHARGE_FAILED: '积分结算失败，后台处理中',
@@ -31,12 +33,44 @@ export function toBackendUrl(url) {
   return apiUrl(url)
 }
 
+const EXPIRED_AUTH_CODES = new Set(['AUTH_REQUIRED', 'AUTH_INVALID', 'AUTH_EXPIRED'])
+let authExpiryHandled = false
+
+async function expireCurrentSession(message = ERROR_MESSAGES.AUTH_EXPIRED) {
+  if (!authExpiryHandled) {
+    authExpiryHandled = true
+    await clearExpiredSession()
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('viral-lab:auth-expired', { detail: { message } }))
+    }
+  }
+  throw new ApiError('AUTH_EXPIRED', message, '', 401)
+}
+
 export async function authFetch(url, options = {}) {
-  const token = await getAccessToken()
+  let token = ''
+  try {
+    token = await getAccessToken()
+  } catch (error) {
+    if (error?.code === 'AUTH_EXPIRED' || [401, 403].includes(Number(error?.status))) {
+      return expireCurrentSession()
+    }
+    throw error
+  }
+  if (!token) return expireCurrentSession()
+  authExpiryHandled = false
   const headers = new Headers(options.headers || {})
-  if (token) headers.set('Authorization', `Bearer ${token}`)
+  headers.set('Authorization', `Bearer ${token}`)
   if (!headers.has('X-Request-ID')) headers.set('X-Request-ID', crypto.randomUUID())
-  return fetch(url, { ...options, headers })
+  const response = await fetch(url, { ...options, headers })
+  if ([401, 403].includes(response.status)) {
+    const data = await response.clone().json().catch(() => null)
+    const code = data?.code || data?.error || ''
+    if (EXPIRED_AUTH_CODES.has(code)) {
+      return expireCurrentSession(data?.message || ERROR_MESSAGES.AUTH_EXPIRED)
+    }
+  }
+  return response
 }
 
 async function requestJson(path, options = {}) {
@@ -92,6 +126,31 @@ export function persistReplacementImage(projectId, file, replacementType) {
   formData.append('replacementType', replacementType)
   return requestJson(`/api/projects/${encodeURIComponent(projectId)}/assets/replacement`, {
     method: 'POST', body: formData, timeoutMs: 120_000,
+  })
+}
+
+export function persistReferenceAsset(projectId, file, assetType, binding = {}) {
+  const formData = new FormData()
+  formData.append('file', file)
+  formData.append('assetType', assetType)
+  formData.append('mimeType', file.type || '')
+  formData.append('purpose', binding.purpose || 'general_reference')
+  formData.append('assetRef', binding.assetRef || '')
+  formData.append('targetPlaceholderId', binding.targetPlaceholderId || '')
+  formData.append('confidence', String(binding.confidence ?? 0.5))
+  const endpoint = `/api/projects/${encodeURIComponent(projectId)}/assets/reference`
+  console.info('[reference-upload] request', {
+    method: 'POST', endpoint, fileName: file.name, fileType: file.type || '', assetType,
+    purpose: binding.purpose || 'general_reference', formDataFields: [...formData.keys()],
+  })
+  return requestJson(endpoint, {
+    method: 'POST', body: formData, timeoutMs: 180_000,
+  })
+}
+
+export function updateProjectAssetBinding(projectId, assetId, binding) {
+  return requestJson(`/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}/binding`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(binding || {}),
   })
 }
 

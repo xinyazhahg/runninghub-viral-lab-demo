@@ -167,8 +167,41 @@ function cleanElements(data, subjects, scenes) {
     .slice(0, 5)
 }
 
+function allowedByEvidence(value, allowed) {
+  return allowed.some((evidenceValue) => isSameConcept(value, evidenceValue))
+}
+
+function filterFinalBreakdownByEvidence(data) {
+  const evidence = data.evidence || {}
+  const subjects = splitList(evidence.subjects)
+  const scenes = splitList(evidence.scenes)
+  const elements = splitList(evidence.elements)
+  const overview = data.overview || {}
+  const filterValues = (values, allowlist) => unique(splitList(values).filter((value) => allowedByEvidence(value, allowlist)))
+  const filterShot = (shot = {}) => ({
+    ...shot,
+    scene: filterValues(shot.scene, scenes).join('、'),
+    elements: filterValues(shot.elements, elements),
+    replaceableSubjects: filterValues(shot.replaceableSubjects, subjects),
+    replaceableScenes: filterValues(shot.replaceableScenes, scenes),
+    replaceableElements: filterValues(shot.replaceableElements, elements),
+  })
+  return {
+    ...data,
+    overview: {
+      ...overview,
+      replaceableSubjects: filterValues(overview.replaceableSubjects, subjects),
+      replaceableScenes: filterValues(overview.replaceableScenes, scenes),
+      replaceableElements: filterValues(overview.replaceableElements, elements),
+    },
+    shots: (Array.isArray(data.shots) ? data.shots : []).map(filterShot),
+  }
+}
+
 export function cleanBreakdownResult(data) {
   if (!data || typeof data !== 'object') return data
+  // v2+ 已由后端确定唯一证据集合；前端只允许做减法，禁止再从旧 shot 字段回填概览。
+  if (Number(data.breakdownVersion || 0) >= 2) return filterFinalBreakdownByEvidence(data)
   const overview = data.overview || {}
   const context = JSON.stringify(data)
   const subjects = cleanSubjects(data, context)
